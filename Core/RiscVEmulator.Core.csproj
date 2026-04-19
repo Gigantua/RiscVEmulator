@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>RiscVEmulator</AssemblyName>
+    <RootNamespace>RiscVEmulator.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Native\rv32i_core.vcxproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\Native\bin\$(Configuration)\rv32i_core.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>rv32i_core.dll</Link>
+      <Visible>false</Visible>
+    </Content>
+    <Content Condition="'$(Configuration)'=='Debug' And Exists('..\Native\bin\Debug\rv32i_core.pdb')"
+             Include="..\Native\bin\Debug\rv32i_core.pdb">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>rv32i_core.pdb</Link>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+</Project>

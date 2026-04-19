@@ -1,0 +1,76 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Produces a self-contained test exe using the new Microsoft Testing Platform -->
+    <EnableMSTestRunner>true</EnableMSTestRunner>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- All-in-one MSTest 3.x package (framework + adapter + MTP runner) -->
+    <PackageReference Include="MSTest" Version="3.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Core\RiscVEmulator.Core.csproj" />
+  </ItemGroup>
+
+  <!-- Copy C sources, linker script and runtime to the test output directory -->
+  <ItemGroup>
+    <None Update="Programs\linker.ld"       CopyToOutputDirectory="Always" />
+    <None Update="Programs\primes.c"        CopyToOutputDirectory="Always" />
+    <None Update="Programs\fibonacci.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\bubblesort.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\bitops.c"        CopyToOutputDirectory="Always" />
+    <None Update="Programs\mem_widths.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\signed_ops.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\uint64_ops.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\factorial.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\float_basics.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\float_matmul.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\double_basics.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\double_matmul.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\timer_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\fb_test.c"      CopyToOutputDirectory="Always" />
+    <None Update="Programs\input_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\audio_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\runtime_ops.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\malloc_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\vfs_test.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\syscalls_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\mmio_devices_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\printf_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\string_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\ctype_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Runtime\softfloat.c"      CopyToOutputDirectory="Always" />
+    <None Update="Runtime\crt0.c"           CopyToOutputDirectory="Always" />
+    <None Update="Runtime\runtime.c"        CopyToOutputDirectory="Always" />
+    <None Update="Runtime\malloc.c"         CopyToOutputDirectory="Always" />
+    <None Update="Runtime\vfs.c"            CopyToOutputDirectory="Always" />
+    <None Update="Runtime\syscalls.c"       CopyToOutputDirectory="Always" />
+    <None Update="Runtime\libc.c"           CopyToOutputDirectory="Always" />
+    <None Update="Runtime\libc.h"           CopyToOutputDirectory="Always" />
+    <None Update="Runtime\math.c"           CopyToOutputDirectory="Always" />
+    <None Update="Runtime\string.h"         CopyToOutputDirectory="Always" />
+    <None Update="Runtime\stdlib.h"         CopyToOutputDirectory="Always" />
+    <None Update="Runtime\stdio.h"          CopyToOutputDirectory="Always" />
+    <None Update="Runtime\ctype.h"          CopyToOutputDirectory="Always" />
+    <None Update="Runtime\errno.h"          CopyToOutputDirectory="Always" />
+    <None Update="Runtime\math.h"           CopyToOutputDirectory="Always" />
+    <None Update="Runtime\assert.h"         CopyToOutputDirectory="Always" />
+    <None Update="Runtime\time.h"           CopyToOutputDirectory="Always" />
+    <None Update="Programs\stdlib_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\math_test.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_mkrgba_test.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_clearscreen_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_triangle_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_render_test.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_fastras_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_worldgen_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_physics_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_midi_test.c"      CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_gameloop_test.c"  CopyToOutputDirectory="Always" />
+  </ItemGroup>
+</Project>

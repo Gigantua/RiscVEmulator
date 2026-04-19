@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Examples.Linux": {
+      "commandName": "Project",
+      "commandLineArgs": "--download"
+    }
+  }
+}

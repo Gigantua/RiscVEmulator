@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Examples.Doom": {
+      "commandName": "Project",
+      "nativeDebugging": true
+    }
+  }
+}
