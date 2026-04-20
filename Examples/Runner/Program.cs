@@ -47,6 +47,7 @@ var bus     = new MemoryBus(memory);
 var uart    = new UartDevice();
 var fb      = new FramebufferDevice();
 var display = new DisplayControlDevice(fb);
+display.SetMemory(memory);
 var kbd     = new KeyboardDevice();
 var mouse   = new MouseDevice();
 var rtc     = new RealTimeClockDevice();

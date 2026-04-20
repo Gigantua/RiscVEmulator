@@ -461,6 +461,211 @@ static __forceinline void step_fast_m() {
     mtime++;
 }
 
+// ── Fast path: RV32IM + F (no priv, no A) ────────────────────────────
+static __forceinline void step_fast_mf() {
+    const uint32_t instr  = mem_read_word(pc);
+    const uint32_t opcode = instr & 0x7F;
+    const int      rd     = (instr >>  7) & 0x1F;
+    const int      rs1    = (instr >> 15) & 0x1F;
+    const int      rs2    = (instr >> 20) & 0x1F;
+    const uint32_t f3     = (instr >> 12) & 0x7;
+    const uint32_t f7     = (instr >> 25) & 0x7F;
+    const int32_t  s1     = (int32_t)regs[rs1];
+    const uint32_t u1     = regs[rs1];
+    const int32_t  s2     = (int32_t)regs[rs2];
+    const uint32_t u2     = regs[rs2];
+    uint32_t nextpc = pc + 4;
+
+    switch (opcode) {
+
+    case 0x37: regs[rd] = instr & 0xFFFFF000u; break;                                    // LUI
+    case 0x17: regs[rd] = pc + (instr & 0xFFFFF000u); break;                             // AUIPC
+    case 0x6F: regs[rd] = pc + 4; nextpc = pc + j_imm(instr); break;                    // JAL
+    case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;                      // JALR
+                 regs[rd] = pc + 4; nextpc = t; break; }
+
+    case 0x63: {                                                                           // BRANCH
+        int taken;
+        switch (f3) {
+            case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
+            case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
+            case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
+            default: taken = 0;
+        }
+        if (taken) nextpc = pc + b_imm(instr);
+        break;
+    }
+
+    case 0x03: {                                                                           // LOAD
+        const uint32_t addr = (uint32_t)(s1 + i_imm(instr));
+        switch (f3) {
+            case 0: regs[rd] = (uint32_t)(int8_t) mem_read_byte(addr); break;
+            case 1: regs[rd] = (uint32_t)(int16_t)mem_read_half(addr); break;
+            case 2: regs[rd] = mem_read_word(addr);                     break;
+            case 4: regs[rd] = mem_read_byte(addr);                     break;
+            case 5: regs[rd] = mem_read_half(addr);                     break;
+        }
+        break;
+    }
+
+    case 0x23: {                                                                           // STORE
+        const uint32_t addr = (uint32_t)(s1 + s_imm(instr));
+        switch (f3) {
+            case 0: mem_write_byte(addr, (uint8_t) u2); break;
+            case 1: mem_write_half(addr, (uint16_t)u2); break;
+            case 2: mem_write_word(addr,             u2); break;
+        }
+        break;
+    }
+
+    case 0x13: {                                                                           // OP-IMM
+        const int32_t imm = i_imm(instr);
+        const int     sh  = (instr >> 20) & 0x1F;
+        uint32_t r;
+        switch (f3) {
+            case 0: r = (uint32_t)(s1 + imm);                                    break;
+            case 1: r = u1 << sh;                                                 break;
+            case 2: r = s1 < imm           ? 1u : 0u;                            break;
+            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                            break;
+            case 4: r = u1 ^ (uint32_t)imm;                                      break;
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;           break;
+            case 6: r = u1 | (uint32_t)imm;                                      break;
+            case 7: r = u1 & (uint32_t)imm;                                      break;
+            default: r = 0;
+        }
+        regs[rd] = r;
+        break;
+    }
+
+    case 0x33: {                                                                           // OP (M-ext always enabled)
+        if (f7 == 0x01) { regs[rd] = exec_m(f3, s1, u1, s2, u2); break; }
+        const int sh = s2 & 0x1F;
+        uint32_t r;
+        switch (f3) {
+            case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
+            case 1: r = u1 << sh;                                                 break;
+            case 2: r = s1 < s2 ? 1u : 0u;                                       break;
+            case 3: r = u1 < u2 ? 1u : 0u;                                       break;
+            case 4: r = u1 ^ u2;                                                  break;
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;            break;
+            case 6: r = u1 | u2;                                                  break;
+            case 7: r = u1 & u2;                                                  break;
+            default: r = 0;
+        }
+        regs[rd] = r;
+        break;
+    }
+
+    // ── F-extension (single-precision) ──────────────────────────────────
+    case 0x07:  /* FLW */
+        if (f3 == 2) fregs[rd] = mem_read_word((uint32_t)(s1 + i_imm(instr)));
+        break;
+
+    case 0x27:  /* FSW */
+        if (f3 == 2) mem_write_word((uint32_t)(s1 + s_imm(instr)), fregs[rs2]);
+        break;
+
+    case 0x43: case 0x47: case 0x4B: case 0x4F: {  /* FMADD/FMSUB/FNMSUB/FNMADD */
+        const int rs3 = (int)((instr >> 27) & 0x1F);
+        const float fa = f_get(rs1), fb = f_get(rs2), fc = f_get(rs3);
+        float fr;
+        if      (opcode == 0x43) fr =  fa*fb + fc;
+        else if (opcode == 0x47) fr =  fa*fb - fc;
+        else if (opcode == 0x4B) fr = -fa*fb + fc;
+        else                     fr = -fa*fb - fc;
+        f_set(rd, fr);
+        break;
+    }
+
+    case 0x53:  /* OP-FP */
+        switch (f7) {
+            case 0x00: f_set(rd, f_get(rs1) + f_get(rs2)); break;
+            case 0x04: f_set(rd, f_get(rs1) - f_get(rs2)); break;
+            case 0x08: f_set(rd, f_get(rs1) * f_get(rs2)); break;
+            case 0x0C: f_set(rd, f_get(rs1) / f_get(rs2)); break;
+            case 0x2C: f_set(rd, host_sqrtf(f_get(rs1))); break;
+            case 0x10:
+                switch (f3) {
+                    case 0: fregs[rd] = ( fregs[rs2]             & 0x80000000u) | (fregs[rs1] & 0x7FFFFFFFu); break;
+                    case 1: fregs[rd] = (~fregs[rs2]             & 0x80000000u) | (fregs[rs1] & 0x7FFFFFFFu); break;
+                    case 2: fregs[rd] = ((fregs[rs1]^fregs[rs2]) & 0x80000000u) | (fregs[rs1] & 0x7FFFFFFFu); break;
+                }
+                break;
+            case 0x14: {
+                const float fa = f_get(rs1), fb = f_get(rs2);
+                const int   na = f_isnan(rs1), nb = f_isnan(rs2);
+                if      (na && nb) fregs[rd] = 0x7FC00000u;
+                else if (na)       f_set(rd, fb);
+                else if (nb)       f_set(rd, fa);
+                else if (f3 == 0)  f_set(rd, fa < fb ? fa : fb);
+                else               f_set(rd, fa > fb ? fa : fb);
+                break;
+            }
+            case 0x50:
+                switch (f3) {
+                    case 2: regs[rd] = (!f_isnan(rs1)&&!f_isnan(rs2)&&f_get(rs1)==f_get(rs2)) ? 1u : 0u; break;
+                    case 1: regs[rd] = (!f_isnan(rs1)&&!f_isnan(rs2)&&f_get(rs1)< f_get(rs2)) ? 1u : 0u; break;
+                    case 0: regs[rd] = (!f_isnan(rs1)&&!f_isnan(rs2)&&f_get(rs1)<=f_get(rs2)) ? 1u : 0u; break;
+                }
+                break;
+            case 0x60: {
+                const float fa = f_get(rs1);
+                regs[rd] = (rs2 == 0)
+                    ? (f_isnan(rs1) ? 0x7FFFFFFFu : (uint32_t)(int32_t)fa)
+                    : ((f_isnan(rs1)||fa<0.0f) ? 0u : (uint32_t)fa);
+                break;
+            }
+            case 0x68:
+                f_set(rd, rs2==0 ? (float)(int32_t)regs[rs1] : (float)regs[rs1]);
+                break;
+            case 0x70:
+                if (f3 == 0) regs[rd] = fregs[rs1];
+                else if (f3 == 1) {
+                    uint32_t bits = fregs[rs1];
+                    uint32_t sign = bits >> 31;
+                    uint32_t exp  = (bits >> 23) & 0xFF;
+                    uint32_t mant = bits & 0x7FFFFF;
+                    uint32_t result = 0;
+                    if (exp == 0xFF) {
+                        result = mant == 0 ? (sign ? 1u : 128u) : ((mant & 0x400000) ? 512u : 256u);
+                    } else if (exp == 0) {
+                        result = mant == 0 ? (sign ? 8u : 16u) : (sign ? 4u : 32u);
+                    } else {
+                        result = sign ? 2u : 64u;
+                    }
+                    regs[rd] = result;
+                }
+                break;
+            case 0x78:
+                fregs[rd] = regs[rs1];
+                break;
+        }
+        break;
+
+    // AMO — not enabled in this fast path
+    case 0x2F: break;
+
+    case 0x0F: break;                                                                     // FENCE — NOP
+
+    case 0x73: {                                                                           // SYSTEM (bare-metal)
+        const uint32_t fn  = (instr >> 20) & 0xFFF;
+        const uint32_t f3s = (instr >> 12) & 0x7;
+        if (f3s == 0) {
+            if      (fn == 0) { if (on_ecall) on_ecall(regs); }                          // ECALL
+            else if (fn == 1) { halted = 1; }                                             // EBREAK
+        } else {
+            regs[rd] = 0;                                                                 // CSR reads → 0 in bare-metal
+        }
+        break;
+    }
+
+    } // end switch (opcode)
+
+    regs[0] = 0;
+    pc = nextpc;
+    mtime++;
+}
+
 // ── Execute one instruction ───────────────────────────────────────────
 static inline void step() {
     // Privileged mode: timer interrupt check and WFI sleep
@@ -665,6 +870,30 @@ static inline void step() {
                     break;
                 case 0x70:  /* FMV.X.W (f3==0) / FCLASS.S (f3==1) */
                     if (f3 == 0) regs[rd] = fregs[rs1];
+                    else if (f3 == 1) {
+                        uint32_t bits = fregs[rs1];
+                        uint32_t sign = bits >> 31;
+                        uint32_t exp = (bits >> 23) & 0xFF;
+                        uint32_t mant = bits & 0x7FFFFF;
+                        uint32_t result = 0;
+                        if (exp == 0xFF) {
+                            if (mant == 0) {
+                                result = sign ? 1 : 128;
+                            } else {
+                                uint32_t quiet = mant & 0x400000;
+                                result = quiet ? 512 : 256;
+                            }
+                        } else if (exp == 0) {
+                            if (mant == 0) {
+                                result = sign ? 8 : 16;
+                            } else {
+                                result = sign ? 4 : 32;
+                            }
+                        } else {
+                            result = sign ? 2 : 64;
+                        }
+                        regs[rd] = result;
+                    }
                     break;
                 case 0x78:  /* FMV.W.X */
                     fregs[rd] = regs[rs1];
@@ -809,6 +1038,14 @@ extern "C" int rv32i_step_n(int n) {
     if (!enable_priv && !enable_f && !enable_a && enable_m) {
         for (int i = 0; i < n; i++) {
             step_fast_m();
+            if (__builtin_expect(halted, 0)) return -(i + 1);
+        }
+        return n;
+    }
+    // Fast path: RV32IMF bare-metal — for float-heavy workloads (Mp4Player).
+    if (!enable_priv && enable_f && !enable_a && enable_m) {
+        for (int i = 0; i < n; i++) {
+            step_fast_mf();
             if (__builtin_expect(halted, 0)) return -(i + 1);
         }
         return n;

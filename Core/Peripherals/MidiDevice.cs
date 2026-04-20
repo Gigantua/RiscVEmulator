@@ -10,6 +10,7 @@ namespace RiscVEmulator.Core.Peripherals
     ///   +0x00 STATUS (RO) — bit 0 = device ready
     ///   +0x04 DATA   (WO) — write a MIDI short message (status | data1&lt;&lt;8 | data2&lt;&lt;16)
     ///   +0x08 CTRL   (WO) — bit 0 = reset (all notes off)
+    ///   +0x0C SLEEP  (WO) — write N: blocks CPU thread for N real milliseconds (max 10000)
     /// </summary>
     public class MidiDevice : IPeripheral, IDisposable
     {
@@ -84,6 +85,11 @@ namespace RiscVEmulator.Core.Peripherals
                 case 0x08: // CTRL
                     if ((value & 1) != 0 && _opened)
                         midiOutReset(_midiHandle);
+                    break;
+
+                case 0x0C: // SLEEP — block CPU thread for N milliseconds (real wall-clock)
+                    if (value > 0 && value <= 10_000)
+                        Thread.Sleep((int)value);
                     break;
             }
         }

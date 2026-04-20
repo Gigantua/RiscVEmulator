@@ -34,9 +34,9 @@
 #define MOUSE_DY     (*(volatile int *)0x10002008)
 #define MOUSE_BTN    (*(volatile unsigned int *)0x1000200C)
 
-/* Framebuffer: 320×200×4 = 256,000 bytes */
-#define FB_BASE     ((volatile unsigned char *)0x20000000)
-#define FB_SIZE     (320 * 200 * 4)
+/* Display control */
+#define DISP_VSYNC   (*(volatile unsigned int *)0x2010000C)
+#define DISP_FB_ADDR (*(volatile unsigned int *)0x2010001C)
 
 /* Timer (CLINT: mtime as instruction count) */
 #define TIMER_LO    (*(volatile unsigned int *)0x0200BFF8)
@@ -206,19 +206,20 @@ static void poll_mouse(void)
     }
 }
 
-/* ── Framebuffer Copy ──────────────────────────────────────────── */
+/* ── Framebuffer ──────────────────────────────────────────────── */
+static int fb_addr_set = 0;
+
 static void copy_framebuffer(void)
 {
     const unsigned char *src = doom_get_framebuffer(4); /* RGBA */
     if (!src) return;
 
-    /* Copy 320×200×4 bytes to MMIO framebuffer using word writes (4× fewer ops) */
-    volatile unsigned int *dst = (volatile unsigned int *)0x20000000;
-    const unsigned int *src32 = (const unsigned int *)src;
-    int count = (320 * 200); /* number of pixels = number of u32 words */
-    for (int i = 0; i < count; i++) {
-        dst[i] = src32[i];
+    /* Point display at Doom's internal RGBA buffer in RAM — zero-copy */
+    if (!fb_addr_set) {
+        DISP_FB_ADDR = (unsigned int)src;
+        fb_addr_set = 1;
     }
+    DISP_VSYNC = 1;
 }
 
 /* ── Audio Copy ────────────────────────────────────────────────── */
@@ -233,6 +234,10 @@ static void copy_audio(void)
 {
     short *buf = doom_get_sound_buffer();
     if (!buf) return;
+
+    /* Wait for host to consume previous buffer */
+    while (AUDIO_CTRL & 1)
+        ;
 
     /* Amplify samples by 4× before copying to MMIO */
     volatile short *dst = (volatile short *)AUDIO_BUF;

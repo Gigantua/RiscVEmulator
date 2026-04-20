@@ -17,7 +17,7 @@ public abstract class EmulatorTestBase
     protected static readonly string TestDir = AppContext.BaseDirectory;
     protected static readonly string ProgramDir = Path.Combine(TestDir, "Programs");
     protected static readonly string RuntimeDir = Path.Combine(TestDir, "Runtime");
-    protected static readonly string LinkerScript = Path.Combine(ProgramDir, "linker.ld");
+    protected static readonly string LinkerScript = Path.Combine(RuntimeDir, "linker.ld");
 
     /// <summary>Compile one or more C/object files to a RISC-V ELF using clang.</summary>
     protected static void CompileC(IEnumerable<string> srcFiles, string elfFile)
@@ -176,6 +176,7 @@ public abstract class EmulatorTestBase
         var uart    = new UartDevice();
         var fb      = new FramebufferDevice();
         var display = new DisplayControlDevice(fb);
+        display.SetMemory(memory);
         var kbd     = new KeyboardDevice();
         var mouse   = new MouseDevice();
         var rtc     = new RealTimeClockDevice();

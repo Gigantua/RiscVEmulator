@@ -19,7 +19,7 @@
 
   <!-- Copy C sources, linker script and runtime to the test output directory -->
   <ItemGroup>
-    <None Update="Programs\linker.ld"       CopyToOutputDirectory="Always" />
+    <None Include="..\Runtime\linker.ld"    CopyToOutputDirectory="Always" Link="Runtime\linker.ld" />
     <None Update="Programs\primes.c"        CopyToOutputDirectory="Always" />
     <None Update="Programs\fibonacci.c"     CopyToOutputDirectory="Always" />
     <None Update="Programs\bubblesort.c"    CopyToOutputDirectory="Always" />
@@ -44,23 +44,24 @@
     <None Update="Programs\printf_test.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\string_test.c" CopyToOutputDirectory="Always" />
     <None Update="Programs\ctype_test.c"  CopyToOutputDirectory="Always" />
-    <None Update="Runtime\softfloat.c"      CopyToOutputDirectory="Always" />
-    <None Update="Runtime\crt0.c"           CopyToOutputDirectory="Always" />
-    <None Update="Runtime\runtime.c"        CopyToOutputDirectory="Always" />
-    <None Update="Runtime\malloc.c"         CopyToOutputDirectory="Always" />
-    <None Update="Runtime\vfs.c"            CopyToOutputDirectory="Always" />
-    <None Update="Runtime\syscalls.c"       CopyToOutputDirectory="Always" />
-    <None Update="Runtime\libc.c"           CopyToOutputDirectory="Always" />
-    <None Update="Runtime\libc.h"           CopyToOutputDirectory="Always" />
-    <None Update="Runtime\math.c"           CopyToOutputDirectory="Always" />
-    <None Update="Runtime\string.h"         CopyToOutputDirectory="Always" />
-    <None Update="Runtime\stdlib.h"         CopyToOutputDirectory="Always" />
-    <None Update="Runtime\stdio.h"          CopyToOutputDirectory="Always" />
-    <None Update="Runtime\ctype.h"          CopyToOutputDirectory="Always" />
-    <None Update="Runtime\errno.h"          CopyToOutputDirectory="Always" />
-    <None Update="Runtime\math.h"           CopyToOutputDirectory="Always" />
-    <None Update="Runtime\assert.h"         CopyToOutputDirectory="Always" />
-    <None Update="Runtime\time.h"           CopyToOutputDirectory="Always" />
+    <None Include="..\Runtime\softfloat.c"   CopyToOutputDirectory="Always" Link="Runtime\softfloat.c" />
+    <None Include="..\Runtime\crt0.c"        CopyToOutputDirectory="Always" Link="Runtime\crt0.c" />
+    <None Include="..\Runtime\runtime.c"     CopyToOutputDirectory="Always" Link="Runtime\runtime.c" />
+    <None Include="..\Runtime\malloc.c"      CopyToOutputDirectory="Always" Link="Runtime\malloc.c" />
+    <None Include="..\Runtime\vfs.c"         CopyToOutputDirectory="Always" Link="Runtime\vfs.c" />
+    <None Include="..\Runtime\syscalls.c"    CopyToOutputDirectory="Always" Link="Runtime\syscalls.c" />
+    <None Include="..\Runtime\libc.c"        CopyToOutputDirectory="Always" Link="Runtime\libc.c" />
+    <None Include="..\Runtime\libc.h"        CopyToOutputDirectory="Always" Link="Runtime\libc.h" />
+    <None Include="..\Runtime\math.c"        CopyToOutputDirectory="Always" Link="Runtime\math.c" />
+    <None Include="..\Runtime\setjmp.c"      CopyToOutputDirectory="Always" Link="Runtime\setjmp.c" />
+    <None Include="..\Runtime\string.h"      CopyToOutputDirectory="Always" Link="Runtime\string.h" />
+    <None Include="..\Runtime\stdlib.h"      CopyToOutputDirectory="Always" Link="Runtime\stdlib.h" />
+    <None Include="..\Runtime\stdio.h"       CopyToOutputDirectory="Always" Link="Runtime\stdio.h" />
+    <None Include="..\Runtime\ctype.h"       CopyToOutputDirectory="Always" Link="Runtime\ctype.h" />
+    <None Include="..\Runtime\errno.h"       CopyToOutputDirectory="Always" Link="Runtime\errno.h" />
+    <None Include="..\Runtime\math.h"        CopyToOutputDirectory="Always" Link="Runtime\math.h" />
+    <None Include="..\Runtime\assert.h"      CopyToOutputDirectory="Always" Link="Runtime\assert.h" />
+    <None Include="..\Runtime\time.h"        CopyToOutputDirectory="Always" Link="Runtime\time.h" />
     <None Update="Programs\stdlib_test.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\math_test.c"     CopyToOutputDirectory="Always" />
     <None Update="Programs\voxel_mkrgba_test.c"    CopyToOutputDirectory="Always" />

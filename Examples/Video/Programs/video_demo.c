@@ -12,11 +12,14 @@
 
 #include "libc.h"
 
-#define FB_BASE     ((volatile unsigned int *)0x20000000)
-#define RTC_MS_LO   (*(volatile unsigned int *)0x10003008)
+#define RTC_MS_LO    (*(volatile unsigned int *)0x10003008)
+#define DISP_VSYNC   (*(volatile unsigned int *)0x2010000C)
+#define DISP_FB_ADDR (*(volatile unsigned int *)0x2010001C)
 
 #define WIDTH  320
 #define HEIGHT 200
+
+static unsigned int framebuf[WIDTH * HEIGHT];
 
 static unsigned int pack_rgba(unsigned char r, unsigned char g, unsigned char b)
 {
@@ -33,7 +36,7 @@ static void draw_gradient(int frame)
             unsigned char r = (unsigned char)((x + frame) & 0xFF);
             unsigned char g = (unsigned char)((y * 2) & 0xFF);
             unsigned char b = (unsigned char)(((x + y + frame) >> 1) & 0xFF);
-            FB_BASE[y * WIDTH + x] = pack_rgba(r, g, b);
+            framebuf[y * WIDTH + x] = pack_rgba(r, g, b);
         }
     }
 }
@@ -46,7 +49,7 @@ static void draw_xor(int frame)
         for (int x = 0; x < WIDTH; x++)
         {
             unsigned char v = (unsigned char)((x ^ y ^ frame) & 0xFF);
-            FB_BASE[y * WIDTH + x] = pack_rgba(v, v >> 1, v << 1);
+            framebuf[y * WIDTH + x] = pack_rgba(v, v >> 1, v << 1);
         }
     }
 }
@@ -65,9 +68,9 @@ static void draw_bouncer(int frame)
         for (int x = 0; x < WIDTH; x++)
         {
             if (x >= bx && x < bx + bw && y >= by && y < by + bh)
-                FB_BASE[y * WIDTH + x] = pack_rgba(255, 255, 0);
+                framebuf[y * WIDTH + x] = pack_rgba(255, 255, 0);
             else
-                FB_BASE[y * WIDTH + x] = pack_rgba(0, 0, (unsigned char)(y & 0x3F));
+                framebuf[y * WIDTH + x] = pack_rgba(0, 0, (unsigned char)(y & 0x3F));
         }
     }
 }
@@ -75,6 +78,8 @@ static void draw_bouncer(int frame)
 void _start(void)
 {
     printf("Video demo: starting\n");
+
+    DISP_FB_ADDR = (unsigned int)framebuf;
 
     int frame = 0;
     unsigned int lastMs = RTC_MS_LO;
@@ -91,6 +96,7 @@ void _start(void)
             case 2: draw_bouncer(frame);   break;
         }
 
+        DISP_VSYNC = 1;
         frame++;
 
         /* Print FPS every 1000ms */

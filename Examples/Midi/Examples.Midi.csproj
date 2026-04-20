@@ -9,8 +9,11 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
-    <RootNamespace>Examples.Linux</RootNamespace>
+    <RootNamespace>Examples.Midi</RootNamespace>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="Programs\midi_demo.c" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>

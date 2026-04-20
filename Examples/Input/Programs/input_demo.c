@@ -23,9 +23,10 @@
 #define MOUSE_BTN    (*(volatile unsigned int *)0x1000200C)
 
 /* Framebuffer */
-#define FB_BASE      ((volatile unsigned int *)0x20000000)
 #define WIDTH        320
 #define HEIGHT       200
+#define DISP_VSYNC   (*(volatile unsigned int *)0x2010000C)
+#define DISP_FB_ADDR (*(volatile unsigned int *)0x2010001C)
 
 /* RTC */
 #define RTC_MS_LO    (*(volatile unsigned int *)0x10003008)
@@ -35,13 +36,12 @@ static unsigned int pack_rgba(unsigned char r, unsigned char g, unsigned char b)
     return (unsigned int)r | ((unsigned int)g << 8) | ((unsigned int)b << 16) | (0xFFu << 24);
 }
 
-/* Back-buffer:draw here, then copy to FB_BASE in one shot to avoid tearing */
+/* Back-buffer: draw here, then signal vsync to present from RAM */
 static unsigned int backbuf[WIDTH * HEIGHT];
 
 static void flip(void)
 {
-    for (int i = 0; i < WIDTH * HEIGHT; i++)
-        FB_BASE[i] = backbuf[i];
+    DISP_VSYNC = 1;
 }
 
 static void bb_clear(unsigned int color)
@@ -85,6 +85,8 @@ void _start(void)
     printf("Input demo: move mouse, press keys\n");
     printf("  Mouse controls cursor, keys light up on screen\n");
     printf("  Press F10 to release mouse grab\n");
+
+    DISP_FB_ADDR = (unsigned int)backbuf;
 
     int cursorX = WIDTH / 2;
     int cursorY = HEIGHT / 2;

@@ -8,12 +8,12 @@ string exeDir = AppContext.BaseDirectory;
 
 // Resolve shared runtime files
 string solutionRoot = Path.GetFullPath(Path.Combine(exeDir, "..", "..", "..", "..", ".."));
-string runtimeDir   = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Runtime");
+string runtimeDir   = Path.Combine(solutionRoot, "Runtime");
 string runtimeC     = Path.Combine(runtimeDir, "runtime.c");
 string libcC        = Path.Combine(runtimeDir, "libc.c");
 string softfloatC   = Path.Combine(runtimeDir, "softfloat.c");
 string syscallsC    = Path.Combine(runtimeDir, "syscalls.c");
-string linkerLd     = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Programs", "linker.ld");
+string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
 string demoC        = Path.Combine(exeDir, "Programs", "sound_demo.c");
 
 string buildDir = Path.Combine(exeDir, "build");
@@ -44,6 +44,7 @@ var bus     = new MemoryBus(memory);
 var uart    = new UartDevice();
 var fb      = new FramebufferDevice();
 var display = new DisplayControlDevice(fb);
+display.SetMemory(memory);
 var kbd     = new KeyboardDevice();
 var mouse   = new MouseDevice();
 var rtc     = new RealTimeClockDevice();

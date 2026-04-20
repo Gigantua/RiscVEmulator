@@ -19,9 +19,8 @@ while (solutionRoot != null && !File.Exists(Path.Combine(solutionRoot, "RiscVEmu
 if (solutionRoot == null)
     throw new DirectoryNotFoundException($"Cannot find RiscVEmulator.sln starting from {exeDir}");
 
-string runtimeDir   = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Runtime");
-string testProgDir  = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Programs");
-string linkerLd     = Path.Combine(testProgDir,  "linker.ld");
+string runtimeDir   = Path.Combine(solutionRoot, "Runtime");
+string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
 
 // ── Parse CLI args ─────────────────────────────────────────────────
 var opts = new SdlWindowOptions { Title = "Voxel — RV32I Emulator", GrabMouse = true };
@@ -114,6 +113,7 @@ var bus     = new MemoryBus(memory);
 var uart    = new UartDevice();
 var fb      = new FramebufferDevice();
 var display = new DisplayControlDevice(fb);
+display.SetMemory(memory);
 var kbd     = new KeyboardDevice();
 var mouse   = new MouseDevice();
 var rtc     = new RealTimeClockDevice();

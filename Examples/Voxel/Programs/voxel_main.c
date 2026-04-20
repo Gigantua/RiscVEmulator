@@ -30,6 +30,7 @@
 #define MOUSE_BASE ((volatile int32_t*)0x10002000u)
 #define RTC_BASE ((volatile uint32_t*)0x10003000u)
 #define DISP_VSYNC_REG (DISP_BASE[3])
+#define DISP_FB_ADDR_REG (DISP_BASE[7])
 #define KBD_STATUS (KBD_BASE[0])
 #define KBD_DATA (KBD_BASE[1])
 #define MOUSE_DX (MOUSE_BASE[1])
@@ -903,6 +904,7 @@ int main(void)
         s_proj_scale_y = proj[5];
     }
 
+    DISP_FB_ADDR_REG = (uint32_t)s_shadow;
     printf("Voxel: Entering game loop (camera-space verts + backface culling + fixed-point raster)\n");
     printf(" WASD = move, Space = jump, Mouse = look\n");
     printf(" LMB = break, RMB = place, 1-5 = select block, ESC = quit\n");
@@ -980,7 +982,6 @@ int main(void)
         clear_screen();
         render_world();
         draw_crosshair();
-        memcpy((void*)FB_BASE, s_shadow, FB_PIXELS * sizeof(uint32_t));
         DISP_VSYNC_REG = 1;
     }
     printf("Voxel: Exiting\n");

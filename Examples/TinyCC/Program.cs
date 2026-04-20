@@ -71,9 +71,8 @@ while (solutionRoot != null && !File.Exists(Path.Combine(solutionRoot, "RiscVEmu
 if (solutionRoot == null)
     throw new DirectoryNotFoundException($"Cannot find RiscVEmulator.sln starting from {exeDir}");
 
-string runtimeDir  = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Runtime");
-string testProgDir = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Programs");
-string linkerLd    = Path.Combine(testProgDir, "linker.ld");
+string runtimeDir  = Path.Combine(solutionRoot, "Runtime");
+string linkerLd    = Path.Combine(runtimeDir, "linker.ld");
 string tinyccDir   = Path.Combine(solutionRoot, "Examples", "TinyCC", "tinycc");
 string includeDir  = Path.Combine(solutionRoot, "Examples", "TinyCC", "include");
 string programsDir = Path.Combine(solutionRoot, "Examples", "TinyCC", "Programs");

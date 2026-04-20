@@ -1,86 +1,89 @@
 using System.Diagnostics;
 using RiscVEmulator.Core;
 using RiscVEmulator.Core.Peripherals;
-using RiscVEmulator.Frontend;
 
 string clang = @"C:\Program Files\LLVM\bin\clang.exe";
 string exeDir = AppContext.BaseDirectory;
 
-// Resolve shared runtime files
-string solutionRoot = Path.GetFullPath(Path.Combine(exeDir, "..", "..", "..", "..", ".."));
+// Walk up from the exe dir to find the solution root (the directory containing Runtime/)
+string? solutionRoot = exeDir;
+while (solutionRoot != null && !Directory.Exists(Path.Combine(solutionRoot, "Runtime")))
+    solutionRoot = Path.GetDirectoryName(solutionRoot);
+if (solutionRoot == null)
+    throw new DirectoryNotFoundException("Could not find solution root — no Runtime/ folder in any parent directory.");
 string runtimeDir   = Path.Combine(solutionRoot, "Runtime");
 string runtimeC     = Path.Combine(runtimeDir, "runtime.c");
 string libcC        = Path.Combine(runtimeDir, "libc.c");
 string softfloatC   = Path.Combine(runtimeDir, "softfloat.c");
 string syscallsC    = Path.Combine(runtimeDir, "syscalls.c");
+string crt0C        = Path.Combine(runtimeDir, "crt0.c");
 string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
-string demoC        = Path.Combine(exeDir, "Programs", "video_demo.c");
+string demoC        = Path.Combine(exeDir, "Programs", "midi_demo.c");
 
 string buildDir = Path.Combine(exeDir, "build");
 Directory.CreateDirectory(buildDir);
 
 // ── Compile ──────────────────────────────────────────────────────
-Console.WriteLine("Compiling video demo...");
+Console.WriteLine("Compiling MIDI demo...");
 
 string runtimeObj   = Path.Combine(buildDir, "runtime.o");
 string libcObj      = Path.Combine(buildDir, "libc.o");
 string softfloatObj = Path.Combine(buildDir, "softfloat.o");
 string syscallsObj  = Path.Combine(buildDir, "syscalls.o");
-string demoObj      = Path.Combine(buildDir, "video_demo.o");
-string elfPath      = Path.Combine(buildDir, "video_demo.elf");
+string crt0Obj      = Path.Combine(buildDir, "crt0.o");
+string demoObj      = Path.Combine(buildDir, "midi_demo.o");
+string elfPath      = Path.Combine(buildDir, "midi_demo.elf");
 
 CompileObj(runtimeC, runtimeObj);
 CompileObj(libcC, libcObj);
 CompileObj(softfloatC, softfloatObj);
 CompileObj(syscallsC, syscallsObj);
+CompileObj(crt0C, crt0Obj);
 CompileObj(demoC, demoObj);
-Link(new[] { demoObj, libcObj, softfloatObj, syscallsObj, runtimeObj }, elfPath);
+Link(new[] { demoObj, crt0Obj, libcObj, softfloatObj, syscallsObj, runtimeObj }, elfPath);
 
-Console.WriteLine($"  video_demo.elf: {new FileInfo(elfPath).Length:N0} bytes");
+Console.WriteLine($"  midi_demo.elf: {new FileInfo(elfPath).Length:N0} bytes");
 
 // ── Build SoC ────────────────────────────────────────────────────
-var memory  = new Memory(4 * 1024 * 1024); // 4MB is plenty
+var memory  = new Memory(4 * 1024 * 1024);
 var bus     = new MemoryBus(memory);
 var uart    = new UartDevice();
-var fb      = new FramebufferDevice();
-var display = new DisplayControlDevice(fb);
-display.SetMemory(memory);
-var kbd     = new KeyboardDevice();
-var mouse   = new MouseDevice();
-var rtc     = new RealTimeClockDevice();
-var audioBuf  = new AudioBufferDevice();
-var audioCtrl = new AudioControlDevice();
+using var midi = new MidiDevice();
 
 bus.RegisterPeripheral(uart);
-bus.RegisterPeripheral(fb);
-bus.RegisterPeripheral(display);
-bus.RegisterPeripheral(kbd);
-bus.RegisterPeripheral(mouse);
-bus.RegisterPeripheral(rtc);
-bus.RegisterPeripheral(audioBuf);
-bus.RegisterPeripheral(audioCtrl);
+bus.RegisterPeripheral(midi);
 
 uart.OutputHandler = c => Console.Write(c);
 
 byte[] elfData = File.ReadAllBytes(elfPath);
 var regs = new RegisterFile();
 uint entry = ElfLoader.Load(elfData, bus);
-regs.Write(2, 0x003FFF00u); // stack near top of 4MB
+regs.Write(2, 0x003FFF00u);
 
 var emu = new Emulator(bus, regs, entry);
 emu.OutputHandler = c => Console.Write(c);
 
 // ── Run ──────────────────────────────────────────────────────────
-var opts = new SdlWindowOptions
-{
-    Title = "Video Demo — RV32I",
-    GrabMouse = false,
-    Scale = 3,
-    TargetFps = 60,
-};
+Console.WriteLine("Starting MIDI demo...");
 
-var window = new SdlWindow(fb, display, kbd, mouse, audioBuf, audioCtrl, emu, opts);
-return window.Run();
+bool running = true;
+var cpuThread = new System.Threading.Thread(() =>
+{
+    while (running && !emu.IsHalted)
+    {
+        for (int i = 0; i < 500_000 && running && !emu.IsHalted; i++)
+            emu.Step();
+    }
+})
+{ IsBackground = true, Name = "RV32I-CPU" };
+cpuThread.Start();
+
+// Wait for completion
+cpuThread.Join();
+Thread.Sleep(1500); // let the MIDI synth finish rendering the last notes
+Console.WriteLine("MIDI demo finished.");
+
+return 0;
 
 // ── Helpers ──────────────────────────────────────────────────────
 void CompileObj(string src, string obj)

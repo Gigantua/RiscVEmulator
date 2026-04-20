@@ -50,6 +50,14 @@ public unsafe class SdlWindow
     private volatile bool _running = true;
     private long _totalSteps;
 
+    // Audio state — shared between render loop and audio-drain thread
+    private Sdl? _sdlApi;
+    private uint _audioDevice;
+    private uint _lastAudioRate;
+    private byte _lastAudioChan;
+    private uint _lastQueuedGen = unchecked((uint)-1);
+    private readonly object _audioLock = new();
+
     public SdlWindow(
         FramebufferDevice fb, DisplayControlDevice display,
         KeyboardDevice kbd, MouseDevice mouse,
@@ -110,11 +118,54 @@ public unsafe class SdlWindow
         }
     }
 
+    // ── Audio drain (called from both render loop and audio thread) ─
+
+    private unsafe void DrainAudioQueue()
+    {
+        var sdl = _sdlApi;
+        if (sdl == null || _audioDevice == 0) return;
+        if (!_audioCtrl.IsPlaying || _audioCtrl.BufLength == 0) return;
+
+        uint gen    = _audioCtrl.WriteGeneration;
+        bool newData = gen != _lastQueuedGen;
+
+        // Only queue when the guest has signalled new data (WriteGeneration changed).
+        // Reading BufStart/BufLength is only safe AFTER the guest writes CTRL=1
+        // (which increments WriteGeneration), guaranteeing all registers are set.
+        if (newData)
+        {
+            uint queued = sdl.GetQueuedAudioSize(_audioDevice);
+            if (queued < 8192)
+            {
+                _lastQueuedGen = gen;
+                uint start = _audioCtrl.BufStart;
+                uint len = Math.Min(_audioCtrl.BufLength,
+                                    (uint)_audioBuf.Buffer.Length - start);
+                if (len > 0)
+                {
+                    fixed (byte* buf = &_audioBuf.Buffer[start])
+                        sdl.QueueAudio(_audioDevice, buf, len);
+                }
+                _audioCtrl.Ctrl = 0;
+            }
+        }
+    }
+
+    private void AudioDrainThread()
+    {
+        while (_running)
+        {
+            System.Threading.Thread.Sleep(8);
+            lock (_audioLock) { DrainAudioQueue(); }
+        }
+    }
+
     // ── Main entry point (SDL main thread) ──────────────────────────
 
     public int Run()
     {
         var sdl = Sdl.GetApi();
+        _sdlApi = sdl;
 
         if (sdl.Init(Sdl.InitVideo | Sdl.InitAudio | Sdl.InitEvents) < 0)
         {
@@ -170,10 +221,7 @@ public unsafe class SdlWindow
         }
 
         // ── Audio: lazy open when guest first writes config ────────
-        uint audioDevice = 0;
-        uint lastAudioRate = 0;
-        byte lastAudioChan = 0;
-        uint lastQueuedGen = unchecked((uint)-1); // sentinel: queue first frame immediately
+        // Audio state is in class fields — shared with AudioDrainThread
 
         // ── Start CPU thread ──────────────────────────────────────
         var cpuThread = new System.Threading.Thread(CpuThread)
@@ -183,6 +231,14 @@ public unsafe class SdlWindow
             Priority = System.Threading.ThreadPriority.AboveNormal
         };
         cpuThread.Start();
+
+        // ── Audio drain thread (survives window drag stalls) ──────
+        var audioThread = new System.Threading.Thread(AudioDrainThread)
+        {
+            IsBackground = true,
+            Name = "Audio-Drain"
+        };
+        audioThread.Start();
 
         // ── Stats ─────────────────────────────────────────────────
         var wallClock = Stopwatch.StartNew();
@@ -289,50 +345,32 @@ public unsafe class SdlWindow
                 _display.ClearVsync();
 
             // 3. Audio: open/reopen device if guest changed config, drain buffer
-            if (_audioCtrl.IsPlaying && _audioCtrl.BufLength > 0)
+            lock (_audioLock)
             {
-                uint rate = _audioCtrl.SampleRate;
-                byte chan = (byte)_audioCtrl.Channels;
-                if (rate != lastAudioRate || chan != lastAudioChan)
+                if (_audioCtrl.IsPlaying && _audioCtrl.BufLength > 0)
                 {
-                    if (audioDevice > 0) sdl.CloseAudioDevice(audioDevice);
-                    AudioSpec want = new()
+                    uint rate = _audioCtrl.SampleRate;
+                    byte chan = (byte)_audioCtrl.Channels;
+                    if (rate != _lastAudioRate || chan != _lastAudioChan)
                     {
-                        Freq = (int)rate,
-                        Format = Sdl.AudioS16Lsb,
-                        Channels = chan,
-                        Samples = 512,
-                    };
-                    AudioSpec have;
-                    audioDevice = sdl.OpenAudioDevice((byte*)null, 0, &want, &have, 0);
-                    if (audioDevice > 0)
-                        sdl.PauseAudioDevice(audioDevice, 0);
-                    lastAudioRate = rate;
-                    lastAudioChan = chan;
-                }
-
-                if (audioDevice > 0)
-                {
-                    uint gen    = _audioCtrl.WriteGeneration;
-                    uint queued = sdl.GetQueuedAudioSize(audioDevice);
-                    bool newData = gen != lastQueuedGen;
-
-                    // Queue when: new audio frame is ready (primary) OR queue is critically
-                    // low and we need to pad with the previous frame to avoid silence.
-                    // Keep at most 2 buffer-lengths (≈92ms) ahead to bound latency.
-                    if ((newData || queued < 2048) && queued < 4096)
-                    {
-                        if (newData) lastQueuedGen = gen;
-                        uint start = _audioCtrl.BufStart;
-                        uint len = Math.Min(_audioCtrl.BufLength,
-                                            (uint)_audioBuf.Buffer.Length - start);
-                        if (len > 0)
+                        if (_audioDevice > 0) sdl.CloseAudioDevice(_audioDevice);
+                        AudioSpec want = new()
                         {
-                            fixed (byte* buf = &_audioBuf.Buffer[start])
-                                sdl.QueueAudio(audioDevice, buf, len);
-                        }
+                            Freq = (int)rate,
+                            Format = Sdl.AudioS16Lsb,
+                            Channels = chan,
+                            Samples = 512,
+                        };
+                        AudioSpec have;
+                        _audioDevice = sdl.OpenAudioDevice((byte*)null, 0, &want, &have, 0);
+                        if (_audioDevice > 0)
+                            sdl.PauseAudioDevice(_audioDevice, 0);
+                        _lastAudioRate = rate;
+                        _lastAudioChan = chan;
                     }
                 }
+
+                DrainAudioQueue();
             }
 
             // 4. Stats (every 2 seconds)
@@ -355,8 +393,9 @@ public unsafe class SdlWindow
         // ── Shutdown ──────────────────────────────────────────────
         _running = false;
         cpuThread.Join(2000);
+        audioThread.Join(500);
 
-        if (audioDevice > 0) sdl.CloseAudioDevice(audioDevice);
+        if (_audioDevice > 0) sdl.CloseAudioDevice(_audioDevice);
         _midi?.Dispose();
         sdl.DestroyTexture(texture);
         sdl.DestroyRenderer(renderer);

@@ -245,48 +245,5 @@ async Task DownloadDtb(string targetPath)
 
 // ── SYSCON peripheral (poweroff/reboot at 0x11100000) ────────────────────────
 
-public sealed class SysconDevice : IPeripheral
-{
-    public uint BaseAddress => 0x11100000u;
-    public uint Size        => 0x1000u;
-
-    public Action? OnPowerOff { get; set; }
-    public Action? OnReboot   { get; set; }
-
-    public uint Read(uint offset, int width) => 0;
-
-    public void Write(uint offset, int width, uint value)
-    {
-        if (offset != 0) return;
-        if      (value == 0x5555u) OnPowerOff?.Invoke();
-        else if (value == 0x7777u) OnReboot?.Invoke();
-    }
-}
-
 // ── Windows VT / ANSI console support ────────────────────────────────────────
 
-/// <summary>Enables ANSI/VT-100 escape sequence processing on Windows stdout.</summary>
-internal static class ConsoleHelper
-{
-    internal static void EnableVt()
-    {
-        if (!OperatingSystem.IsWindows()) return;
-        try
-        {
-            // STD_OUTPUT_HANDLE = -11; ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            var h = GetStdHandle(-11);
-            if (GetConsoleMode(h, out uint mode))
-                SetConsoleMode(h, mode | 0x0004u);
-        }
-        catch { /* non-console host (piped / redirected) — ignore */ }
-    }
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern nint GetStdHandle(int nStdHandle);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern bool GetConsoleMode(nint hHandle, out uint lpMode);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    private static extern bool SetConsoleMode(nint hHandle, uint dwMode);
-}

@@ -17,11 +17,9 @@ string doomMainC   = Path.Combine(exeDir, "Programs", "doom_main.c");
 string pureDoomH   = Path.Combine(exeDir, "Programs"); // -I for PureDOOM.h
 string wadPath     = Path.Combine(exeDir, "doom1.wad");
 
-// Runtime sources live in the test project's Runtime/ folder
 string solutionRoot = Path.GetFullPath(Path.Combine(exeDir, "..", "..", "..", "..", ".."));
-string runtimeDir   = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Runtime");
-string programsDir  = Path.Combine(solutionRoot, "RiscVEmulator.Tests", "Programs");
-string linkerLd     = Path.Combine(programsDir, "linker.ld");
+string runtimeDir   = Path.Combine(solutionRoot, "Runtime");
+string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
 
 string runtimeC   = Path.Combine(runtimeDir, "runtime.c");
 string softfloatC = Path.Combine(runtimeDir, "softfloat.c");
@@ -120,6 +118,7 @@ var bus     = new MemoryBus(memory);
 var uart    = new UartDevice();
 var fb      = new FramebufferDevice();
 var display = new DisplayControlDevice(fb);
+display.SetMemory(memory);
 var kbd     = new KeyboardDevice();
 var mouse   = new MouseDevice();
 var rtc     = new RealTimeClockDevice();
