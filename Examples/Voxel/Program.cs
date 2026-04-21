@@ -25,7 +25,7 @@ string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
 // ── Parse CLI args ─────────────────────────────────────────────────
 var opts = new SdlWindowOptions { Title = "Voxel — RV32I Emulator", GrabMouse = true };
 bool enableMExt = true;
-bool enableFExt = false;
+bool enableFExt = true;
 
 for (int i = 0; i < args.Length; i++)
 {

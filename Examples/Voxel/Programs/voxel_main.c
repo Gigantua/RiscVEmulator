@@ -404,7 +404,7 @@ static uint8_t world_get(int x, int y, int z)
     return s_world[x][y][z];
 }
 /* ═══════════════════════════════ Framebuffer + depth ════════════════════════ */
-static uint8_t s_depth[FB_PIXELS];      /* 8-bit "already drawn" flag */
+static float   s_zbuf[FB_PIXELS];       /* per-pixel 1/w depth (larger = closer) */
 static uint32_t s_shadow[FB_PIXELS];
 static uint32_t s_sky[FB_PIXELS];
 static void init_sky(void)
@@ -422,24 +422,19 @@ static void init_sky(void)
 }
 static void clear_screen(void)
 {
-    memset(s_depth, 0, sizeof(s_depth));
+    memset(s_zbuf, 0, sizeof(s_zbuf));   /* 0.0f = infinitely far (1/w == 0) */
     memcpy(s_shadow, s_sky, sizeof(s_sky));
 }
-/* ═══════════════════════════════ FIXED-POINT SOFTWARE RASTERIZER ════════════════════════ */
-/* 16.16 fixed-point (FP=16) */
-#define FP 16
-#define FP_ONE (1 << FP)
-#define FP_HALF (1 << (FP-1))
-
+/* ═══════════════════════════════ FLOAT PERSPECTIVE-CORRECT RASTERIZER ═══════ */
 typedef struct
 {
-    int32_t sx, sy;   /* screen coords × FP_ONE */
-    int32_t u, v;     /* UV × FP_ONE */
+    float sx, sy;            /* screen coords (pixels) */
+    float u_w, v_w, inv_w;   /* u/w, v/w, 1/w for perspective-correct interp */
 } PVert;
 
 /* Camera-space basis + projection constants */
 static Vec3 s_cam_right, s_cam_up, s_cam_fwd, s_cam_eye;
-static float s_proj_scale_x, s_proj_scale_y;   /* only these two are actually used */
+static float s_proj_scale_x, s_proj_scale_y;
 
 static inline int vert_shader(float wx, float wy, float wz,
     float u, float v, PVert* out)
@@ -449,27 +444,25 @@ static inline int vert_shader(float wx, float wy, float wz,
     float cam_y = v3_dot(rel, s_cam_up);
     float cam_z = -v3_dot(rel, s_cam_fwd);   /* view-space Z (negative in front) */
 
-    float clip_x = s_proj_scale_x * cam_x;
-    float clip_y = s_proj_scale_y * cam_y;
-    float clip_w = -cam_z;                   /* matches original perspective matrix */
-
+    float clip_w = -cam_z;
     if (clip_w <= 0.05f) return 0;
 
-    float inv_cw = 1.0f / clip_w;
-    float sx_f = (clip_x * inv_cw * 0.5f + 0.5f) * (float)FB_WIDTH;
-    float sy_f = (0.5f - clip_y * inv_cw * 0.5f) * (float)FB_HEIGHT;
+    float inv_w = 1.0f / clip_w;
+    float clip_x = s_proj_scale_x * cam_x;
+    float clip_y = s_proj_scale_y * cam_y;
 
-    out->sx = (int32_t)(sx_f * FP_ONE);
-    out->sy = (int32_t)(sy_f * FP_ONE);
-    out->u = (int32_t)(u * FP_ONE);
-    out->v = (int32_t)(v * FP_ONE);
+    out->sx = (clip_x * inv_w * 0.5f + 0.5f) * (float)FB_WIDTH;
+    out->sy = (0.5f - clip_y * inv_w * 0.5f) * (float)FB_HEIGHT;
+    out->u_w = u * inv_w;
+    out->v_w = v * inv_w;
+    out->inv_w = inv_w;
     return 1;
 }
 
-static inline int64_t edge_fn_i(int32_t ax, int32_t ay, int32_t bx, int32_t by,
-    int32_t px, int32_t py)
+static inline float edge_fn(float ax, float ay, float bx, float by,
+    float px, float py)
 {
-    return (int64_t)(px - ax) * (by - ay) - (int64_t)(py - ay) * (bx - ax);
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
 }
 
 static inline uint32_t frag_shader_inline(int tx, int ty, int px_tex, int py_tex,
@@ -491,19 +484,15 @@ static inline uint32_t frag_shader_inline(int tx, int ty, int px_tex, int py_tex
 static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
     int tx, int ty, int ao_i, int fog_i)
 {
-    int32_t min_sx = v0->sx < v1->sx ? v0->sx : v1->sx;
-    min_sx = min_sx < v2->sx ? min_sx : v2->sx;
-    int32_t min_sy = v0->sy < v1->sy ? v0->sy : v1->sy;
-    min_sy = min_sy < v2->sy ? min_sy : v2->sy;
-    int32_t max_sx = v0->sx > v1->sx ? v0->sx : v1->sx;
-    max_sx = max_sx > v2->sx ? max_sx : v2->sx;
-    int32_t max_sy = v0->sy > v1->sy ? v0->sy : v1->sy;
-    max_sy = max_sy > v2->sy ? max_sy : v2->sy;
+    float min_sx = fminf2(fminf2(v0->sx, v1->sx), v2->sx);
+    float min_sy = fminf2(fminf2(v0->sy, v1->sy), v2->sy);
+    float max_sx = fmaxf2(fmaxf2(v0->sx, v1->sx), v2->sx);
+    float max_sy = fmaxf2(fmaxf2(v0->sy, v1->sy), v2->sy);
 
-    int minx = (min_sx >> FP) - 1;
-    int miny = (min_sy >> FP) - 1;
-    int maxx = ((max_sx + FP_ONE - 1) >> FP) + 1;
-    int maxy = ((max_sy + FP_ONE - 1) >> FP) + 1;
+    int minx = (int)floorf(min_sx);
+    int miny = (int)floorf(min_sy);
+    int maxx = (int)ceilf(max_sx);
+    int maxy = (int)ceilf(max_sy);
 
     if (minx < 0) minx = 0;
     if (miny < 0) miny = 0;
@@ -511,63 +500,71 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
     if (maxy >= FB_HEIGHT) maxy = FB_HEIGHT - 1;
     if (minx > maxx || miny > maxy) return;
 
-    int64_t area_i = edge_fn_i(v0->sx, v0->sy, v1->sx, v1->sy, v2->sx, v2->sy);
-    if (area_i >= 0) return;
+    float area = edge_fn(v0->sx, v0->sy, v1->sx, v1->sy, v2->sx, v2->sy);
+    if (area >= 0.0f) return;
+    float inv_area = 1.0f / area;
 
-    int64_t dE0_dx = (int64_t)(v2->sy - v1->sy) * FP_ONE;
-    int64_t dE0_dy = -(int64_t)(v2->sx - v1->sx) * FP_ONE;
-    int64_t dE1_dx = (int64_t)(v0->sy - v2->sy) * FP_ONE;
-    int64_t dE1_dy = -(int64_t)(v0->sx - v2->sx) * FP_ONE;
+    /* Edge-function screen-space derivatives (per 1-pixel step) */
+    float dE0_dx = v2->sy - v1->sy;
+    float dE0_dy = -(v2->sx - v1->sx);
+    float dE1_dx = v0->sy - v2->sy;
+    float dE1_dy = -(v0->sx - v2->sx);
 
-    int32_t du0 = v0->u - v2->u;
-    int32_t du1 = v1->u - v2->u;
-    int32_t dv0 = v0->v - v2->v;
-    int32_t dv1 = v1->v - v2->v;
+    /* Attribute deltas relative to v2 */
+    float du0 = v0->u_w - v2->u_w;
+    float du1 = v1->u_w - v2->u_w;
+    float dv0 = v0->v_w - v2->v_w;
+    float dv1 = v1->v_w - v2->v_w;
+    float dw0 = v0->inv_w - v2->inv_w;
+    float dw1 = v1->inv_w - v2->inv_w;
 
-    int64_t num_u_dx = dE0_dx * (int64_t)du0 + dE1_dx * (int64_t)du1;
-    int64_t num_v_dx = dE0_dx * (int64_t)dv0 + dE1_dx * (int64_t)dv1;
-    int64_t num_u_dy = dE0_dy * (int64_t)du0 + dE1_dy * (int64_t)du1;
-    int64_t num_v_dy = dE0_dy * (int64_t)dv0 + dE1_dy * (int64_t)dv1;
+    /* Per-pixel screen-space gradients of u/w, v/w, 1/w */
+    float du_w_dx = (dE0_dx * du0 + dE1_dx * du1) * inv_area;
+    float dv_w_dx = (dE0_dx * dv0 + dE1_dx * dv1) * inv_area;
+    float diw_dx  = (dE0_dx * dw0 + dE1_dx * dw1) * inv_area;
+    float du_w_dy = (dE0_dy * du0 + dE1_dy * du1) * inv_area;
+    float dv_w_dy = (dE0_dy * dv0 + dE1_dy * dv1) * inv_area;
+    float diw_dy  = (dE0_dy * dw0 + dE1_dy * dw1) * inv_area;
 
-    int32_t du_dx = (int32_t)(num_u_dx / area_i);
-    int32_t dv_dx = (int32_t)(num_v_dx / area_i);
-    int32_t du_dy = (int32_t)(num_u_dy / area_i);
-    int32_t dv_dy = (int32_t)(num_v_dy / area_i);
+    /* Initial edge values + attributes at pixel center (minx+0.5, miny+0.5) */
+    float px0 = (float)minx + 0.5f;
+    float py0 = (float)miny + 0.5f;
+    float E0_row = edge_fn(v1->sx, v1->sy, v2->sx, v2->sy, px0, py0);
+    float E1_row = edge_fn(v2->sx, v2->sy, v0->sx, v0->sy, px0, py0);
+
+    float u_w_row  = v2->u_w   + (E0_row * du0 + E1_row * du1) * inv_area;
+    float v_w_row  = v2->v_w   + (E0_row * dv0 + E1_row * dv1) * inv_area;
+    float iw_row   = v2->inv_w + (E0_row * dw0 + E1_row * dw1) * inv_area;
 
     int nfog = 256 - fog_i;
     int fog_r = 230 * fog_i;
     int fog_g = 205 * fog_i;
     int fog_b = 180 * fog_i;
 
-    int32_t px0 = (int32_t)minx * FP_ONE + FP_HALF;
-    int32_t py0 = (int32_t)miny * FP_ONE + FP_HALF;
-
-    int64_t E0_row = edge_fn_i(v1->sx, v1->sy, v2->sx, v2->sy, px0, py0);
-    int64_t E1_row = edge_fn_i(v2->sx, v2->sy, v0->sx, v0->sy, px0, py0);
-
-    int64_t num_u0 = E0_row * (int64_t)du0 + E1_row * (int64_t)du1;
-    int64_t num_v0 = E0_row * (int64_t)dv0 + E1_row * (int64_t)dv1;
-    int32_t u_row = v2->u + (int32_t)(num_u0 / area_i);
-    int32_t v_row = v2->v + (int32_t)(num_v0 / area_i);
-
     for (int py = miny; py <= maxy; py++)
     {
-        int64_t E0 = E0_row;
-        int64_t E1 = E1_row;
-        int32_t u_p = u_row;
-        int32_t v_p = v_row;
+        float E0 = E0_row;
+        float E1 = E1_row;
+        float u_w = u_w_row;
+        float v_w = v_w_row;
+        float iw  = iw_row;
         int idx = py * FB_WIDTH + minx;
 
         for (int px = minx; px <= maxx; px++, idx++)
         {
-            if (E0 <= 0 && E1 <= 0 && E0 + E1 >= area_i)
+            if (E0 <= 0.0f && E1 <= 0.0f && E0 + E1 >= area)
             {
-                if (!s_depth[idx])
+                if (iw > s_zbuf[idx])
                 {
-                    s_depth[idx] = 1;
+                    s_zbuf[idx] = iw;
 
-                    int px_tex = (u_p >> (FP - 4)) & 15;
-                    int py_tex = (v_p >> (FP - 4)) & 15;
+                    /* Perspective divide → recover true u, v at this pixel */
+                    float w = 1.0f / iw;
+                    float u = u_w * w;
+                    float v = v_w * w;
+
+                    int px_tex = (int)(u * 16.0f) & 15;
+                    int py_tex = (int)(v * 16.0f) & 15;
 
                     s_shadow[idx] = frag_shader_inline(tx, ty, px_tex, py_tex,
                         ao_i, nfog, fog_r, fog_g, fog_b);
@@ -575,13 +572,15 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
             }
             E0 += dE0_dx;
             E1 += dE1_dx;
-            u_p += du_dx;
-            v_p += dv_dx;
+            u_w += du_w_dx;
+            v_w += dv_w_dx;
+            iw  += diw_dx;
         }
         E0_row += dE0_dy;
         E1_row += dE1_dy;
-        u_row += du_dy;
-        v_row += dv_dy;
+        u_w_row += du_w_dy;
+        v_w_row += dv_w_dy;
+        iw_row  += diw_dy;
     }
 }
 /* ═══════════════════════════════ Block face rendering + backface culling ════════════════════════ */
