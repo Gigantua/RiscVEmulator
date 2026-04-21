@@ -24,7 +24,193 @@ This project demonstrates that **a simple, readable RISC-V implementation can do
 | 🌄 **Voxel terrain** | Height-map voxel renderer written entirely in guest C. |
 | 🔊 **Audio** | PCM playback through the emulated sound peripheral. |
 
-All of this from ~1 000 lines of C++ and a thin C# peripheral layer.
+All of this from ~200 lines of core C++ and a thin C# peripheral layer.
+
+~~~cpp
+template<bool MExt, bool FExt, bool AExt, bool Priv>
+static __forceinline void do_step() {
+    if constexpr (Priv) {
+        if (check_interrupts()) { regs[0] = 0; mtime++; return; }
+        if (wfi_pending)        { regs[0] = 0; mtime++; return; }
+    }
+
+    const uint32_t instr  = mem_read<uint32_t>(pc);
+    const uint32_t opcode = instr & 0x7F;
+    const int      rd     = (instr >>  7) & 0x1F;
+    const int      rs1    = (instr >> 15) & 0x1F;
+    const int      rs2    = (instr >> 20) & 0x1F;
+    const uint32_t f3     = (instr >> 12) & 0x7;
+    const uint32_t f7     = (instr >> 25) & 0x7F;
+    const int32_t  s1     = (int32_t)regs[rs1];
+    const uint32_t u1     = regs[rs1];
+    const int32_t  s2     = (int32_t)regs[rs2];
+    const uint32_t u2     = regs[rs2];
+    uint32_t nextpc       = pc + 4;
+    uint32_t trap_cause   = 0;
+    uint32_t trap_tval    = 0;
+
+    switch (opcode) {
+
+    case 0x37: regs[rd] = instr & 0xFFFFF000u;                           break;  // LUI
+    case 0x17: regs[rd] = pc + (instr & 0xFFFFF000u);                    break;  // AUIPC
+    case 0x6F: regs[rd] = pc + 4; nextpc = pc + j_imm(instr);            break;  // JAL
+    case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;               // JALR
+                 regs[rd] = pc + 4; nextpc = t;                          break; }
+
+    case 0x63: {  // BRANCH
+        int taken;
+        switch (f3) {
+            case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
+            case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
+            case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
+            default: taken = 0;
+        }
+        if (taken) nextpc = pc + b_imm(instr);
+        break;
+    }
+
+    case 0x03: {  // LOAD
+        uint32_t addr = (uint32_t)(s1 + i_imm(instr));
+        switch (f3) {
+            case 0: regs[rd] = (uint32_t)(int8_t) mem_read<uint8_t> (addr); break;
+            case 1: regs[rd] = (uint32_t)(int16_t)mem_read<uint16_t>(addr); break;
+            case 2: regs[rd] =                    mem_read<uint32_t>(addr); break;
+            case 4: regs[rd] =                    mem_read<uint8_t> (addr); break;
+            case 5: regs[rd] =                    mem_read<uint16_t>(addr); break;
+        }
+        break;
+    }
+
+    case 0x23: {  // STORE
+        uint32_t addr = (uint32_t)(s1 + s_imm(instr));
+        switch (f3) {
+            case 0: mem_write<uint8_t> (addr, (uint8_t) u2); break;
+            case 1: mem_write<uint16_t>(addr, (uint16_t)u2); break;
+            case 2: mem_write<uint32_t>(addr,            u2); break;
+        }
+        break;
+    }
+
+    case 0x13: {  // OP-IMM
+        const int32_t imm = i_imm(instr);
+        const int     sh  = (instr >> 20) & 0x1F;
+        uint32_t r;
+        switch (f3) {
+            case 0: r = (uint32_t)(s1 + imm);                            break;
+            case 1: r = u1 << sh;                                         break;
+            case 2: r = s1 < imm           ? 1u : 0u;                    break;
+            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                    break;
+            case 4: r = u1 ^ (uint32_t)imm;                              break;
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;    break;
+            case 6: r = u1 | (uint32_t)imm;                              break;
+            case 7: r = u1 & (uint32_t)imm;                              break;
+            default: r = 0;
+        }
+        regs[rd] = r;
+        break;
+    }
+
+    case 0x33: {  // OP
+        uint32_t r;
+        if (MExt && f7 == 0x01) {
+            r = exec_m(f3, s1, u1, s2, u2);
+        } else {
+            const int sh = s2 & 0x1F;
+            switch (f3) {
+                case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
+                case 1: r = u1 << sh;                                                break;
+                case 2: r = s1 < s2 ? 1u : 0u;                                       break;
+                case 3: r = u1 < u2 ? 1u : 0u;                                       break;
+                case 4: r = u1 ^ u2;                                                  break;
+                case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;            break;
+                case 6: r = u1 | u2;                                                  break;
+                case 7: r = u1 & u2;                                                  break;
+                default: r = 0;
+            }
+        }
+        regs[rd] = r;
+        break;
+    }
+
+    case 0x2F:  // AMO (RV32A)
+        if constexpr (AExt) {
+            const uint32_t irmid = (instr >> 27) & 0x1F;
+            const uint32_t addr  = u1;
+            if (irmid == 2) {                                            // LR.W
+                regs[rd] = mem_read<uint32_t>(addr);
+                rsv_addr = addr;
+            } else if (irmid == 3) {                                     // SC.W
+                if (rsv_addr == addr) { mem_write<uint32_t>(addr, u2); regs[rd] = 0; }
+                else                                                       regs[rd] = 1;
+                rsv_addr = ~0u;
+            } else {
+                uint32_t old = mem_read<uint32_t>(addr);
+                regs[rd]     = old;
+                uint32_t nw;
+                switch (irmid) {
+                    case  1: nw = u2;                                       break;  // SWAP
+                    case  0: nw = old + u2;                                 break;  // ADD
+                    case  4: nw = old ^ u2;                                 break;  // XOR
+                    case 12: nw = old & u2;                                 break;  // AND
+                    case  8: nw = old | u2;                                 break;  // OR
+                    case 16: nw = (int32_t)u2 < (int32_t)old ? u2 : old;    break;  // MIN
+                    case 20: nw = (int32_t)u2 > (int32_t)old ? u2 : old;    break;  // MAX
+                    case 24: nw = u2 < old ? u2 : old;                      break;  // MINU
+                    case 28: nw = u2 > old ? u2 : old;                      break;  // MAXU
+                    default: nw = old;                                       break;
+                }
+                mem_write<uint32_t>(addr, nw);
+            }
+        }
+        break;
+
+    case 0x07:  // FLW
+        if constexpr (FExt) if (f3 == 2) fregs[rd] = mem_read<uint32_t>((uint32_t)(s1 + i_imm(instr)));
+        break;
+
+    case 0x27:  // FSW
+        if constexpr (FExt) if (f3 == 2) mem_write<uint32_t>((uint32_t)(s1 + s_imm(instr)), fregs[rs2]);
+        break;
+
+    case 0x43: case 0x47: case 0x4B: case 0x4F:  // FMADD/FMSUB/FNMSUB/FNMADD
+        if constexpr (FExt) {
+            const int rs3 = (int)((instr >> 27) & 0x1F);
+            const float fa = f_get(rs1), fb = f_get(rs2), fc = f_get(rs3);
+            float fr;
+            switch (opcode) {
+                case 0x43: fr =  fa*fb + fc; break;
+                case 0x47: fr =  fa*fb - fc; break;
+                case 0x4B: fr = -fa*fb + fc; break;
+                default:   fr = -fa*fb - fc; break;
+            }
+            f_set(rd, fr);
+        }
+        break;
+
+    case 0x53:  // OP-FP
+        if constexpr (FExt) exec_fp_opfp(instr, rd, rs1, rs2, f3, f7);
+        break;
+
+    case 0x0F: break;  // FENCE / FENCE.I — NOP
+
+    case 0x73: {  // SYSTEM
+        const uint32_t f3s = (instr >> 12) & 0x7;
+        trap_cause = exec_system<Priv>(instr, rd, f3s, nextpc, trap_tval);
+        break;
+    }
+
+    }  // switch (opcode)
+
+    if constexpr (Priv) {
+        if (trap_cause) { do_trap(trap_cause, trap_tval); regs[0] = 0; mtime++; return; }
+    }
+
+    regs[0] = 0;
+    pc = nextpc;
+    if constexpr (Priv) { if (priv_mode == 0) umode_count++; }
+    mtime++;
+}
+~~~
 
 ---
 
