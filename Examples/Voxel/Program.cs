@@ -138,8 +138,6 @@ uint entry = ElfLoader.Load(elfData, bus);
 regs.Write(2, StackPointer);
 
 var emu = new Emulator(bus, regs, entry);
-emu.EnableMExtension = enableMExt;
-emu.EnableFExtension = enableFExt;
 emu.OutputHandler = c => Console.Write(c);
 
 Console.WriteLine("Starting Voxel...");

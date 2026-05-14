@@ -27,18 +27,15 @@ typedef unsigned int u32;
  * PROCESS CONTROL
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* _exit: terminate the program. MUST NOT RETURN. */
+/* _exit: terminate the program by writing the exit code to the host-exit
+ * peripheral at 0x40000000. The guarded MMIO write is intercepted by the
+ * host's page-fault dispatcher, which sets the exit code and halts the CPU. */
 void _exit(int status)
 {
-    __asm__ volatile(
-        "mv a0, %0\n"
-        "li a7, 93\n"
-        "ecall"
-        :
-        : "r"(status)
-        : "a0", "a7"
-    );
-    __builtin_unreachable();
+    volatile unsigned int *exit_reg = (volatile unsigned int *)0x40000000;
+    *exit_reg = (unsigned int)status;
+    /* Page-fault handler halts the CPU, so this loop never actually iterates. */
+    for (;;);
 }
 
 /* _getpid: return process ID. Always 1 on bare metal. */
@@ -61,25 +58,17 @@ int _kill(int pid, int sig)
  * I/O — FILE DESCRIPTOR OPERATIONS
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* _write: send bytes to fd. fd=1 (stdout) and fd=2 (stderr) go to UART.
- * Uses ecall 64 (Linux write syscall) which the emulator handles. */
+/* _write: send bytes to fd. fd=1 (stdout) and fd=2 (stderr) go to UART THR.
+ * Each byte write is a guarded MMIO access — the host VEH catches the AV
+ * and routes through UartDevice.Write → OutputHandler. No ecall needed. */
 int _write(int fd, const void *buf, unsigned int count)
 {
     if (fd == 1 || fd == 2) {
-        /* Use ecall write syscall — emulator reads from memory */
-        int ret;
-        __asm__ volatile(
-            "mv a0, %1\n"
-            "mv a1, %2\n"
-            "mv a2, %3\n"
-            "li a7, 64\n"
-            "ecall\n"
-            "mv %0, a0"
-            : "=r"(ret)
-            : "r"(fd), "r"(buf), "r"(count)
-            : "a0", "a1", "a2", "a7"
-        );
-        return ret;
+        volatile unsigned char *uart_thr = (volatile unsigned char *)0x10000000;
+        const unsigned char *p = (const unsigned char *)buf;
+        for (unsigned int i = 0; i < count; i++)
+            *uart_thr = p[i];
+        return (int)count;
     }
     return -1;
 }

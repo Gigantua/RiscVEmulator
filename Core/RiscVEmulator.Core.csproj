@@ -6,10 +6,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RiscVEmulator</AssemblyName>
     <RootNamespace>RiscVEmulator.Core</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Native\rv32i_core.vcxproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+    <ProjectReference Include="..\Native\slirp_bridge.vcxproj">
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
     </ProjectReference>
   </ItemGroup>
@@ -24,6 +28,19 @@
              Include="..\Native\bin\Debug\rv32i_core.pdb">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>rv32i_core.pdb</Link>
+      <Visible>false</Visible>
+    </Content>
+    <Content Include="..\Native\bin\$(Configuration)\slirp_bridge.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>slirp_bridge.dll</Link>
+      <Visible>false</Visible>
+    </Content>
+
+    <!-- libslirp Windows runtime (populated by Examples.Linux.Build_RV32i).
+         Auto-deployed to every consumer's bin dir; SlirpBackend uses these. -->
+    <Content Include="$(MSBuildThisFileDirectory)Networking/native/*.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>%(Filename)%(Extension)</Link>
       <Visible>false</Visible>
     </Content>
   </ItemGroup>

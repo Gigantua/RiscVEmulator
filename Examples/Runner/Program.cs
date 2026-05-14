@@ -21,7 +21,6 @@ string elfPath = args[0];
 var opts = new SdlWindowOptions();
 int ramMB = 16;
 var loads = new List<(string path, uint addr)>();
-bool enableMExt = false;
 
 for (int i = 1; i < args.Length; i++)
 {
@@ -31,7 +30,6 @@ for (int i = 1; i < args.Length; i++)
         case "--ram":     ramMB = int.Parse(args[++i]); break;
         case "--fps":     opts.TargetFps = int.Parse(args[++i]); break;
         case "--no-grab": opts.GrabMouse = false; break;
-        case "--m-ext":   enableMExt = true; break;
         case "--load":
             string loadPath = args[++i];
             uint loadAddr = Convert.ToUInt32(args[++i], 16);
@@ -70,7 +68,6 @@ uint entry = ElfLoader.Load(elfData, bus);
 regs.Write(2, 0x009FFF00u); // sp
 
 var emu = new Emulator(bus, regs, entry);
-emu.EnableMExtension = enableMExt;
 emu.OutputHandler = c => Console.Write(c);
 
 // Load binary files into guest RAM (--load <file> <addr>)

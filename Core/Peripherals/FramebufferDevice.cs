@@ -1,74 +1,88 @@
+using System.Runtime.InteropServices;
+
 namespace RiscVEmulator.Core.Peripherals
 {
     /// <summary>
-    /// Framebuffer device at 0x20000000.
-    /// Provides a direct-mapped RGBA8888 pixel buffer (default 320×200 = 256,000 bytes).
-    /// The host reads <see cref="Pixels"/> to render.
+    /// Framebuffer at 0x20000000. Plain memory (PAGE_READWRITE slice).
+    /// CPU writes pixels directly via mem + addr — no callback.
+    /// SDL reads the tear-free <see cref="PresentedPixels"/> snapshot.
     /// </summary>
-    public class FramebufferDevice : IPeripheral
+    public sealed unsafe class FramebufferDevice : IPeripheral
     {
         public uint BaseAddress => 0x20000000;
         public uint Size { get; }
-
-        private readonly byte[] _pixels;
-        private readonly byte[] _presented;
+        public bool IsGuarded => false;
 
         public int Width { get; }
         public int Height { get; }
-        public const int BytesPerPixel = 4; // RGBA8888
+        public const int BytesPerPixel = 4;
 
-        /// <summary>Live pixel buffer — written by guest via MMIO.</summary>
-        public byte[] Pixels => _pixels;
+        private byte*  _pixels;       // slice in the host reservation
+        private readonly byte[] _presented;
+
+        /// <summary>Live pixel buffer pointer (slice in reservation). Null until <see cref="Bind"/>.</summary>
+        public byte* PixelsPtr => _pixels;
 
         /// <summary>
-        /// Snapshot of the last completed frame, updated on vsync.
-        /// SDL always blits from here so it never sees a partially-rendered frame.
+        /// Snapshot of live pixels as a managed byte[] (slow — used by tests).
+        /// Production code should read <see cref="PixelsPtr"/> directly.
         /// </summary>
+        public byte[] Pixels
+        {
+            get
+            {
+                var arr = new byte[Size];
+                if (_pixels != null)
+                    System.Runtime.InteropServices.Marshal.Copy(new IntPtr(_pixels), arr, 0, (int)Size);
+                return arr;
+            }
+        }
+
+        /// <summary>Tear-free snapshot, updated on vsync. SDL reads from this.</summary>
         public byte[] PresentedPixels => _presented;
 
         public FramebufferDevice(int width = 320, int height = 200)
         {
-            Width = width;
+            Width  = width;
             Height = height;
-            Size = (uint)(width * height * BytesPerPixel);
-            _pixels    = new byte[Size];
+            Size   = (uint)(width * height * BytesPerPixel);
             _presented = new byte[Size];
         }
 
-        /// <summary>Snapshot live pixels → presented buffer. Called by DisplayControlDevice on vsync.</summary>
-        public void PresentFrame() => Array.Copy(_pixels, _presented, _pixels.Length);
+        public void Bind(byte* slice) => _pixels = slice;
 
+        public void PresentFrame()
+        {
+            if (_pixels == null) return;
+            fixed (byte* dst = _presented)
+                Buffer.MemoryCopy(_pixels, dst, _presented.Length, _presented.Length);
+        }
+
+        // Read/Write are unused for plain peripherals (CPU dereferences directly),
+        // but kept for in-process callers (tests, frontends).
         public uint Read(uint offset, int width)
         {
-            if (offset + (uint)width > Size) return 0;
+            if (_pixels == null || offset + (uint)width > Size) return 0;
+            byte* p = _pixels + offset;
             return width switch
             {
-                1 => _pixels[offset],
-                2 => (uint)(_pixels[offset] | (_pixels[offset + 1] << 8)),
-                4 => (uint)(_pixels[offset] | (_pixels[offset + 1] << 8)
-                     | (_pixels[offset + 2] << 16) | (_pixels[offset + 3] << 24)),
-                _ => 0
+                1 => p[0],
+                2 => (uint)(p[0] | (p[1] << 8)),
+                4 => (uint)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)),
+                _ => 0,
             };
         }
 
         public void Write(uint offset, int width, uint value)
         {
-            if (offset + (uint)width > Size) return;
-            switch (width)
+            if (_pixels == null || offset + (uint)width > Size) return;
+            byte* p = _pixels + offset;
+            p[0] = (byte)value;
+            if (width >= 2) p[1] = (byte)(value >> 8);
+            if (width >= 4)
             {
-                case 1:
-                    _pixels[offset] = (byte)value;
-                    break;
-                case 2:
-                    _pixels[offset]     = (byte)value;
-                    _pixels[offset + 1] = (byte)(value >> 8);
-                    break;
-                case 4:
-                    _pixels[offset]     = (byte)value;
-                    _pixels[offset + 1] = (byte)(value >> 8);
-                    _pixels[offset + 2] = (byte)(value >> 16);
-                    _pixels[offset + 3] = (byte)(value >> 24);
-                    break;
+                p[2] = (byte)(value >> 16);
+                p[3] = (byte)(value >> 24);
             }
         }
     }

@@ -1,31 +1,30 @@
 namespace RiscVEmulator.Core
 {
     /// <summary>
-    /// A memory-mapped I/O peripheral that occupies a contiguous address range.
-    /// The MemoryBus dispatches reads/writes to peripherals based on address.
+    /// A memory-mapped peripheral. Lives in a slice of the host memory
+    /// reservation at <see cref="BaseAddress"/>. Plain peripherals back
+    /// themselves with PAGE_READWRITE pages (the CPU dereferences them
+    /// directly, no callback). Guarded peripherals back themselves with
+    /// PAGE_NOACCESS — every access AVs and the host's VEH calls
+    /// <see cref="Read"/> / <see cref="Write"/>.
     /// </summary>
     public interface IPeripheral
     {
-        /// <summary>Base address of this peripheral's MMIO region.</summary>
         uint BaseAddress { get; }
-
-        /// <summary>Size in bytes of this peripheral's MMIO region.</summary>
-        uint Size { get; }
+        uint Size        { get; }
+        bool IsGuarded   { get; }
 
         /// <summary>
-        /// Read from a peripheral register.
+        /// Called once by the Emulator after committing this peripheral's slice
+        /// in the reservation. Plain peripherals can stash the pointer to access
+        /// their bytes directly. Guarded peripherals can ignore it.
         /// </summary>
-        /// <param name="offset">Byte offset from BaseAddress.</param>
-        /// <param name="width">Access width: 1, 2, or 4 bytes.</param>
-        /// <returns>Value read (zero-extended to 32 bits).</returns>
+        unsafe void Bind(byte* slice) { }
+
+        /// <summary>Read from a guarded peripheral. Plain peripherals don't see this.</summary>
         uint Read(uint offset, int width);
 
-        /// <summary>
-        /// Write to a peripheral register.
-        /// </summary>
-        /// <param name="offset">Byte offset from BaseAddress.</param>
-        /// <param name="width">Access width: 1, 2, or 4 bytes.</param>
-        /// <param name="value">Value to write (lower bits used based on width).</param>
+        /// <summary>Write to a guarded peripheral. Plain peripherals don't see this.</summary>
         void Write(uint offset, int width, uint value);
     }
 }

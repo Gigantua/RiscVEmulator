@@ -176,7 +176,6 @@ memory.Load(JitSrcAddress, jitSrcBytes, 0, jitSrcBytes.Length);
 // null terminator is already zero (Memory is zero-initialised)
 
 var emu = new Emulator(bus, regs, entry);
-emu.EnableMExtension = true;  // TCC emits MUL/DIV instructions
 emu.OutputHandler = c =>
 {
     Console.Write(c);

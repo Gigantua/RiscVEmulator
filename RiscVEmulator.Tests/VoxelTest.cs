@@ -98,7 +98,7 @@ public class VoxelTest : EmulatorTestBase
         };
 
         CompileMExt(sources, elfFile);
-        return RunElfFull(elfFile, maxSteps, enableMExtension: true);
+        return RunElfFull(elfFile, maxSteps);
     }
 
     // ── Test 1: mk_rgba pixel encoding ──────────────────────────────────────

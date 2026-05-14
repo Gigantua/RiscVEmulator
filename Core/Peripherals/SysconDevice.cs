@@ -1,13 +1,13 @@
 namespace RiscVEmulator.Core.Peripherals;
 
-/// <summary>
-/// SYSCON power/reboot controller at 0x11100000 (compatible with mini-rv32ima Linux images).
-/// Write 0x5555 to offset 0 to power off; write 0x7777 to reboot.
-/// </summary>
+/// <summary>SYSCON power/reboot peripheral. Guarded.</summary>
 public sealed class SysconDevice : IPeripheral
 {
-    public uint BaseAddress => 0x11100000u;
+    public uint BaseAddress { get; }
     public uint Size        => 0x1000u;
+    public bool IsGuarded   => true;
+
+    public SysconDevice(uint baseAddress = 0x11100000u) { BaseAddress = baseAddress; }
 
     public Action? OnPowerOff { get; set; }
     public Action? OnReboot   { get; set; }

@@ -98,10 +98,7 @@ unsafe
     var cpuThread = new System.Threading.Thread(() =>
     {
         while (running && !emu.IsHalted)
-        {
-            for (int i = 0; i < 500_000 && running && !emu.IsHalted; i++)
-                emu.Step();
-        }
+            emu.StepN(500_000);
     })
     { IsBackground = true, Name = "RV32I-CPU" };
     cpuThread.Start();
@@ -162,16 +159,13 @@ unsafe
             {
                 uint start = audioCtrl.BufStart;
                 uint len = Math.Min(audioCtrl.BufLength,
-                                    (uint)audioBuf.Buffer.Length - start);
+                                    (uint)audioBuf.Length - start);
                 // Only queue when SDL has consumed enough ahead — keeps at most 2 buffers
-                // queued. This throttles the emulator to real-time audio speed, eliminating
-                // the stale-audio lag and the apparent 15-second input delay.
+                // queued. This throttles the emulator to real-time audio speed.
                 uint queued = sdl.GetQueuedAudioSize(audioDevice);
                 if (len > 0 && queued < 2 * len)
                 {
-                    fixed (byte* buf = &audioBuf.Buffer[start])
-                        sdl.QueueAudio(audioDevice, buf, len);
-                    // Clear play bit so guest can submit the next buffer
+                    sdl.QueueAudio(audioDevice, audioBuf.RawPtr + start, len);
                     audioCtrl.Ctrl = 0;
                 }
             }

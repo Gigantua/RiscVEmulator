@@ -21,6 +21,7 @@ namespace RiscVEmulator.Core
 
         public int RamSize => _ram.SizeInBytes;
         internal Memory RawMemory => _ram;
+        public IReadOnlyList<IPeripheral> Peripherals => _peripherals;
 
         public MemoryBus(Memory ram)
         {

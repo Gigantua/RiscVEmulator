@@ -2,27 +2,17 @@ LIBRARY rv32i_core
 EXPORTS
     rv32i_init
     rv32i_destroy
-    rv32i_set_mmio
-    rv32i_set_ecall
     rv32i_step_n
     rv32i_get_pc
     rv32i_set_reg
     rv32i_is_halted
     rv32i_set_halted
-    rv32i_exit_code
-    rv32i_set_exit_code
-    rv32i_set_m_ext
-    rv32i_set_f_ext
-    rv32i_set_a_ext
-    rv32i_set_priv_mode
-    rv32i_set_ram_offset
+    rv32i_get_priv_mode
+    rv32i_get_mtime
+    rv32i_set_mtime
+    rv32i_get_mtimecmp
+    rv32i_set_mtimecmp
     rv32i_get_mtime_lo
     rv32i_get_mtime_hi
-    rv32i_get_priv_mode
-    rv32i_get_umode_lo
-    rv32i_get_umode_hi
-    rv32i_get_last_trap
-    rv32i_get_trap_count
-    rv32i_get_mret_to_u
-    rv32i_get_mret_to_m
-    rv32i_get_uecall_count
+    rv32i_set_meip
+    rv32i_set_seip

@@ -1,0 +1,9 @@
+Package: bc
+Version: 1.07.1
+Architecture: rv32inommu_uclibc
+Maintainer: rvemu-feed
+Description: bc (cross-built via buildroot)
+Filename: bc_1.07.1_rv32inommu_uclibc.ipk
+Size: 174754
+SHA256sum: 7af9fe2497cc37d73502d68b5be861781bcd585fa65360e63b5cfde9a2c11e31
+

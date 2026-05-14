@@ -1,69 +1,42 @@
 namespace RiscVEmulator.Core.Peripherals
 {
-    /// <summary>
-    /// Display control registers at 0x20100000.
-    /// Register map:
-    ///   +0x00 WIDTH      (R/W — set framebuffer width)
-    ///   +0x04 HEIGHT     (R/W — set framebuffer height)
-    ///   +0x08 BPP        (RO, always 32)
-    ///   +0x0C VSYNC_FLAG (R/W — guest writes 1 to signal frame ready)
-    ///   +0x10 PALETTE_INDEX (W — select palette entry 0–255)
-    ///   +0x14 PALETTE_DATA  (W — write 0x00RRGGBB to selected entry)
-    ///   +0x18 MODE       (R/W — 0=direct RGBA, 1=8-bit indexed)
-    ///   +0x1C FB_ADDR    (R/W — RAM address of framebuffer; 0 = use MMIO fb)
-    /// </summary>
+    /// <summary>Display control at 0x20100000. Guarded.</summary>
     public class DisplayControlDevice : IPeripheral
     {
         public uint BaseAddress => 0x20100000;
-        public uint Size => 0x100;
+        public uint Size        => 0x100;
+        public bool IsGuarded   => true;
 
         private readonly FramebufferDevice _fb;
         private Memory? _ram;
         private uint _vsyncFlag;
         private bool _vsyncEverUsed;
         private uint _paletteIndex;
-        private uint _mode; // 0=direct RGBA, 1=indexed
-        private uint _fbAddr; // RAM address for framebuffer (0 = use MMIO)
+        private uint _mode;
+        private uint _fbAddr;
 
-        /// <summary>256-entry palette: each entry is 0x00RRGGBB.</summary>
         public uint[] Palette { get; } = new uint[256];
 
-        public uint VsyncFlag => _vsyncFlag;
-        public uint Mode => _mode;
-
-        /// <summary>
-        /// True once the guest has written vsync at least once.
-        /// SDL uses this to decide whether to auto-present (Doom) or
-        /// only show snapshots taken at vsync boundaries (Voxel).
-        /// </summary>
+        public uint VsyncFlag     => _vsyncFlag;
+        public uint Mode          => _mode;
         public bool VsyncEverUsed => _vsyncEverUsed;
 
-        public DisplayControlDevice(FramebufferDevice fb)
-        {
-            _fb = fb;
-        }
-
-        /// <summary>Set the RAM reference so FB_ADDR can blit from guest RAM on vsync.</summary>
+        public DisplayControlDevice(FramebufferDevice fb) { _fb = fb; }
         public void SetMemory(Memory ram) => _ram = ram;
-
-        /// <summary>Clear vsync flag (called by host after rendering a frame).</summary>
         public void ClearVsync() => _vsyncFlag = 0;
 
-        public uint Read(uint offset, int width)
+        public uint Read(uint offset, int width) => offset switch
         {
-            return offset switch
-            {
-                0x00 => (uint)_fb.Width,
-                0x04 => (uint)_fb.Height,
-                0x08 => FramebufferDevice.BytesPerPixel * 8,
-                0x0C => _vsyncFlag,
-                0x18 => _mode,
-                0x1C => _fbAddr,
-                _ => 0
-            };
-        }
+            0x00 => (uint)_fb.Width,
+            0x04 => (uint)_fb.Height,
+            0x08 => FramebufferDevice.BytesPerPixel * 8,
+            0x0C => _vsyncFlag,
+            0x18 => _mode,
+            0x1C => _fbAddr,
+            _    => 0,
+        };
 
-        public void Write(uint offset, int width, uint value)
+        public unsafe void Write(uint offset, int width, uint value)
         {
             switch (offset)
             {
@@ -74,21 +47,23 @@ namespace RiscVEmulator.Core.Peripherals
                         _vsyncEverUsed = true;
                         if (_fbAddr != 0 && _ram != null)
                         {
-                            // Blit from guest RAM directly into presented buffer
                             int len = _fb.Width * _fb.Height * FramebufferDevice.BytesPerPixel;
-                            int addr = (int)_fbAddr;
-                            if (addr + len <= _ram.SizeInBytes)
-                                Array.Copy(_ram.Data, addr, _fb.PresentedPixels, 0, len);
+                            uint addr = _fbAddr;
+                            if (addr + len <= _ram.BaseAddress + _ram.SizeBytes)
+                            {
+                                fixed (byte* dst = _fb.PresentedPixels)
+                                    System.Buffer.MemoryCopy(_ram.Reservation.PtrAt(addr), dst, len, len);
+                            }
                         }
                         else
                         {
-                            _fb.PresentFrame(); // legacy MMIO path
+                            _fb.PresentFrame();
                         }
                     }
                     break;
                 case 0x10: _paletteIndex = value & 0xFF; break;
                 case 0x14: Palette[_paletteIndex] = value; break;
-                case 0x18: _mode = value; break;
+                case 0x18: _mode   = value; break;
                 case 0x1C: _fbAddr = value; break;
             }
         }

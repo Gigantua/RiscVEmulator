@@ -1,0 +1,16 @@
+{
+  "Packages": [
+    {
+      "Name": "bc",
+      "BrSymbol": "BR2_PACKAGE_BC",
+      "BuiltVersion": "1.07.1",
+      "IpkFile": "bc_1.07.1_rv32inommu_uclibc.ipk"
+    },
+    {
+      "Name": "nano",
+      "BrSymbol": "BR2_PACKAGE_NANO",
+      "BuiltVersion": null,
+      "IpkFile": null
+    }
+  ]
+}

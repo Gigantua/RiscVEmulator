@@ -69,11 +69,9 @@ Console.WriteLine("Starting MIDI demo...");
 bool running = true;
 var cpuThread = new System.Threading.Thread(() =>
 {
+    // Use StepN so peripheral sync (incl. MIDI message dispatch) runs at batch boundaries.
     while (running && !emu.IsHalted)
-    {
-        for (int i = 0; i < 500_000 && running && !emu.IsHalted; i++)
-            emu.Step();
-    }
+        emu.StepN(500_000);
 })
 { IsBackground = true, Name = "RV32I-CPU" };
 cpuThread.Start();

@@ -254,7 +254,6 @@ uint entry = ElfLoader.Load(elfData, bus);
 regs.Write(2, StackPointer);
 
 var emu = new Emulator(bus, regs, entry);
-emu.EnableMExtension = true;
 emu.OutputHandler = c => Console.Write(c);
 
 Console.WriteLine($"  SVID on disk: {svidData.Length:N0} bytes ({svidData.Length / 1024 / 1024}MB)");

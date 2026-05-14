@@ -1,41 +1,60 @@
+using System.Runtime.InteropServices;
+
 namespace RiscVEmulator.Core
 {
     /// <summary>
-    /// Byte-addressable little-endian memory for the RV32I emulator.
+    /// Byte-addressable little-endian RAM. Backed by a PAGE_READWRITE slice
+    /// inside a <see cref="HostMemoryReservation"/>. The native CPU reads/writes
+    /// the same bytes via the reservation's base pointer — zero copy.
     /// </summary>
-    public class Memory
+    public sealed unsafe class Memory
     {
-        private readonly byte[] _data;
+        public HostMemoryReservation Reservation { get; }
+        public uint BaseAddress { get; }
+        public uint SizeBytes   { get; }
+        public byte* RawPtr     => Reservation.PtrAt(BaseAddress);
 
-        public int SizeInBytes => _data.Length;
-        internal byte[] Data => _data;
-
-        public Memory(int sizeInBytes)
+        /// <summary>
+        /// Creates its own reservation and commits RAM at <paramref name="baseAddress"/>.
+        /// Default base is 0 (bare-metal). Linux uses 0x80000000.
+        /// </summary>
+        public Memory(int sizeInBytes, uint baseAddress = 0)
         {
-            _data = new byte[sizeInBytes];
+            Reservation = new HostMemoryReservation();
+            BaseAddress = baseAddress;
+            SizeBytes   = (uint)sizeInBytes;
+            Reservation.CommitPlain(baseAddress, SizeBytes);
         }
+
+        /// <summary>Shared reservation (Linux uses this with baseAddress=0x80000000).</summary>
+        public Memory(HostMemoryReservation reservation, uint baseAddress, uint sizeBytes)
+        {
+            Reservation = reservation;
+            BaseAddress = baseAddress;
+            SizeBytes   = sizeBytes;
+            reservation.CommitPlain(baseAddress, sizeBytes);
+        }
+
+        public int SizeInBytes => (int)SizeBytes;
 
         // ── Reads ────────────────────────────────────────────────────────────
 
         public byte ReadByte(uint address)
         {
             CheckBounds(address, 1);
-            return _data[address];
+            return *(Reservation.PtrAt(address));
         }
 
         public ushort ReadHalfWord(uint address)
         {
             CheckBounds(address, 2);
-            return (ushort)(_data[address] | (_data[address + 1] << 8));
+            return *(ushort*)Reservation.PtrAt(address);
         }
 
         public uint ReadWord(uint address)
         {
             CheckBounds(address, 4);
-            return (uint)(_data[address]
-                        | (_data[address + 1] << 8)
-                        | (_data[address + 2] << 16)
-                        | (_data[address + 3] << 24));
+            return *(uint*)Reservation.PtrAt(address);
         }
 
         // ── Writes ───────────────────────────────────────────────────────────
@@ -43,23 +62,19 @@ namespace RiscVEmulator.Core
         public void WriteByte(uint address, byte value)
         {
             CheckBounds(address, 1);
-            _data[address] = value;
+            *(Reservation.PtrAt(address)) = value;
         }
 
         public void WriteHalfWord(uint address, ushort value)
         {
             CheckBounds(address, 2);
-            _data[address]     = (byte)value;
-            _data[address + 1] = (byte)(value >> 8);
+            *(ushort*)Reservation.PtrAt(address) = value;
         }
 
         public void WriteWord(uint address, uint value)
         {
             CheckBounds(address, 4);
-            _data[address]     = (byte)value;
-            _data[address + 1] = (byte)(value >> 8);
-            _data[address + 2] = (byte)(value >> 16);
-            _data[address + 3] = (byte)(value >> 24);
+            *(uint*)Reservation.PtrAt(address) = value;
         }
 
         // ── Bulk load (used by ELF loader) ───────────────────────────────────
@@ -67,16 +82,29 @@ namespace RiscVEmulator.Core
         public void Load(uint address, byte[] src, int srcOffset, int length)
         {
             CheckBounds(address, (uint)length);
-            Array.Copy(src, srcOffset, _data, (int)address, length);
+            fixed (byte* p = &src[srcOffset])
+                Buffer.MemoryCopy(p, Reservation.PtrAt(address), length, length);
         }
 
-        // ── Helpers ──────────────────────────────────────────────────────────
+        // ── Internal access (for compat) ─────────────────────────────────────
+        // Returns a managed copy of the bytes [start, start+len). Slow path —
+        // only used by code that legitimately needs a byte[] (e.g. DisplayControl
+        // blitting from guest RAM into the presented framebuffer snapshot).
+        internal byte[] Data
+        {
+            get
+            {
+                var arr = new byte[SizeBytes];
+                Marshal.Copy(new IntPtr(Reservation.PtrAt(BaseAddress)), arr, 0, (int)SizeBytes);
+                return arr;
+            }
+        }
 
         private void CheckBounds(uint address, uint size)
         {
-            if ((ulong)address + size > (ulong)_data.Length)
+            if (address < BaseAddress || (ulong)address + size > (ulong)BaseAddress + SizeBytes)
                 throw new InvalidOperationException(
-                    $"Memory access out of bounds: address=0x{address:X8} size={size} memSize=0x{_data.Length:X8}");
+                    $"Memory access out of bounds: address=0x{address:X8} size={size} (RAM 0x{BaseAddress:X8}..0x{BaseAddress + SizeBytes:X8})");
         }
     }
 }

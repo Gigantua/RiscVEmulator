@@ -167,8 +167,7 @@ public abstract class EmulatorTestBase
     protected static RunResult RunElfFull(string elfFile, int maxSteps = 20_000_000,
         Action<KeyboardDevice>? setupKeyboard = null,
         Action<MouseDevice>? setupMouse = null,
-        Action<UartDevice>? setupUart = null,
-        bool enableMExtension = false)
+        Action<UartDevice>? setupUart = null)
     {
         byte[] elfData = File.ReadAllBytes(elfFile);
         var memory  = new Memory(16 * 1024 * 1024);
@@ -205,7 +204,6 @@ public abstract class EmulatorTestBase
 
         var emu = new Emulator(bus, regs, entry);
         emu.OutputHandler = c => sb.Append(c);
-        if (enableMExtension) emu.EnableMExtension = true;
         emu.Run(maxSteps);
 
         return new RunResult(sb.ToString(), emu.ExitCode, emu.IsHalted, bus, fb, display, kbd, mouse, audioBuf, audioCtrl, rtc);

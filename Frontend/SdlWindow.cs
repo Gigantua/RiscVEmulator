@@ -140,12 +140,9 @@ public unsafe class SdlWindow
                 _lastQueuedGen = gen;
                 uint start = _audioCtrl.BufStart;
                 uint len = Math.Min(_audioCtrl.BufLength,
-                                    (uint)_audioBuf.Buffer.Length - start);
+                                    (uint)_audioBuf.Length - start);
                 if (len > 0)
-                {
-                    fixed (byte* buf = &_audioBuf.Buffer[start])
-                        sdl.QueueAudio(_audioDevice, buf, len);
-                }
+                    sdl.QueueAudio(_audioDevice, _audioBuf.RawPtr + start, len);
                 _audioCtrl.Ctrl = 0;
             }
         }

@@ -18,5 +18,8 @@ namespace RiscVEmulator.Core
         void Load(uint address, byte[] src, int srcOffset, int length);
 
         int RamSize { get; }
+
+        /// <summary>Registered peripherals. Emulator iterates these for plain-range registration and batch sync.</summary>
+        System.Collections.Generic.IReadOnlyList<IPeripheral> Peripherals { get; }
     }
 }
