@@ -365,19 +365,90 @@ prepared kernel. Without proper `#address-cells = 2; #size-cells = 2;` on
 the parent of the FB node, the reg parses as size=0 and the kernel
 silently discards the node → "minimal node booted" is a false positive.
 
-**Workarounds** (none picked yet):
+**Workarounds**: we've adopted **#3** (userspace `mmap /dev/mem`). The FB
+now lives at `0x85FC0000` (last 256 KB of a 96 MB RAM bank), no
+`simple-framebuffer` DT node is emitted, and `CONFIG_DEVMEM=y` lets guest
+userspace mmap it directly. `Examples.Linux.Build_RV32i/guest-userspace/
+rvemu-fbtest.c` is the reference demo: opens `/dev/mem`, mmaps the FB,
+draws to it, reads `/dev/input/event0+1` for input. Pass `--gui` to
+`Examples.Linux` to see it rendered in an SDL window.
 
-1. Move `FramebufferDevice` *inside* RAM (carve last 256 KB of `/memory`)
-   so simple-framebuffer reserves it from RAM, no separate bank.
-2. Custom in-tree driver bound to a non-standard compatible string
-   (e.g. `"rvemu,framebuffer"`) that `ioremap`s the region without going
-   through any memory-aware framework.
-3. Skip `/dev/fb0` entirely. `CONFIG_DEVMEM=y` is on, so userspace can
-   `mmap /dev/mem` at `0x20000000` directly — same path Doom uses
-   bare-metal. Already works.
+The other two paths (FB inside RAM with `/reserved-memory` + `/chosen/
+framebuffer`; custom `"rvemu,framebuffer"` driver) were tried — the first
+re-triggers `init_unavailable_range` even with proper memblock layout, and
+the second is more code than option 3 plus needs a kernel patch.
 
 Bonus trap: when stripping cells decls via regex, anchor to the right
 subtree. The root `/` and `/chosen` both write `#address-cells = <0x02>;`
 identically, so a naive `re.sub` first-match strips the root's, which
 makes the kernel ignore `/memory@80000000` and panic with
 `early_init_dt_alloc_memory_arch: Failed to allocate N bytes`.
+
+### Linux input + framebuffer (working stack)
+
+`Examples.Linux` defaults to 96 MB RAM. The last 256 KB are reserved for
+the framebuffer at `0x85FC0000` (registered by `FramebufferDevice`).
+`KeyboardDevice` and `MouseDevice` are registered at `0x10001000` /
+`0x10002000` (same MMIO addresses as Doom).
+
+Inside the guest, `rvemu-input` is a tiny BFLT daemon (built by
+`Examples.Linux.Build_RV32i`, source at `guest-userspace/rvemu-input.c`)
+that `mmap`s those MMIO regions via `/dev/mem`, polls them, and synthesizes
+`input_event`s into `/dev/uinput`. `/etc/init.d/S42input` auto-starts it at
+boot. The result: `/dev/input/event0` (kbd) and `/dev/input/event1` (mouse)
+behave like normal Linux evdev devices for any app.
+
+Guest userspace apps display by `mmap`ing `/dev/mem` at `0x85FC0000` and
+writing RGBA pixels. `rvemu-fbtest` is the reference (color gradient + a
+cursor that follows the host mouse). On the host, `--gui` opens an SDL
+window that shows `FramebufferDevice.PresentedPixels` and forwards
+keyboard/mouse events into the C# `KeyboardDevice` / `MouseDevice`
+peripherals — closing the loop with the guest's `rvemu-input` daemon.
+
+**BFLT cross-compile recipe** (post-mortem in
+`memory/project_nommu_bflt_quirks.md`): the magic incantation is
+```
+$CC -static -fPIC -Wl,-elf2flt=-r -O2 src.c -o out
+```
+Without `-Wl,-elf2flt=-r` the binary loads as a process but never reaches
+`main()`. `Examples.Linux.Build_RV32i/Program.cs` drives the cross-compile
+via a small shell script and drops the results into the rootfs overlay.
+
+### Microwindows nano-X (real retained-mode WM)
+
+`Examples.Linux.Build_RV32i` optionally rolls in a Microwindows nano-X
+server + window manager + demo clients. The patched upstream tree lives
+at `$HOME/rvemu-mw/microwindows` (cloned from
+`https://github.com/ghaerr/microwindows`); the rvemu-specific overrides
+are kept beside `Examples/Linux.Build_RV32i/microwindows/`
+(`config`, `scr_rvemu.c`) and a one-shot setup script lives at
+`Examples/Linux.Build_RV32i/scripts/build-microwindows.sh`.
+
+Five things needed patching:
+
+1. New `UCLINUX-RISCV` arch in `src/Arch.rules` adding
+   `-Wl,-elf2flt=-r` so each binary becomes BFLT v4 ram gotpic.
+2. New screen driver `src/drivers/scr_rvemu.c` that opens `/dev/mem`
+   and `mmap`s the FB at `0x85FC0000` directly (we have no `/dev/fb0`,
+   see above). Also defines stub `ioctl_get/setpalette` because
+   `kbd_ttyscan.c` references them unconditionally.
+3. `SCREEN=RVEMU` selector added to `src/drivers/Objects.rules`.
+4. `AUTO_START_SERVER=0` in `src/include/mwconfig.h` — default uses
+   `fork()` from any client to spawn the server; nommu has no fork.
+5. Strip `nxlaunch`, `nxterm`, `nxroach`, `nxev` (all fork-using) and
+   the C++ `cannyedgedetect` / `demo-agg` demos (toolchain has no g++)
+   from `src/demos/nanox/Makefile`. Enable the previously-commented
+   `nanowm` target while you're there.
+
+When the prepare detects pre-built binaries under
+`$HOME/rvemu-mw/microwindows/src/bin/`, it copies `nano-X`, `nanowm`,
+and a few demo clients into the rootfs overlay and installs
+`S45microwindows` which:
+
+1. Stops the makeshift `rvemu-desktop` (S43desktop) if running.
+2. Starts `nano-X` (waits for `/tmp/.nano-X` socket).
+3. Starts `nanowm` (window manager).
+4. Starts `nxclock` + `nxeyes` as initial visible apps.
+
+To launch additional demos by hand: just `nxchess &` / `demo-arc &` etc.
+at the shell — they connect to the running server over the socket.

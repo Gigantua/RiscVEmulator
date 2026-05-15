@@ -4,6 +4,33 @@ Architecture: rv32inommu_uclibc
 Maintainer: rvemu-feed
 Description: bc (cross-built via buildroot)
 Filename: bc_1.07.1_rv32inommu_uclibc.ipk
-Size: 174754
-SHA256sum: 7af9fe2497cc37d73502d68b5be861781bcd585fa65360e63b5cfde9a2c11e31
+Size: 199724
+SHA256sum: 59b1065f4cd1e16376df0c63983ea6bf0157f10534eb31bb493ee1064b6a4d53
+
+Package: doom-wad
+Version: 1.9
+Architecture: rv32inommu_uclibc
+Maintainer: rvemu-feed
+Description: doom-wad (cross-built via buildroot)
+Filename: doom-wad_1.9_rv32inommu_uclibc.ipk
+Size: 1750676
+SHA256sum: cd5a943f09f62fcaf58ace5ea997075f5b3f31e6bb3b3c76dec7db838a521b73
+
+Package: doomgeneric
+Version: dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284
+Architecture: rv32inommu_uclibc
+Maintainer: rvemu-feed
+Description: doomgeneric (cross-built via buildroot)
+Filename: doomgeneric_dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284_rv32inommu_uclibc.ipk
+Size: 284590
+SHA256sum: cbe4e57b0f4ce593ee8f00531034ef3ba0bdfadf5b74c335959636fa6d76782e
+
+Package: nano
+Version: 7.2
+Architecture: rv32inommu_uclibc
+Maintainer: rvemu-feed
+Description: nano (cross-built via buildroot)
+Filename: nano_7.2_rv32inommu_uclibc.ipk
+Size: 298554
+SHA256sum: 46fb228ce812fc7f089881c11ec635ea2c28bc6c91da157ee6f5799014a433dd
 

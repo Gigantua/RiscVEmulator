@@ -45,7 +45,7 @@ if (args.Length > 0)
 }
 
 // No args → interactive REPL.
-Console.WriteLine("rvemu package server. Commands: search <q>, add <name>, remove <name>, list, build, serve, run, quit");
+Console.WriteLine("rvemu package server. Commands: search <q>, add <name>, remove <name>, list, build, rebuild <name>, serve, run, quit");
 while (true)
 {
     Console.Write("> ");
@@ -93,6 +93,11 @@ async Task<int> ExecuteAsync(string[] argv)
         case "build":
             return await DoBuildAsync();
 
+        case "rebuild":
+            if (argv.Length < 2) { Console.Error.WriteLine("usage: rebuild <name> [<name>...]"); return 1; }
+            DoRebuild(argv.Skip(1));
+            return await DoBuildAsync();
+
         case "serve":
             return await DoServeAsync();
 
@@ -102,7 +107,7 @@ async Task<int> ExecuteAsync(string[] argv)
         case "help":
         case "-h":
         case "--help":
-            Console.WriteLine("commands: search <q>, add <name>, remove <name>, list, build, serve, run");
+            Console.WriteLine("commands: search <q>, add <name>, remove <name>, list, build, rebuild <name>, serve, run");
             return 0;
 
         default:
@@ -227,6 +232,33 @@ void DoRemove(IEnumerable<string> names)
     Console.WriteLine($"removed {before - cat.Packages.Count}");
 }
 
+// Forget cached .ipk for one or more packages so the next build re-runs
+// them. Used when the package recipe changes — `build` alone would skip
+// them as cached.
+void DoRebuild(IEnumerable<string> names)
+{
+    var cat = LoadCatalog();
+    foreach (var n in names)
+    {
+        var entry = cat.Packages.FirstOrDefault(p =>
+            string.Equals(p.Name, n, StringComparison.OrdinalIgnoreCase));
+        if (entry == null)
+        {
+            Console.Error.WriteLine($"  {n}: not in catalog (use 'add' first)");
+            continue;
+        }
+        if (!string.IsNullOrEmpty(entry.IpkFile))
+        {
+            var p = Path.Combine(FeedCacheDir, entry.IpkFile);
+            if (File.Exists(p)) File.Delete(p);
+        }
+        entry.BuiltVersion = null;
+        entry.IpkFile      = null;
+        Console.WriteLine($"  {entry.Name}: cleared cache, will rebuild");
+    }
+    SaveCatalog(cat);
+}
+
 void DoList()
 {
     var cat = LoadCatalog();
@@ -243,15 +275,34 @@ async Task<int> DoBuildAsync()
     if (cat.Packages.Count == 0) { Console.WriteLine("nothing to build (catalog empty)"); return 0; }
     Directory.CreateDirectory(FeedCacheDir);
 
+    int skipped = 0, built = 0, failed = 0;
     foreach (var entry in cat.Packages)
     {
+        // Skip packages whose previously-built .ipk is still cached. The
+        // catalog tracks IpkFile + BuiltVersion; if both are set and the
+        // file is still on disk, there's nothing to do.
+        if (!string.IsNullOrEmpty(entry.IpkFile) && !string.IsNullOrEmpty(entry.BuiltVersion))
+        {
+            string cached = Path.Combine(FeedCacheDir, entry.IpkFile);
+            if (File.Exists(cached))
+            {
+                Console.WriteLine($"=== {entry.Name} ({entry.BrSymbol}) — cached {entry.BuiltVersion} ===");
+                skipped++;
+                continue;
+            }
+        }
+
         Console.WriteLine($"=== {entry.Name} ({entry.BrSymbol}) ===");
         var (ok, ipkPath, version) = await BuildAndPackAsync(entry);
-        if (!ok) { Console.Error.WriteLine($"  ! build failed"); continue; }
+        if (!ok) { Console.Error.WriteLine($"  ! build failed"); failed++; continue; }
         entry.BuiltVersion = version;
         entry.IpkFile      = Path.GetFileName(ipkPath);
         Console.WriteLine($"  → {entry.IpkFile}");
+        built++;
     }
+    Console.WriteLine($"Build summary: {built} built, {skipped} cached, {failed} failed.");
+    if (skipped > 0)
+        Console.WriteLine("  (use 'rebuild <name>' to force-rebuild a cached package)");
     SaveCatalog(cat);
 
     // Regenerate Packages.gz from whatever .ipk's are in feed-cache.
@@ -439,6 +490,12 @@ async Task<int> DoServeAsync()
     listener.Prefixes.Add($"http://localhost:{FeedPort}/");
     listener.Start();
     Console.WriteLine($"Serving {FeedCacheDir} on http://localhost:{FeedPort}/ (guest URL: http://10.0.2.2:{FeedPort}/)");
+    Console.WriteLine();
+    Console.WriteLine("In the guest's Terminal:");
+    Console.WriteLine("    rvpkg update                # refresh the package index");
+    Console.WriteLine("    rvpkg list                  # see what's available");
+    Console.WriteLine("    rvpkg install <name>        # e.g. rvpkg install bc");
+    Console.WriteLine();
     Console.WriteLine("Ctrl+C to stop.");
     using var cts = new CancellationTokenSource();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };

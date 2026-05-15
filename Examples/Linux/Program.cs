@@ -11,9 +11,10 @@ Console.OutputEncoding = System.Text.Encoding.UTF8;
 
 string? kernelPath = null;
 string? dtbPath    = null;
-int     ramMB      = 64;        // matches cnlohr DTB's hardcoded memory size
+int     ramMB      = 96;        // 64 MB Linux + 32 MB headroom for Microwindows etc.
 bool    doDownload = false;
 bool    enableNet  = false;
+bool    enableGui  = false;
 using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
 {
     Timeout = TimeSpan.FromMinutes(10),
@@ -29,6 +30,7 @@ for (int i = 0; i < args.Length; i++)
         case "--ram":      ramMB      = int.Parse(args[++i]); break;
         case "--download": doDownload = true; break;
         case "--net":      enableNet  = true; break;
+        case "--gui":      enableGui  = true; break;
         default:
             Console.Error.WriteLine($"Unknown option: {args[i]}");
             PrintUsage();
@@ -66,6 +68,7 @@ if (!userOverrodeKernel && !userOverrodeDtb &&
     kernelPath = preparedKernel;
     dtbPath    = preparedDtb;
     enableNet  = true;          // prepared image always has virtio-net.
+    enableGui  = true;          // ...and the rvemu-desktop overlay app.
 }
 
 if (doDownload)
@@ -99,9 +102,26 @@ byte[] kernelImage = File.ReadAllBytes(kernelPath);
 int    ramSize     = ramMB * 1024 * 1024;
 const uint RamBase = 0x80000000u;
 
+// Framebuffer slot — last 4 MB of RAM, fixed at 0x85C00000. The FB lives
+// INSIDE the RAM bank (vs. a separate physical address like 0x20000000)
+// to avoid the init_unavailable_range trap — see CLAUDE.md "Don't put
+// simple-framebuffer in the DT" for the post-mortem. /memory is shrunk
+// to exclude this region; guest userspace mmap's /dev/mem at FbBase to
+// draw. 1024×768×32 = 3 MB, rounded up to 4 MB for headroom.
+// Requires ramMB >= 96 so the FB region is actually committed.
+const uint FbBase    = 0x85C0_0000u;
+const uint FbSize    = 0x400000u;         // 4 MB (1024*768*4 = 3,145,728)
+const int  FbWidth   = 1024;
+const int  FbHeight  = 768;
+
 if (kernelImage.Length > ramSize)
 {
     Console.Error.WriteLine($"Kernel ({kernelImage.Length:N0} bytes) does not fit in {ramMB} MB RAM.");
+    return 1;
+}
+if (RamBase + ramSize < FbBase + FbSize)
+{
+    Console.Error.WriteLine($"--ram {ramMB} too small; framebuffer at 0x{FbBase:X8} needs RAM ≥ 96 MB.");
     return 1;
 }
 
@@ -111,19 +131,39 @@ byte[] dtbBytes = File.ReadAllBytes(dtbPath);
 // ── Memory layout ────────────────────────────────────────────────────────────
 //
 //   Physical 0x80000000 .. 0x80000000+ramSize
-//   Bus address = physical - 0x80000000
-//   [bus 0x00000000] kernel flat binary
-//   [bus ram_size - dtb_size - 64] DTB  (near end of RAM, like mini-rv32ima)
+//   [0x00000000          ] kernel flat binary
+//   [dtbRamOffset        ] DTB
+//   [0x85C00000-0x85FFFFFF] framebuffer  (last 4 MB, fixed; 1024x768x32)
+//
+// DTB sits BELOW the framebuffer so kernel can read it without colliding.
 
-uint dtbRamOffset = (uint)(ramSize - dtbBytes.Length - 64);
+uint dtbRamOffset = (FbBase - RamBase) - (uint)dtbBytes.Length - 64;
+
+// Native mtime is just the CPU's instruction counter. DTS default
+// `timebase-frequency = 1 MHz` makes the kernel think one tick = one μs,
+// but at our typical ~60 MIPS that's 60× too fast. Override with a
+// rough match. If your host runs faster, bump this — visible symptom is
+// nxclock or `date` racing ahead of wall clock. A pre-boot benchmark
+// would compute this exactly per host but adds startup cost.
+const uint TimebaseHz = 60_000_000u;
 
 // Patch the RAM size field in the DTB. Both rvemu-net.dts and the legacy
 // sixtyfourmb.dts use 0x00C0FF03 as a magic guard in <reg = <0x80000000 0x00C0FF03>>;
 // at runtime we scan for that big-endian u32 and replace it with the actual
 // RAM size in BE so the kernel sees the right amount of memory.
+//
+// validRam = ramSize − FbSize: SHRINK /memory so the kernel never tracks
+// the FB region at all (no struct pages, no slab in those pages).
+// Otherwise userspace /dev/mem mmap to the FB clobbers kernel data that
+// happened to land in those pages — symptoms: WARN at mm/internal.h,
+// slab_common.c, workqueue.c followed by devtmpfs corruption.
+// Since FB is OUTSIDE /memory, there's still only ONE memblock bank — the
+// gap below `RamBase` is iterated by init_unavailable_range, but with
+// ARCH_PFN_OFFSET = 0x80000 every PFN in the hole returns false from
+// pfn_valid, so the walk skips by pageblock and finishes fast.
 byte[] dtbPatch = (byte[])dtbBytes.Clone();
 {
-    uint validRam = dtbRamOffset;  // how much RAM the kernel should see
+    uint validRam = (uint)ramSize - FbSize;
     for (int o = 0; o + 4 <= dtbPatch.Length; o++)
     {
         uint w = (uint)(dtbPatch[o] << 24 | dtbPatch[o+1] << 16 |
@@ -133,6 +173,19 @@ byte[] dtbPatch = (byte[])dtbBytes.Clone();
         dtbPatch[o+1] = (byte)(validRam >> 16);
         dtbPatch[o+2] = (byte)(validRam >>  8);
         dtbPatch[o+3] = (byte)(validRam >>  0);
+        break;
+    }
+    // Patch timebase-frequency 0x000F4240 (1 MHz, the cnlohr DTS default)
+    // with the measured MIPS so the kernel's clock runs at ~wall pace.
+    for (int o = 0; o + 4 <= dtbPatch.Length; o++)
+    {
+        uint w = (uint)(dtbPatch[o] << 24 | dtbPatch[o+1] << 16 |
+                        dtbPatch[o+2] << 8 | dtbPatch[o+3]);
+        if (w != 0x000F4240u) continue;
+        dtbPatch[o+0] = (byte)((TimebaseHz >> 24) & 0xFF);
+        dtbPatch[o+1] = (byte)((TimebaseHz >> 16) & 0xFF);
+        dtbPatch[o+2] = (byte)((TimebaseHz >>  8) & 0xFF);
+        dtbPatch[o+3] = (byte)((TimebaseHz >>  0) & 0xFF);
         break;
     }
 }
@@ -180,14 +233,34 @@ if (enableNet)
     bus.RegisterPeripheral(virtNet);
 }
 
-// Plain-MMIO peripherals — same set the Doom/Voxel demos use.
-// FramebufferDevice is committed at 0x20000000 so userspace can mmap it
-// directly via /dev/mem (Doom-style). NO simple-framebuffer DT node is
-// emitted: it would pull 0x20000000 into kernel memblock and stall boot
-// in init_unavailable_range — see Examples.Linux.Build_RV32i for the full
-// post-mortem.
-var framebuffer = new FramebufferDevice(width: 320, height: 200);
+// Framebuffer at FbBase (inside the top of RAM). The Memory peripheral
+// already committed this region as plain RAM; FramebufferDevice's commit
+// is a no-op overlay (VirtualAlloc on already-committed pages just returns
+// the same pointer). The result: CPU writes to FbBase land in real RAM,
+// SDL sees them via PresentedPixels, AND the kernel's simple-framebuffer
+// driver can ioremap the region from /reserved-memory.
+var framebuffer = new FramebufferDevice(FbWidth, FbHeight, FbBase);
 bus.RegisterPeripheral(framebuffer);
+
+// Keyboard + mouse MMIO peripherals (same as Doom/Voxel use).
+// The guest's rvemu-input daemon mmap's /dev/mem at these addresses and
+// translates events into /dev/input/event0 + event1 via /dev/uinput so
+// any evdev-aware app (Microwindows, fbterm) sees standard Linux input.
+var keyboard = new KeyboardDevice();
+var mouse    = new MouseDevice();
+bus.RegisterPeripheral(keyboard);
+bus.RegisterPeripheral(mouse);
+
+// Audio MMIO peripherals (same as Doom uses).
+//   0x30000000  AudioBufferDevice  (1 MB plain RAM — PCM samples)
+//   0x30100000  AudioControlDevice (guarded — sample rate / play trigger)
+// Guest userspace mmap's /dev/mem at these addresses; LinuxSdlAudio drains
+// the buffer to SDL2 when the guest sets Ctrl bit 0. Region is outside
+// /memory@0x80000000 so it doesn't perturb memblock — no DT entry needed.
+var audioBuf  = new AudioBufferDevice();
+var audioCtrl = new AudioControlDevice();
+bus.RegisterPeripheral(audioBuf);
+bus.RegisterPeripheral(audioCtrl);
 
 // Load kernel at physical 0x80000000
 bus.Load(RamBase, kernelImage, 0, kernelImage.Length);
@@ -220,12 +293,12 @@ syscon.OnReboot   = () => emu.SetHalted(true);
 
 var cts = new System.Threading.CancellationTokenSource();
 
-Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    Console.Error.WriteLine("\nCtrl+C — halting emulator.");
-    cts.Cancel();
-};
+// Forward Ctrl-C to the guest (byte 0x03 on stdin → UART → busybox tty
+// discipline → SIGINT to foreground process). Without this the .NET
+// runtime catches Ctrl-C as a process-level signal and the guest shell
+// never sees it. To exit the emulator: `poweroff` from inside the guest,
+// or close the host terminal window.
+try { Console.TreatControlCAsInput = true; } catch { /* not a console */ }
 
 var stdinThread = new System.Threading.Thread(() =>
 {
@@ -249,6 +322,22 @@ stdinThread.Start();
 Console.Error.WriteLine($"Booting Linux kernel ({kernelImage.Length:N0} bytes) with {ramMB} MB RAM at 0x{RamBase:X8}...");
 Console.Error.WriteLine("Press Ctrl+C to exit emulator (the signal is NOT forwarded to Linux).");
 Console.Error.WriteLine();
+
+// Optional SDL viewer — renders FB + forwards keyboard/mouse events to the
+// guest's MMIO peripherals. The rvemu-input daemon inside the guest then
+// translates those to /dev/input/eventN. Audio drain runs on its own thread
+// so guests can play sound without --gui implying a window in the future.
+Examples.Linux.LinuxSdlViewer? viewer = null;
+Examples.Linux.LinuxSdlAudio?  audio  = null;
+if (enableGui)
+{
+    viewer = new Examples.Linux.LinuxSdlViewer(framebuffer, keyboard, mouse,
+        title: $"rvemu Linux ({ramMB} MB)", scale: 1);
+    viewer.Start();
+    audio  = new Examples.Linux.LinuxSdlAudio(audioBuf, audioCtrl);
+    audio.Start();
+    Console.Error.WriteLine("SDL viewer + audio started (--gui).");
+}
 
 const int BatchSize = 500_000;
 
@@ -276,6 +365,8 @@ while (!emu.IsHalted && !cts.IsCancellationRequested)
 }
 
 cts.Cancel();
+viewer?.Stop();
+audio?.Stop();
 Console.Error.WriteLine($"\nEmulator stopped. Executed ~{emu.MTime:N0} instructions.");
 return 0;
 

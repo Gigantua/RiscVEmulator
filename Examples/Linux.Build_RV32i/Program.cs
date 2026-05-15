@@ -145,17 +145,31 @@ string[] kernelEnable =
     "CONFIG_FB", "CONFIG_FB_SIMPLE", "CONFIG_FB_NOTIFY",
 
     // ── Input subsystem (keyboard + mouse) ──────────────────────────────────
-    // virtio-input from the guest side; the host can ship one virtio-mmio slot
-    // per device (kbd, mouse) and userspace reads /dev/input/eventN via evdev.
+    // CONFIG_INPUT_UINPUT lets the rvemu-input userspace daemon (overlay)
+    // synthesize input events read from our MMIO peripherals; CONFIG_INPUT_EVDEV
+    // exposes them as /dev/input/eventN.
     "CONFIG_INPUT", "CONFIG_INPUT_EVDEV", "CONFIG_INPUT_KEYBOARD",
     "CONFIG_INPUT_MOUSEDEV", "CONFIG_INPUT_MISC",
-    "CONFIG_VIRTIO_INPUT",
+    "CONFIG_INPUT_UINPUT",
+
+    // /dev/mem so rvemu-input can mmap the MMIO regions for kbd/mouse and
+    // userspace can mmap the framebuffer at 0x85FC0000 directly. STRICT_DEVMEM
+    // would block userspace from touching anything inside RAM (including our
+    // reserved FB) — explicit `# is not set` line keeps it off (`olddefconfig`
+    // re-enables it otherwise).
+    "CONFIG_DEVMEM",
 
     // ── Sound + MIDI ────────────────────────────────────────────────────────
-    // ALSA + virtio-snd backs /dev/snd/* including raw MIDI on /dev/snd/midiCxDx.
+    // ALSA core + raw MIDI. CONFIG_SND_ALOOP is the in-tree loopback driver
+    // — it registers a real ALSA card "Loopback" whose pcmC0D0p playback
+    // substream forwards into pcmC0D1c capture. The rvemu-audiod daemon
+    // reads from the capture side and forwards PCM frames to the host
+    // AudioBufferDevice at 0x30000000 via /dev/mem. This is the audio
+    // equivalent of rvemu-input bridging MMIO kbd/mouse to /dev/uinput.
     "CONFIG_SOUND", "CONFIG_SND", "CONFIG_SND_PCM", "CONFIG_SND_TIMER",
     "CONFIG_SND_RAWMIDI", "CONFIG_SND_SEQUENCER",
     "CONFIG_SND_VIRTIO",
+    "CONFIG_SND_DRIVERS", "CONFIG_SND_ALOOP",
 };
 Console.WriteLine($"Patching cnlohr-kernel.config (+{kernelEnable.Length} symbols)...");
 foreach (var sym in kernelEnable)
@@ -163,6 +177,19 @@ foreach (var sym in kernelEnable)
     RunWsl($"sed -i 's|^# {sym} is not set$|{sym}=y|' {wslDir}/board/rvemu/cnlohr-kernel.config");
     RunWslSilent($"grep -q '^{sym}=' {wslDir}/board/rvemu/cnlohr-kernel.config || " +
                  $"echo '{sym}=y' >> {wslDir}/board/rvemu/cnlohr-kernel.config");
+}
+
+// Explicitly DISABLE CONFIG_STRICT_DEVMEM — our compositor mmap's /dev/mem
+// at 0x85FC0000 (inside RAM, marked /reserved-memory), and STRICT_DEVMEM
+// blocks all RAM-range /dev/mem access. Symptom when left on: kernel WARN
+// at kernel/workqueue.c when the FB process accesses the mapping, then
+// devtmpfs corruption ("can't open /dev/console").
+string[] kernelDisable = { "CONFIG_STRICT_DEVMEM", "CONFIG_IO_STRICT_DEVMEM" };
+foreach (var sym in kernelDisable)
+{
+    RunWsl($"sed -i 's|^{sym}=.*|# {sym} is not set|' {wslDir}/board/rvemu/cnlohr-kernel.config");
+    RunWslSilent($"grep -q '{sym}' {wslDir}/board/rvemu/cnlohr-kernel.config || " +
+                 $"echo '# {sym} is not set' >> {wslDir}/board/rvemu/cnlohr-kernel.config");
 }
 
 // ── 5. Patch cnlohr's DTS with PLIC + virtio-mmio nodes ─────────────────
@@ -266,28 +293,23 @@ RunWsl($"python3 -c \"" +
        $"s2=re.sub(r'(\\s*)bootargs = ', r'\\1' + frag + 'bootargs = ', s, count=1) if 'rng-seed' not in s else s;" +
        $"open(p,'w').write(s2)\"");
 
-// NOT injecting a simple-framebuffer DT node — exhaustively bisected and
-// found that ANY well-formed simple-framebuffer node (with correct cells
-// declaration so its reg resolves to a real size) pulls the FB region
-// into memblock.memory, which drops ARCH_PFN_OFFSET to the FB's PFN
-// (0x20000) and makes init_unavailable_range walk ~400k pages of the
-// gap to RAM (0x80000) one-by-one via __memset(struct page). At 50 MIPS
-// this is effectively forever. Repro: just `compatible="simple-framebuffer";
-// reg=<0 0x20000000 0 0x40000>;` inside /chosen with #address-cells=2,
-// #size-cells=2. Without proper cells the reg parses as size=0 and the
-// kernel ignores it (but simplefb's probe would also reject it, so that's
-// not a fix).
+// Not injecting any simple-framebuffer DT node.
 //
-// Workable paths (NOT yet implemented):
-//   1. Move FramebufferDevice INSIDE RAM (carve last 256KB of /memory),
-//      then standard simple-framebuffer works because the kernel reserves
-//      it from RAM rather than treating it as a separate bank.
-//   2. Write a tiny custom in-tree driver "rvemu,framebuffer" that
-//      ioremap's 0x20000000 without going through any memory-aware
-//      framework. Kernel ignores the reg for memblock purposes.
-//   3. Skip /dev/fb0 entirely. Userspace mmap's /dev/mem at 0x20000000
-//      directly (same path Doom uses bare-metal). Already works with
-//      CONFIG_DEVMEM=y (default).
+// We tried workaround #1 (FB inside RAM, /reserved-memory + /chosen/framebuffer)
+// in May 2026 and it STILL hangs the kernel before any printk. Same PCs in
+// __memset / init_unavailable_range as the out-of-RAM case. The trigger is
+// surprisingly fragile: a "minimal" /chosen/framebuffer (compatible+reg
+// only) boots, but adding ANY one of width/height/stride/format kicks the
+// kernel back into the slow walk — even with FB inside the RAM range and
+// /reserved-memory carving it out. The kernel apparently still ends up
+// treating the FB region as a separate memblock entry through some path
+// we haven't fully pinpointed.
+//
+// Active strategy: workaround #3 — guest userspace mmaps /dev/mem at
+// 0x85FC0000 directly (Doom's bare-metal path). CONFIG_DEVMEM=y is on.
+// FramebufferDevice is still registered (Examples.Linux), so the address
+// is real RAM. A future Microwindows port that uses /dev/mem instead of
+// /dev/fb0 would render here directly.
 
 // ── 6. Configure buildroot to use cnlohr's kernel config ────────────────
 
@@ -327,7 +349,12 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        "BR2_riscv_custom=y\n" +
        "BR2_RISCV_ISA_RVI=y\n" +
        "BR2_RISCV_ISA_RVM=y\n" +
-       "# BR2_RISCV_ISA_RVA is not set\n" +
+       // A-extension (LR.W/SC.W/AMO*). Our emulator implements it fully
+       // (see CLAUDE.md ISA support table). Required by uClibc-ng's
+       // libpthread/linuxthreads/sysdeps/riscv32/pt-machine.h once WCHAR
+       // + LOCALE are enabled, because those pull in pthread atomic
+       // primitives that use `lr.w` / `sc.w` directly.
+       "BR2_RISCV_ISA_RVA=y\n" +
        "# BR2_RISCV_ISA_RVF is not set\n" +
        "# BR2_RISCV_ISA_RVD is not set\n" +
        "# BR2_RISCV_ISA_RVC is not set\n" +
@@ -338,6 +365,24 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        // Instead the overlay ships an `rvpkg` shell script that uses busybox
        // ar+tar+wget to install .ipks from Examples.Linux.Packageserver.
        "BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES=\"board/rvemu/busybox.fragment\"\n" +
+       // ── Toolchain capabilities ──────────────────────────────────────
+       // uClibc-ng wchar + locale. Required by gnulib-using packages
+       // (nano, sed, grep, gawk, ...) which reference wctype/iswctype/
+       // wctomb. Without these the package server's cross-build fails
+       // at link time with "undefined reference to `wctype'" etc.
+       // Adds ~250 KB to libc.a, but transitively unlocks most of
+       // buildroot's package set for the Packageserver feed.
+       "BR2_TOOLCHAIN_BUILDROOT_WCHAR=y\n" +
+       "BR2_TOOLCHAIN_BUILDROOT_LOCALE=y\n" +
+       "BR2_ENABLE_LOCALE=y\n" +
+       // Keep only C/POSIX + a couple of common UTF-8 locales — full set
+       // bloats the rootfs by several MB and we don't need it.
+       "BR2_ENABLE_LOCALE_WHITELIST=\"C en_US en_US.UTF-8\"\n" +
+       // Bake doomgeneric (+ its WAD dep) directly into the base image so
+       // the Doom button shows up on the taskbar on first boot, no rvpkg
+       // install needed. Costs ~5 MB of rootfs (binary + shareware WAD).
+       "BR2_PACKAGE_DOOMGENERIC=y\n" +
+       "BR2_PACKAGE_DOOM_WAD=y\n" +
        "BR_CFG_EOF");
 
 // ── 6b. Rootfs overlay: drop in an auto-DHCP init script ────────────────
@@ -391,10 +436,63 @@ RunWsl($"cat > {wslDir}/board/rvemu/busybox.fragment << 'BB_EOF'\n" +
        "CONFIG_GUNZIP=y\n" +
        "CONFIG_GZIP=y\n" +
        "CONFIG_FEATURE_GZIP_DECOMPRESS=y\n" +
+       // Process/system inspection — useful in the on-guest terminal.
+       "CONFIG_TOP=y\n" +
+       "CONFIG_FEATURE_TOP_INTERACTIVE=y\n" +
+       "CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE=y\n" +
+       "CONFIG_FEATURE_TOP_CPU_GLOBAL_PERCENTS=y\n" +
+       "CONFIG_PS=y\n" +
+       "CONFIG_FEATURE_PS_TIME=y\n" +
+       "CONFIG_FEATURE_PS_LONG=y\n" +
+       "CONFIG_FREE=y\n" +
+       "CONFIG_UPTIME=y\n" +
+       "CONFIG_VMSTAT=y\n" +
+       "CONFIG_PIDOF=y\n" +
+       "CONFIG_KILLALL=y\n" +
        // awk is built but broken in our nommu uclibc build (""Access to
        // negative field"" on `$1`). Leaving the symbols out — rvpkg uses
        // pure POSIX shell parsing instead.
        "BB_EOF");
+
+// ── Custom buildroot package: doomgeneric ─────────────────────────────────
+// Drop our package recipe into the buildroot tree so the Packageserver
+// sees it under the BR2_PACKAGE_* scan. The user then does
+//   add doomgeneric  →  run     (host)
+//   rvpkg install doomgeneric    (guest)
+// and the .desktop file ships with the .ipk, making the Doom button
+// appear live on the taskbar (mtime-poll picks it up).
+{
+    string hostDoomDir = Path.GetFullPath(Path.Combine(
+        AppContext.BaseDirectory, "..", "..", "..", "..", "doomgeneric"))
+        .Replace("\\", "/");
+    string wslDoomDir = $"$(wslpath -u '{hostDoomDir}')";
+    Console.WriteLine("Installing doomgeneric buildroot package...");
+    RunWsl($"rm -rf {wslDir}/package/doomgeneric && mkdir -p {wslDir}/package/doomgeneric");
+    RunWsl($"cp {wslDoomDir}/Config.in           {wslDir}/package/doomgeneric/");
+    RunWsl($"cp {wslDoomDir}/doomgeneric.mk      {wslDir}/package/doomgeneric/");
+    RunWsl($"cp {wslDoomDir}/doomgeneric_rvemu.c {wslDir}/package/doomgeneric/");
+    RunWsl($"cp {wslDoomDir}/Makefile.rvemu      {wslDir}/package/doomgeneric/");
+    // Splice `source "package/doomgeneric/Config.in"` into package/Config.in
+    // (idempotent — only injects if not present already).
+    RunWsl($"grep -q 'package/doomgeneric/Config.in' {wslDir}/package/Config.in || " +
+           $"sed -i '/menu \"Games\"/a\\\tsource \"package/doomgeneric/Config.in\"' " +
+           $"{wslDir}/package/Config.in");
+
+    // Patch upstream doom-wad's Config.in so it accepts being selected by
+    // our doomgeneric package. Upstream only allows chocolate-doom or
+    // prboom — without this our `select BR2_PACKAGE_DOOM_WAD` triggers an
+    // "unmet direct dependencies" warning and the WAD doesn't actually
+    // get into the rootfs.
+    RunWsl($"sed -i 's/depends on BR2_PACKAGE_CHOCOLATE_DOOM || BR2_PACKAGE_PRBOOM$/" +
+           $"depends on BR2_PACKAGE_CHOCOLATE_DOOM || BR2_PACKAGE_PRBOOM || BR2_PACKAGE_DOOMGENERIC/' " +
+           $"{wslDir}/package/doom-wad/Config.in");
+
+    // Stage Microwindows nano-X client lib + headers into buildroot's
+    // sysroot so packages (doomgeneric, future nano-X apps) can link.
+    // The shell script form sidesteps PowerShell/.NET $HOME expansion
+    // games when passing inline scripts.
+    RunWsl("bash /mnt/c/work/RiscV/RiscVEmulator/Examples/Linux.Build_RV32i/scripts/stage-nanox.sh");
+}
 
 // rvpkg — tiny shell-script package installer. Fetches the host feed,
 // extracts the .ipk (ar + tar.gz inside) into /. No opkg dependencies.
@@ -453,6 +551,9 @@ install_pkg() {
     ar x ""/tmp/$fname"" || { echo ""ar failed (busybox without CONFIG_AR?)""; return 1; }
     [ -f data.tar.gz ] || { echo ""$fname: missing data.tar.gz""; return 1; }
     tar -xzf data.tar.gz -C /
+    # Touch the launchers dir so rvemu-taskbar's mtime poll sees a change
+    # and re-scans for new .desktop entries the package may have shipped.
+    [ -d /etc/rvemu-launchers.d ] && touch /etc/rvemu-launchers.d
     echo ""$pkg installed.""
     cd / && rm -rf /tmp/rvpkg-ext /tmp/$fname
 }
@@ -468,7 +569,344 @@ string rvpkgB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(rvpk
 RunWsl($"echo {rvpkgB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/usr/bin/rvpkg");
 RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/usr/bin/rvpkg");
 
+// rvemu-input — userspace daemon that bridges our MMIO keyboard/mouse to
+// the kernel input subsystem via /dev/uinput. After it's running,
+// /dev/input/event0 (kbd) and event1 (mouse) appear and any standard
+// fbdev/evdev-aware app sees real Linux input devices.
+//
+// Source lives at guest-userspace/rvemu-input.c. We cross-compile it here
+// with buildroot's toolchain (which produces a statically-linked nommu
+// uclibc RV32I binary) and drop the result into the overlay.
+Console.WriteLine("Cross-compiling rvemu-input...");
+// AppContext.BaseDirectory varies by build flavour:
+//   Debug:        bin/Debug/net10.0/            → 3 levels up = project dir
+//   Release:      bin/Release/net10.0/          → 3 levels up = project dir
+//   Release x64:  bin/x64/Release/net10.0/      → 4 levels up = project dir
+// Walk upward until we find a sibling guest-userspace/ folder so we work
+// in all configurations without hard-coding the depth.
+string hostSrcDir;
+{
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "guest-userspace")))
+        dir = dir.Parent;
+    if (dir == null)
+        throw new DirectoryNotFoundException(
+            "Could not locate guest-userspace/ above " + AppContext.BaseDirectory);
+    hostSrcDir = Path.Combine(dir.FullName, "guest-userspace").Replace("\\", "/");
+}
+Console.WriteLine($"  source dir: {hostSrcDir}");
+RunWsl($"mkdir -p {wslDir}/board/rvemu/userspace");
+// Let bash convert the Windows path to /mnt/c/... at run time.
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-input.c\" {wslDir}/board/rvemu/userspace/");
+// Buildroot's toolchain wrapper lives at output/host/bin/<triple>-gcc. The
+// `-static` is required because our nommu rootfs has no dynamic linker
+// listening at the standard path; everything in /usr/bin is statically linked.
+// BFLT link recipe — mirrors what buildroot uses for busybox itself.
+// Critical flags:
+//   -fPIC               position-independent code (BFLT v4 'ram gotpic')
+//   -Wl,-elf2flt=-r     emit BFLT + tell elf2flt -r (ram-relocatable)
+//   -static             no shared libs (nommu has no dynamic linker)
+// Without -elf2flt=-r the output is BFLT 'gotpic' (no 'ram' flag) which
+// the kernel loads as a process but never reaches main() — busybox
+// works because it links with =-r. See memory/project_nommu_bflt_quirks.md.
+// Copy fbtest + desktop + audiotest + audiod + play source too. The shell
+// loop below compiles each .c.
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-fbtest.c\"    {wslDir}/board/rvemu/userspace/");
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-desktop.c\"   {wslDir}/board/rvemu/userspace/");
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-audiotest.c\" {wslDir}/board/rvemu/userspace/");
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-audiod.c\"    {wslDir}/board/rvemu/userspace/");
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-play.c\"      {wslDir}/board/rvemu/userspace/");
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-keytap.c\"    {wslDir}/board/rvemu/userspace/");
+const string buildScript = @"#!/bin/sh
+set -e
+cd ""$1""
+OVERLAY=""$2""
+CC=""$HOME/rvemu-buildroot/output/host/bin/riscv32-buildroot-linux-uclibc-gcc""
+FLAGS=""-static -fPIC -Wl,-elf2flt=-r -O2 -Wall -Wextra""
+for src in rvemu-input.c rvemu-fbtest.c rvemu-desktop.c rvemu-audiotest.c rvemu-audiod.c rvemu-play.c rvemu-keytap.c; do
+    [ -f ""$src"" ] || continue
+    out=""${src%.c}""
+    echo ""  compiling $src...""
+    $CC $FLAGS ""$src"" -o ""$out""
+    cp ""$out"" ""$OVERLAY/usr/bin/$out""
+    chmod 0755 ""$OVERLAY/usr/bin/$out""
+    file ""$OVERLAY/usr/bin/$out""
+done
+";
+string bsB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(buildScript));
+RunWsl($"echo {bsB64} | base64 -d > /tmp/rvemu-build-userspace.sh && chmod +x /tmp/rvemu-build-userspace.sh");
+string ccCmd =
+    $"/tmp/rvemu-build-userspace.sh " +
+    $"{wslDir}/board/rvemu/userspace " +
+    $"{wslDir}/board/rvemu/rootfs-overlay";
+int ccRc = RunWsl(ccCmd);
+if (ccRc == 0)
+{
+    Console.WriteLine("  rvemu-input compiled.");
+    // S42input — start the daemon after networking, never block boot.
+    // Base64-piped because bash -c heredocs still expand $1 / $! / $(...).
+    const string s42 = @"#!/bin/sh
+case ""$1"" in
+    start)
+        [ -e /dev/uinput ] && [ -x /usr/bin/rvemu-input ] || exit 0
+        echo -n 'Starting rvemu-input (MMIO→uinput bridge)... '
+        /usr/bin/rvemu-input >/dev/null 2>&1 &
+        echo $! > /var/run/rvemu-input.pid
+        echo 'OK'
+        ;;
+    stop)
+        [ -f /var/run/rvemu-input.pid ] && kill $(cat /var/run/rvemu-input.pid) 2>/dev/null
+        ;;
+esac
+exit 0
+";
+    string s42B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s42));
+    RunWsl($"echo {s42B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S42input");
+    RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S42input");
+
+    // S43desktop — auto-launch the rvemu-desktop compositor right after
+    // input is up. Runs detached (the host's --gui SDL window picks up
+    // the framebuffer renders). Boot still reaches a normal login on
+    // the serial console in parallel.
+    const string s43 = @"#!/bin/sh
+case ""$1"" in
+    start)
+        [ -x /usr/bin/rvemu-desktop ] && [ -c /dev/input/event0 ] || exit 0
+        echo -n 'Starting rvemu-desktop... '
+        /usr/bin/rvemu-desktop >/dev/null 2>&1 &
+        echo $! > /var/run/rvemu-desktop.pid
+        echo 'OK'
+        ;;
+    stop)
+        [ -f /var/run/rvemu-desktop.pid ] && kill $(cat /var/run/rvemu-desktop.pid) 2>/dev/null
+        ;;
+esac
+exit 0
+";
+    string s43B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s43));
+    RunWsl($"echo {s43B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S43desktop");
+    RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S43desktop");
+
+    // S44audio — start the ALSA loopback → MMIO bridge after input is up.
+    // Together with CONFIG_SND_ALOOP and the asound.conf below, this is what
+    // makes `aplay -l` show a real card and any ALSA app route through to
+    // the host SDL audio device.
+    const string s44 = @"#!/bin/sh
+case ""$1"" in
+    start)
+        [ -x /usr/bin/rvemu-audiod ] && [ -c /dev/snd/pcmC0D1c ] || exit 0
+        echo -n 'Starting rvemu-audiod (snd-aloop -> MMIO bridge)... '
+        /usr/bin/rvemu-audiod >/dev/null 2>&1 &
+        echo $! > /var/run/rvemu-audiod.pid
+        echo 'OK'
+        ;;
+    stop)
+        [ -f /var/run/rvemu-audiod.pid ] && kill $(cat /var/run/rvemu-audiod.pid) 2>/dev/null
+        ;;
+esac
+exit 0
+";
+    string s44B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s44));
+    RunWsl($"echo {s44B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S44audio");
+    RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S44audio");
+
+    // /etc/asound.conf — route ALSA's `default` device through plug:
+    //   * plug resamples / reformats whatever the app uses
+    //   * down to fixed 44100 / S16_LE / stereo so it matches what
+    //     rvemu-audiod opens on the capture side of the loopback.
+    // Without this, an app that requests an unusual rate (8 kHz, 48 kHz)
+    // would negotiate a different format on D0p than the daemon is reading
+    // on D1c, and snd-aloop would refuse the bind.
+    const string asoundConf = @"# Generated by Examples.Linux.Build_RV32i.
+# Maps ALSA's `default` to the snd-aloop card so all audio flows through
+# rvemu-audiod -> MMIO -> host SDL2.
+pcm.!default {
+    type plug
+    slave {
+        pcm ""hw:Loopback,0,0""
+        rate 44100
+        format S16_LE
+        channels 2
+    }
+}
+ctl.!default {
+    type hw
+    card Loopback
+}
+";
+    string asoundB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(asoundConf));
+    RunWsl($"mkdir -p {wslDir}/board/rvemu/rootfs-overlay/etc");
+    RunWsl($"echo {asoundB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/asound.conf");
+    RunWsl($"chmod 0644 {wslDir}/board/rvemu/rootfs-overlay/etc/asound.conf");
+
+    // ── Microwindows (nano-X) ────────────────────────────────────────────────
+    // If a pre-built Microwindows tree exists at ~/rvemu-mw/microwindows, ship
+    // its BFLT binaries into the rootfs and replace our makeshift rvemu-desktop
+    // with a real retained-mode window manager + a couple of demo clients.
+    //
+    // Build steps (one-time, manual):
+    //   git clone https://github.com/ghaerr/microwindows.git ~/rvemu-mw/microwindows
+    //   cp .../microwindows/config        ~/rvemu-mw/microwindows/src/config
+    //   cp .../microwindows/scr_rvemu.c   ~/rvemu-mw/microwindows/src/drivers/
+    //   ... (Arch.rules, Objects.rules tweaks — see scripts/)
+    //   cd ~/rvemu-mw/microwindows/src && make
+    //
+    // The Microwindows binaries are BFLT executables linked against the same
+    // buildroot uclibc toolchain we use here. They mmap /dev/mem at 0x85FC0000
+    // (see scr_rvemu.c) so they need CONFIG_DEVMEM in the kernel (already on).
+    int mwRc = RunWsl(
+        "test -x $HOME/rvemu-mw/microwindows/src/bin/nano-X && " +
+        "test -x $HOME/rvemu-mw/microwindows/src/bin/nanowm");
+    if (mwRc == 0)
+    {
+        Console.WriteLine("  Microwindows detected — installing nano-X + demos.");
+        string[] mwBins = { "nano-X", "nanowm", "rvemu-taskbar", "rvemu-term",
+                            "nxstart",
+                            "nxclock", "nxeyes", "nxchess", "nxcalc",
+                            "nxtetris", "nxworld",
+                            "demo-hello", "demo-arc", "demo-blit" };
+        // nxchess loads its piece sprites from /usr/share/nxchess/*.gif at
+        // runtime (HAVE_GIF_SUPPORT=Y in our MW config enables the decoder).
+        RunWsl($"mkdir -p {wslDir}/board/rvemu/rootfs-overlay/usr/share/nxchess && " +
+               $"cp $HOME/rvemu-mw/microwindows/src/demos/tuxchess/images/*.gif " +
+               $"   {wslDir}/board/rvemu/rootfs-overlay/usr/share/nxchess/");
+
+        // Taskbar launcher entries — rvemu-taskbar scans this dir at startup
+        // and re-scans whenever the dir's mtime changes (poll every second).
+        // `rvpkg install` drops new .desktop files here and the taskbar
+        // picks them up automatically without restart.
+        var launchers = new (string name, string prog)[] {
+            ("Terminal", "/usr/bin/rvemu-term"),
+            ("Clock",    "/usr/bin/nxclock"),
+            ("Eyes",     "/usr/bin/nxeyes"),
+            ("Chess",    "/usr/bin/nxchess"),
+            ("Calc",     "/usr/bin/nxcalc"),
+            ("Tetris",   "/usr/bin/nxtetris"),
+            ("World",    "/usr/bin/nxworld"),
+            ("Mine",     "/usr/bin/nxmine"),
+            ("Hello",    "/usr/bin/demo-hello"),
+            // doomgeneric is now baked into the base image via
+            // BR2_PACKAGE_DOOMGENERIC=y. Its own .ipk also ships a
+            // doom.desktop but our rm-and-rewrite of the launchers dir
+            // would wipe it, so we re-add it explicitly here.
+            ("Doom",     "/usr/bin/doom"),
+        };
+        // Wipe stale .desktop entries first so removing an item from the list
+        // above also removes the button. Have to scrub BOTH the rootfs-overlay
+        // (source) AND output/target (where buildroot stages the rootfs) —
+        // buildroot only copies overlay → target, it never removes files from
+        // target that were placed by a previous build.
+        RunWsl($"rm -rf {wslDir}/board/rvemu/rootfs-overlay/etc/rvemu-launchers.d " +
+               $"      {wslDir}/output/target/etc/rvemu-launchers.d");
+        RunWsl($"mkdir -p {wslDir}/board/rvemu/rootfs-overlay/etc/rvemu-launchers.d");
+        foreach (var (name, prog) in launchers)
+        {
+            string body = $"Name={name}\nExec={prog}\n";
+            string b64  = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(body));
+            string file = $"{wslDir}/board/rvemu/rootfs-overlay/etc/rvemu-launchers.d/{name.ToLower()}.desktop";
+            RunWsl($"echo {b64} | base64 -d > {file}");
+        }
+        foreach (var bin in mwBins)
+        {
+            RunWsl($"cp $HOME/rvemu-mw/microwindows/src/bin/{bin} " +
+                   $"{wslDir}/board/rvemu/rootfs-overlay/usr/bin/{bin} 2>/dev/null && " +
+                   $"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/usr/bin/{bin}");
+        }
+
+        // S45microwindows — stops our makeshift rvemu-desktop and brings up the
+        // real stack: nano-X server, nano-X window manager, plus nxclock and
+        // nxeyes as visible demos. Each runs detached. nano-X listens on
+        // /tmp/.nano-X for client connections.
+        const string s45 = @"#!/bin/sh
+case ""$1"" in
+    start)
+        [ -x /usr/bin/nano-X ] && [ -c /dev/input/event0 ] || exit 0
+        # If rvemu-desktop is up, stop it — it owns the same framebuffer.
+        [ -x /etc/init.d/S43desktop ] && /etc/init.d/S43desktop stop 2>/dev/null
+        echo -n 'Starting nano-X server... '
+        /usr/bin/nano-X >/dev/null 2>&1 &
+        echo $! > /var/run/nano-X.pid
+        # Wait for the socket to come up before launching clients.
+        i=0
+        while [ ! -S /tmp/.nano-X ] && [ $i -lt 20 ]; do
+            sleep 0.1
+            i=$((i+1))
+        done
+        echo 'OK'
+        echo -n 'Starting nanowm... '
+        /usr/bin/nanowm >/dev/null 2>&1 &
+        echo $! > /var/run/nanowm.pid
+        echo 'OK'
+        echo -n 'Starting desktop apps (rvemu-taskbar, nxclock, nxeyes)... '
+        # rvemu-taskbar — our own bottom-of-screen launcher with proper
+        # graphical buttons. The clock + eyes show as initial visible
+        # apps; everything else is one click away on the taskbar.
+        /usr/bin/rvemu-taskbar >/dev/null 2>&1 &
+        echo $! > /var/run/rvemu-taskbar.pid
+        /usr/bin/nxclock       >/dev/null 2>&1 &
+        /usr/bin/nxeyes        >/dev/null 2>&1 &
+        echo 'OK'
+        ;;
+    stop)
+        for f in nxeyes nxclock nanowm nano-X; do
+            [ -f /var/run/$f.pid ] && kill $(cat /var/run/$f.pid) 2>/dev/null
+        done
+        ;;
+esac
+exit 0
+";
+        string s45B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s45));
+        RunWsl($"echo {s45B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S45microwindows");
+        RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S45microwindows");
+        // Disable S43desktop on boot — Microwindows takes the framebuffer.
+        // Buildroot's rootfs build copies rootfs-overlay/ over target/ but
+        // never deletes target/ files that were placed by a previous run,
+        // so a stale S43desktop in target/etc/init.d/ will still be packed
+        // into the cpio. Remove it from BOTH locations.
+        RunWsl($"rm -f {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S43desktop " +
+               $"      {wslDir}/output/target/etc/init.d/S43desktop");
+    }
+    else
+    {
+        Console.WriteLine("  Microwindows not built (skipping). To enable, build the");
+        Console.WriteLine("  microwindows tree at $HOME/rvemu-mw/microwindows and re-run.");
+    }
+}
+else
+{
+    Console.WriteLine("  rvemu-input cross-compile failed (toolchain not built yet — " +
+                      "first `make` will build it; rerun Prepare after).");
+}
+
 RunWsl($"cd {wslDir} && yes '' | make olddefconfig");
+
+// ── 6c. Force toolchain rebuild when wchar/locale flags toggle on ───────
+// Buildroot caches the toolchain heavily — the uclibc + gcc-final stamp
+// files don't get invalidated by a .config edit alone. If an existing
+// toolchain was built without UCLIBC_HAS_WCHAR=y, we need to dirclean
+// those packages so the next `make` picks up the new flags. The check
+// is self-cancelling: after a rebuild the uclibc-ng .config contains
+// UCLIBC_HAS_WCHAR=y and this branch is skipped.
+Console.WriteLine("Checking toolchain for wchar/locale support...");
+// Marker-file approach: the first time we run after adding the wchar/locale
+// flags, force a uclibc + gcc-final dirclean so buildroot actually rebuilds
+// the toolchain with UCLIBC_HAS_WCHAR=y. Subsequent runs see the marker and
+// skip the dirclean.
+//
+// Why not detect by grepping the uclibc-*/.config for UCLIBC_HAS_WCHAR=y?
+// Tried it — `bash -c '...$(...)...'` invoked through .NET ProcessStartInfo
+// + ArgumentList apparently does NOT preserve command-substitution output
+// (the var ends up empty even though the pipeline prints the right thing
+// when run standalone). Marker files use only simple `[ -e PATH ]` tests
+// which work reliably through that invocation path.
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.wchar-applied ]; then " +
+    "  echo '  first run with wchar/locale - forcing toolchain rebuild'; " +
+    "  make uclibc-dirclean host-gcc-final-dirclean toolchain-buildroot-dirclean && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.wchar-applied; " +
+    "else " +
+    "  echo '  marker present - toolchain already rebuilt with wchar/locale'; " +
+    "fi");
 
 // ── 7. Build ─────────────────────────────────────────────────────────────
 

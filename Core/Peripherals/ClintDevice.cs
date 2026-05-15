@@ -4,13 +4,15 @@ namespace RiscVEmulator.Core.Peripherals
 {
     /// <summary>
     /// CLINT (mtime / mtimecmp) MMIO. Mapped at 0x02000000 by default
-    /// (SiFive layout). Linux uses 0x11000000 — create a second instance with
-    /// <see cref="BaseAddress"/> overridden if needed.
+    /// (SiFive layout). Linux uses 0x11000000.
     ///
-    /// mtime is a CPU-internal counter (incremented per step). This peripheral
-    /// is just the memory-mapped window onto it — guarded so every read/write
-    /// from the guest faults through the host VEH into <see cref="Read"/> /
-    /// <see cref="Write"/>, which talk to the native CPU's counter via P/Invoke.
+    /// mtime is the native CPU's instruction counter (increments once per
+    /// step). Reads/writes are forwarded to the native CPU via P/Invoke.
+    ///
+    /// We rely on the DTS `timebase-frequency` being set to match the
+    /// emulator's observed MIPS (see Examples.Linux — it patches the DTB
+    /// at startup with a measured value). Without that the kernel thinks
+    /// time runs many times faster than wall clock.
     /// </summary>
     public sealed class ClintDevice : IPeripheral
     {

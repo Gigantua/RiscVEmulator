@@ -17,14 +17,17 @@ This project demonstrates that **a simple, readable RISC-V implementation can do
 
 | | |
 |---|---|
-| 🎮 **Doom** | Full DOOM running in RISCV c++ emulation layer. Compiles from source and runs at launch. |
-| 🐧 **Linux 6.1** | Real nommu kernel boots to an interactive BusyBox shell. |
+| 🎮 **Doom** | Full DOOM running in RISCV c++ emulation layer. Two flavors: bare-metal PureDOOM (`Examples.Doom`) and a windowed `doomgeneric` build that runs inside the Linux desktop. |
+| 🐧 **Linux 6.6 + desktop** | Real nommu kernel boots to a **graphical Microwindows desktop** with taskbar, terminal, clock, eyes, calc, chess, tetris, etc. Drag windows, click buttons, type into apps. |
+| 💻 **Linux Terminal app** | A nano-X terminal-emulator window (`rvemu-term`) runs `sh -i` over a real Unix98 pty with full VT100 escape parsing — nano, vi, less, top all work. |
+| 📦 **Self-hosted OPKG feed** | `Examples.Linux.Packageserver` drives buildroot to cross-compile any of ~2700 buildroot packages, wraps the output as `.ipk`, and serves them over HTTP. The guest's `rvpkg` installs them like a real package manager. |
+| 🛜 **Networking** | Host-loopback NAT through libslirp — `wget`, DHCP, all standard sockets. |
+| 🔊 **Audio + RTC + MIDI** | PCM, real-time clock, and MIDI output peripherals — wired into the bare-metal Doom and reachable from any guest userspace via `/dev/snd` (ALSA bridge). |
 | ⚙️ **TinyCC** | A C compiler running inside the emulator, compiling C programs. |
 | 🎬 **Video** | Software-rendered frame sequences at real-time speed. |
 | 🌄 **Voxel terrain** | Height-map voxel renderer written entirely in guest C. |
-| 🔊 **Audio** | PCM playback through the emulated sound peripheral. |
 
-All of this from ~200 lines of core C++ and a thin C# peripheral layer.
+All of this from ~550 lines of core C++ and a thin C# peripheral layer.
 
 ~~~cpp
 template<bool MExt, bool FExt, bool AExt, bool Priv>
@@ -235,8 +238,13 @@ Core/                    C# emulator engine (P/Invoke shell, memory bus, periphe
 Native/                  C++ CPU hot path (single-file, ClangCL vcxproj)
 Frontend/                SDL2 window (rendering, input, audio) via Silk.NET.SDL
 Examples/
-  Doom/                  Full Doom port (PureDOOM, compiles at launch)
-  Linux/                 Boot Linux 6.1 nommu kernel to an interactive shell
+  Doom/                  Full Doom port (PureDOOM, compiles at launch, bare metal)
+  Linux/                 Boot Linux 6.6 nommu kernel + nano-X desktop (--gui)
+  Linux.Build_RV32i/     WSL-driven buildroot prepare: toolchain, kernel,
+                         busybox, Microwindows nano-X, rvemu-{input,taskbar,term},
+                         doomgeneric (windowed), etc. → packed initramfs
+  Linux.Packageserver/   Interactive REPL: pick from ~2700 buildroot packages,
+                         cross-build, wrap as .ipk, serve OPKG feed at :8080
   Runner/                Generic ELF runner with all peripherals wired
   Video/                 Software-rendered video playback demo
   Voxel/                 Voxel terrain renderer demo
@@ -296,11 +304,12 @@ See [MEMORY_MAP.md](MEMORY_MAP.md) for full register-level details.
 | Tool | Purpose |
 |------|---------|
 | [.NET 10 SDK](https://dotnet.microsoft.com/download) | Build and run C# projects |
-| Visual Studio 2022 with **C++ workload + Clang/LLVM** | Build native `rv32i_core.dll` (ClangCL toolset) |
-| [LLVM/Clang](https://releases.llvm.org/) in `PATH` | Cross-compile guest programs to RV32I ELF |
-| `lld` linker in `PATH` | Link RV32I ELF binaries (`-fuse-ld=lld`) |
+| Visual Studio 2022 / 2026 with **C++ workload + Clang/LLVM** | Build native `rv32i_core.dll` (ClangCL toolset) |
+| [LLVM/Clang](https://releases.llvm.org/) in `PATH` | Cross-compile bare-metal RV32I ELF guest programs |
+| `lld` linker in `PATH` | Link bare-metal RV32I ELF binaries (`-fuse-ld=lld`) |
+| **WSL2 + Ubuntu** (for the Linux desktop) | `Examples.Linux.Build_RV32i` cross-compiles a nommu-uClibc rootfs + Microwindows desktop + ~30 packages via buildroot inside WSL |
 
-> **Windows only.** The native project uses the ClangCL toolset and builds a `.dll`.
+> **Windows only** (host). Bare-metal demos work without WSL; the Linux desktop / package feed needs it.
 
 ---
 
@@ -329,28 +338,68 @@ dotnet Examples.Doom.dll [--wad path\to\doom.wad] [--scale 3] [--no-grab]
 - Mouse is grabbed by default; press **Escape** or **Alt+F4** to exit.
 - `--no-m-ext` disables the M-extension (much slower — avoid unless testing).
 
-### Linux
+### Linux desktop
 
-Boots Linux 6.1.14 (nommu, Buildroot) to an interactive shell.
-Downloads a ~10 MB pre-built kernel image on first run.
+Boots Linux 6.6 (nommu, uClibc) to a **graphical Microwindows nano-X desktop**.
+Run with `--gui` to get an SDL window showing the framebuffer + a taskbar:
 
 ```powershell
-cd Examples\Linux\bin\Debug\net10.0
-dotnet Examples.Linux.dll --download   # first run: fetch kernel + DTB
-dotnet Examples.Linux.dll              # subsequent runs use cache
+dotnet run --no-build --project Examples\Linux -p:Platform=x64 -- --gui
 ```
 
-Log in as **root** (no password). Press **Ctrl+C** to exit the emulator (the signal is *not* forwarded to the guest).
+What you get out of the box (everything is a real nano-X client):
+
+- **Terminal** — `rvemu-term`, a Microwindows window running `sh -i` over a Unix98 pty. Sets `TERM=vt100` so ncurses apps work; full VT100 escape parsing (cursor motion, ED/EL, SGR). Backspace, line editing, Ctrl-C all work.
+- **Doom** — `doomgeneric` ported to render into a nano-X window via `GrArea()`. Movable, focusable, close-box. Plays the shareware WAD.
+- **Clock / Eyes / Chess / Tetris / World / Mine / Calculator / Hello** — standard Microwindows demos. Taskbar reads `/etc/rvemu-launchers.d/*.desktop` and dynamically picks up new entries — install a package, click the new button within a second.
+- **Mouse capture** — Esc releases pointer grab; click back in the window to re-capture. Keyboard layout-aware (German/French/Dvorak all type the same Linux KEY_* as US).
+- **Window manager** — nanowm; drag titlebars, alt-tab between apps.
+
+Quick build (needs WSL2 + Ubuntu — the prepare drives buildroot in WSL):
+
+```powershell
+# First-time setup builds buildroot toolchain, kernel, busybox, nano-X, taskbar (~30-40 min)
+dotnet run --no-build --project Examples\Linux.Build_RV32i -p:Platform=x64
+# Then boot:
+dotnet run --no-build --project Examples\Linux -p:Platform=x64 -- --gui
+```
+
+Log in as **root** (no password) on the serial console too. Press **Ctrl+C** in the host shell to exit the emulator.
 
 Options:
 ```
 --kernel <path>   Use a custom kernel flat binary
 --dtb    <path>   Use a custom DTB
---ram    <MB>     Guest RAM in MB (default: 128)
---download        Download and cache the pre-built kernel image
+--ram    <MB>     Guest RAM in MB (default: 96; 96 minimum for the desktop)
+--gui             Open the SDL framebuffer window
+--download        Fetch the pre-built mini-rv32ima kernel (legacy serial-only mode)
 ```
 
 The kernel and DTB are cached in `~/.cache/riscvemu/linux/`.
+
+### Self-hosted package feed
+
+`Examples.Linux.Packageserver` is an interactive REPL that drives buildroot to cross-build any of buildroot's ~2700 packages and serves the results as an opkg-compatible `.ipk` feed over HTTP at `http://localhost:8080` (reachable from the guest as `http://10.0.2.2:8080` via libslirp NAT).
+
+Host:
+```
+> search nano                    # find packages buildroot knows about
+> add nano bc dropbear           # pick what you want
+> build                          # cross-build, only un-cached packages
+> rebuild doomgeneric            # force rebuild a cached package
+> run                            # build + serve feed-cache/
+```
+
+Guest, in **Terminal**:
+```
+rvpkg update                     # pull Packages index from the host
+rvpkg list                       # see what's available
+rvpkg install nano               # download .ipk + extract to /
+```
+
+`rvpkg` is a 30-line POSIX-shell installer (no opkg/dpkg — those need MMU + wchar). If a package ships a `/etc/rvemu-launchers.d/*.desktop` file, the desktop's taskbar adds a button for it within ~1 second of install.
+
+Caveats: packages calling `dlopen` (SDL2, anything plugin-loading), or `fork()` directly (vfork is fine) won't build for nommu+uClibc. Pure-C CLI tools (bc, nano, less, vim, dropbear, lynx) work out of the box. ~30 packages from the curated catalog have been verified.
 
 ### Runner
 

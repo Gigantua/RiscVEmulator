@@ -3,13 +3,20 @@ using System.Runtime.InteropServices;
 namespace RiscVEmulator.Core.Peripherals
 {
     /// <summary>
-    /// Framebuffer at 0x20000000. Plain memory (PAGE_READWRITE slice).
-    /// CPU writes pixels directly via mem + addr — no callback.
-    /// SDL reads the tear-free <see cref="PresentedPixels"/> snapshot.
+    /// Framebuffer at <see cref="BaseAddress"/> (default 0x20000000). Plain
+    /// memory (PAGE_READWRITE slice). CPU writes pixels directly via mem+addr
+    /// — no callback. SDL reads the tear-free <see cref="PresentedPixels"/>
+    /// snapshot.
+    ///
+    /// The Linux example overrides BaseAddress to live INSIDE RAM (top 256 KB
+    /// of /memory) so the kernel can use the standard simple-framebuffer
+    /// driver without tripping the init_unavailable_range trap — see
+    /// CLAUDE.md "Don't put simple-framebuffer in the DT" for the gory
+    /// details.
     /// </summary>
     public sealed unsafe class FramebufferDevice : IPeripheral
     {
-        public uint BaseAddress => 0x20000000;
+        public uint BaseAddress { get; }
         public uint Size { get; }
         public bool IsGuarded => false;
 
@@ -41,8 +48,9 @@ namespace RiscVEmulator.Core.Peripherals
         /// <summary>Tear-free snapshot, updated on vsync. SDL reads from this.</summary>
         public byte[] PresentedPixels => _presented;
 
-        public FramebufferDevice(int width = 320, int height = 200)
+        public FramebufferDevice(int width = 320, int height = 200, uint baseAddress = 0x20000000)
         {
+            BaseAddress = baseAddress;
             Width  = width;
             Height = height;
             Size   = (uint)(width * height * BytesPerPixel);

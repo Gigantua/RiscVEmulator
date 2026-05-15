@@ -340,8 +340,8 @@ static uint32_t exec_system(CPU_State& cpu, uint32_t instr, int rd, uint32_t f3s
 // ── do_step ─────────────────────────────────────────────────────────
 
 static constexpr void do_step(CPU_State& cpu) {
-    if (check_interrupts(cpu)) { cpu.regs[0] = 0; cpu.mtime++; return; }
-    if (cpu.wfi_pending)       { cpu.regs[0] = 0; cpu.mtime++; return; }
+    if (check_interrupts(cpu)) { cpu.regs[0] = 0; return; }
+    if (cpu.wfi_pending)       { cpu.regs[0] = 0; return; }
 
     const uint32_t instr  = mem_read<uint32_t>(cpu, cpu.pc);
     const uint32_t opcode = instr & 0x7F;
@@ -502,18 +502,61 @@ static constexpr void do_step(CPU_State& cpu) {
     if (trap_cause) {
         do_trap(cpu, trap_cause, trap_tval);
         cpu.regs[0] = 0;
-        cpu.mtime++;
         return;
     }
 
     cpu.regs[0] = 0;
     cpu.pc = nextpc;
-    cpu.mtime++;
 }
 
 // ── Public C ABI ────────────────────────────────────────────────────
 
+// ── Wall-clock-derived mtime ──────────────────────────────────────────
+// mtime *used to* increment once per instruction, which means the guest
+// kernel's notion of time tracked CPU speed: at 300 MIPS (Release) the
+// clock raced 5x ahead of wall time, at 70 MIPS (Debug) ~20% fast.
+// Instead we refresh mtime from a host monotonic clock at the START of
+// every step_n batch, so the guest sees ticks advance at exactly
+// TIMEBASE_HZ (matching the value we patch into the DTB at boot)
+// regardless of how fast we actually emulate.
+//
+// The per-instruction `mtime++` calls are gone; the only place mtime
+// changes is here. CPU code that reads cpu.mtime sees a snapshot that's
+// fresh-at-batch-start — interrupt latency is bounded by the batch size
+// (small enough that timers fire within a frame's worth of wallclock).
+
+static constexpr uint64_t TIMEBASE_HZ = 60'000'000ULL;   // matches Linux/Program.cs DTB patch
+
+#ifdef _WIN32
+  #include <windows.h>
+  static LARGE_INTEGER s_qpc_epoch, s_qpc_freq;
+  static inline uint64_t wallclock_ticks() {
+      LARGE_INTEGER now;
+      QueryPerformanceCounter(&now);
+      // (now - epoch) * TIMEBASE_HZ / qpc_freq, done with 128-bit safe math.
+      uint64_t d = (uint64_t)(now.QuadPart - s_qpc_epoch.QuadPart);
+      return (d / s_qpc_freq.QuadPart) * TIMEBASE_HZ
+           + (d % s_qpc_freq.QuadPart) * TIMEBASE_HZ / s_qpc_freq.QuadPart;
+  }
+  static inline void wallclock_reset() {
+      QueryPerformanceFrequency(&s_qpc_freq);
+      QueryPerformanceCounter(&s_qpc_epoch);
+  }
+#else
+  #include <time.h>
+  static struct timespec s_epoch;
+  static inline uint64_t wallclock_ticks() {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      uint64_t s  = (uint64_t)(now.tv_sec  - s_epoch.tv_sec);
+      int64_t  ns = (int64_t) (now.tv_nsec - s_epoch.tv_nsec);
+      return s * TIMEBASE_HZ + (uint64_t)(ns * (int64_t)TIMEBASE_HZ / 1'000'000'000LL);
+  }
+  static inline void wallclock_reset() { clock_gettime(CLOCK_MONOTONIC, &s_epoch); }
+#endif
+
 extern "C" int rv32i_step_n(int n) {
+    cpu.mtime = wallclock_ticks();
     for (int i = 0; i < n; i++) {
         do_step(cpu);
         if (__builtin_expect(cpu.halted, 0)) return -(i + 1);
@@ -528,18 +571,25 @@ extern "C" void rv32i_init(uint8_t* mem, uint32_t entry) {
     cpu.rsv_addr  = ~0u;
     cpu.mem       = mem;
     cpu.priv_mode = 3;          // start in M-mode
+    wallclock_reset();
+    cpu.mtime = 0;
 }
 
 extern "C" void rv32i_destroy() { cpu.mem = nullptr; }
 
 extern "C" uint32_t rv32i_get_pc()                 { return cpu.pc; }
 extern "C" int      rv32i_is_halted()              { return cpu.halted; }
-extern "C" uint32_t rv32i_get_mtime_lo()           { return (uint32_t) cpu.mtime; }
-extern "C" uint32_t rv32i_get_mtime_hi()           { return (uint32_t)(cpu.mtime >> 32); }
+// CLINT MMIO reads — return the LIVE wall-clock value, not the batch-snapshot
+// stored in cpu.mtime. The kernel reads CLINT in a tight loop while a WFI is
+// waiting for mtime ≥ mtimecmp; if we returned the cached value the kernel
+// would spin a whole batch worth of instructions before noticing the time
+// advanced.
+extern "C" uint32_t rv32i_get_mtime_lo()           { uint64_t t = wallclock_ticks(); return (uint32_t) t; }
+extern "C" uint32_t rv32i_get_mtime_hi()           { uint64_t t = wallclock_ticks(); return (uint32_t)(t >> 32); }
 extern "C" uint32_t rv32i_get_priv_mode()          { return cpu.priv_mode; }
 
-extern "C" uint64_t rv32i_get_mtime()              { return cpu.mtime; }
-extern "C" void     rv32i_set_mtime(uint64_t v)    { cpu.mtime = v; }
+extern "C" uint64_t rv32i_get_mtime()              { return wallclock_ticks(); }
+extern "C" void     rv32i_set_mtime(uint64_t v)    { cpu.mtime = v; /* guest writes are advisory; epoch stays */ }
 extern "C" uint64_t rv32i_get_mtimecmp()           { return cpu.mtimecmp; }
 extern "C" void     rv32i_set_mtimecmp(uint64_t v) { cpu.mtimecmp = v; }
 
