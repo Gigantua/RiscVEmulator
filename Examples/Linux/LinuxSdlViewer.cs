@@ -144,11 +144,16 @@ public sealed unsafe class LinuxSdlViewer : IDisposable
                         if (evt.Key.Repeat != 0) break;
                         bool pressed = (EventType)evt.Type == EventType.Keydown;
                         int sym = (int)evt.Key.Keysym.Sym;
-                        // ESC releases mouse capture. We intercept here and
-                        // do NOT forward it to the guest — otherwise the
-                        // guest would see a spurious ESC every time the user
-                        // wants to un-grab.
-                        if (captured && pressed && sym == 0x1b /* SDLK_ESCAPE */)
+                        // Ctrl+Alt releases mouse capture (matches VMware /
+                        // QEMU convention). Both modifier bits must be set
+                        // on the SAME event. We do NOT forward the modifier
+                        // keys to the guest in that frame so the un-grab
+                        // doesn't sneak a stray Ctrl/Alt into Doom or the
+                        // shell. ESC is now free to reach the guest.
+                        const int KMOD_CTRL = 0xC0, KMOD_ALT = 0x300;
+                        ushort mod = evt.Key.Keysym.Mod;
+                        if (captured && pressed &&
+                            (mod & KMOD_CTRL) != 0 && (mod & KMOD_ALT) != 0)
                         {
                             SetCapture(false);
                             ReleaseAllHeldKeys();

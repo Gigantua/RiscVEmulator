@@ -1,0 +1,18 @@
+config BR2_PACKAGE_DOOM_PUREDOOM
+	bool "doom-puredoom"
+	select BR2_PACKAGE_DOOM_WAD
+	help
+	  Doom port using PureDOOM (single-header, MIT). Replaces the older
+	  doomgeneric port. Talks directly to the rvemu MMIO peripherals via
+	  /dev/mem:
+	    - 320x200 RGBA → 2x-upscaled, centered in 1024x768 framebuffer
+	      at 0x85C00000
+	    - keyboard FIFO at 0x10001000, mouse at 0x10002000
+	    - audio PCM buffer at 0x30000000 (sound effects)
+	    - MIDI short messages at 0x10005004 (music)
+
+	  Selects doom-wad which installs the shareware WAD at
+	  /usr/share/games/doom/doom1.wad.
+
+	  PureDOOM source is bundled in-tree at
+	  Examples/Doom/Programs/PureDOOM.h.

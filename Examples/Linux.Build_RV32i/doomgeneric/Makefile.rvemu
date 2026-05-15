@@ -38,7 +38,7 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 $(TARGET): $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $(OBJ) -lnano-X -lm
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) -lm
 
 clean:
 	rm -rf $(OBJDIR) $(TARGET)

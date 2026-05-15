@@ -262,6 +262,16 @@ var audioCtrl = new AudioControlDevice();
 bus.RegisterPeripheral(audioBuf);
 bus.RegisterPeripheral(audioCtrl);
 
+// MIDI MMIO peripheral (same as Examples.Midi).
+//   0x10005000  MidiDevice (guarded — write packed short message to +0x04)
+// Guest's rvemu-midid daemon reads the rawmidi loopback at /dev/snd/midiC1D0
+// (snd-virmidi), parses the byte stream, and writes 3-byte short messages
+// here. MidiDevice forwards each to winmm.midiOutShortMsg() → Windows GM
+// synth. On non-Windows hosts midiOutGetNumDevs() returns 0 and all writes
+// silently no-op, so registering this is safe everywhere.
+var midi = new MidiDevice();
+bus.RegisterPeripheral(midi);
+
 // Load kernel at physical 0x80000000
 bus.Load(RamBase, kernelImage, 0, kernelImage.Length);
 
@@ -367,6 +377,7 @@ while (!emu.IsHalted && !cts.IsCancellationRequested)
 cts.Cancel();
 viewer?.Stop();
 audio?.Stop();
+midi.Dispose();
 Console.Error.WriteLine($"\nEmulator stopped. Executed ~{emu.MTime:N0} instructions.");
 return 0;
 

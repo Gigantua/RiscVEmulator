@@ -32,16 +32,31 @@ define DOOMGENERIC_BUILD_CMDS
 endef
 
 define DOOMGENERIC_INSTALL_TARGET_CMDS
-	# Real binary goes to libexec so running `doomgeneric` from the
-	# shell can't bypass the wrapper. The wrapper is what /usr/bin
-	# exposes — it sets the WAD path and the conservative zone size
-	# (3 MB; nommu fragments badly and the default 5 MB OOMs once the
-	# desktop is up). stderr → /tmp/doom.log so a silent crash from a
-	# taskbar click leaves something to diagnose.
+	# Real binary lives in libexec; the wrapper at /usr/bin/doomgeneric
+	# does the framebuffer-takeover dance:
+	#   1. Stop the nano-X desktop (otherwise nxclock/etc. keep blitting
+	#      over Doom's pixels and exit leaves a corrupted FB).
+	#   2. Run doomgeneric — owns /dev/mem 0x85C00000 fullscreen at
+	#      640x400 centered, zone capped at -mb 3 (5 MB OOMs on nommu).
+	#   3. Restart the desktop so the user gets nano-X + taskbar back.
+	# stderr → /tmp/doom.log for silent-crash diagnosis.
 	$(INSTALL) -D -m 0755 $(@D)/doomgeneric/doomgeneric \
 		$(TARGET_DIR)/usr/libexec/doomgeneric
 	$(INSTALL) -d $(TARGET_DIR)/usr/bin
-	printf '#!/bin/sh\nexec /usr/libexec/doomgeneric -iwad /usr/share/games/doom/doom1.wad -mb 3 "$$@" >/tmp/doom.log 2>&1\n' \
+	# Wrapper script: stop the desktop so nxclock/nxeyes/nanowm don't
+	# paint over Doom, run the engine, restart the desktop afterwards.
+	# The taskbar's vfork+execv child has its own PID, so when
+	# S45microwindows stop kill's the taskbar we're not affected —
+	# we're already detached.
+	printf '%s\n' \
+		'#!/bin/sh' \
+		'echo "doom-wrapper: stopping desktop..." >> /tmp/doom.log' \
+		'/etc/init.d/S45microwindows stop >>/tmp/doom.log 2>&1 || true' \
+		'sleep 1' \
+		'echo "doom-wrapper: launching engine..." >> /tmp/doom.log' \
+		'/usr/libexec/doomgeneric -iwad /usr/share/games/doom/doom1.wad -mb 3 "$$@" >>/tmp/doom.log 2>&1' \
+		'echo "doom-wrapper: restarting desktop..." >> /tmp/doom.log' \
+		'/etc/init.d/S45microwindows start >>/tmp/doom.log 2>&1 || true' \
 		> $(TARGET_DIR)/usr/bin/doomgeneric
 	chmod 0755 $(TARGET_DIR)/usr/bin/doomgeneric
 	# Convenience alias /usr/bin/doom — same wrapper, shorter name.

@@ -159,6 +159,12 @@ string[] kernelEnable =
     // re-enables it otherwise).
     "CONFIG_DEVMEM",
 
+    // SysV IPC: shmget/shmat needed for nano-X's BUFFER_MMAP path so
+    // Microwindows clients (doomgeneric in particular) can write pixels
+    // directly to a shared backing buffer instead of pushing 256 KB
+    // through the unix socket per frame.
+    "CONFIG_SYSVIPC", "CONFIG_POSIX_MQUEUE",
+
     // ── Sound + MIDI ────────────────────────────────────────────────────────
     // ALSA core + raw MIDI. CONFIG_SND_ALOOP is the in-tree loopback driver
     // — it registers a real ALSA card "Loopback" whose pcmC0D0p playback
@@ -170,6 +176,14 @@ string[] kernelEnable =
     "CONFIG_SND_RAWMIDI", "CONFIG_SND_SEQUENCER",
     "CONFIG_SND_VIRTIO",
     "CONFIG_SND_DRIVERS", "CONFIG_SND_ALOOP",
+    // CONFIG_SND_VIRMIDI: virtual rawmidi card. Built-in (=y) auto-creates
+    // one card at boot with 4 rawmidi devices (midiC1D0..D3). Each device
+    // loopbacks writes→reads via the alsa-sequencer subsystem, so anything
+    // an app sends to /dev/snd/midiC1D0 (with O_WRONLY) is received by the
+    // rvemu-midid daemon reading the same device O_RDONLY. The daemon
+    // forwards each short message to the host MidiDevice MMIO at 0x10005000.
+    // CONFIG_SND_SEQ_VIRMIDI is auto-selected by SEQUENCER+VIRMIDI.
+    "CONFIG_SND_VIRMIDI",
 };
 Console.WriteLine($"Patching cnlohr-kernel.config (+{kernelEnable.Length} symbols)...");
 foreach (var sym in kernelEnable)
@@ -251,9 +265,9 @@ const string dtsExtraNodes = """
 		 * to the existing C# MMIO peripherals at:
 		 *   0x10001000 keyboard
 		 *   0x10002000 mouse
+		 *   0x10005000 MIDI         (bridged via snd-virmidi + rvemu-midid)
 		 *   0x30000000 audio PCM
-		 *   0x30100000 audio control
-		 *   <tbd>      MIDI                                              */
+		 *   0x30100000 audio control                                      */
 """;
 
 Console.WriteLine("Injecting PLIC + virtio-mmio into the DTS...");
@@ -378,10 +392,12 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        // Keep only C/POSIX + a couple of common UTF-8 locales — full set
        // bloats the rootfs by several MB and we don't need it.
        "BR2_ENABLE_LOCALE_WHITELIST=\"C en_US en_US.UTF-8\"\n" +
-       // Bake doomgeneric (+ its WAD dep) directly into the base image so
+       // Bake doom-puredoom (+ its WAD dep) directly into the base image so
        // the Doom button shows up on the taskbar on first boot, no rvpkg
        // install needed. Costs ~5 MB of rootfs (binary + shareware WAD).
-       "BR2_PACKAGE_DOOMGENERIC=y\n" +
+       // PureDOOM has built-in PCM mixing + MIDI emission — same path as
+       // Examples.Doom bare-metal demo, so SFX + music work out of the box.
+       "BR2_PACKAGE_DOOM_PUREDOOM=y\n" +
        "BR2_PACKAGE_DOOM_WAD=y\n" +
        "BR_CFG_EOF");
 
@@ -416,6 +432,31 @@ RunWsl($"cat > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S41dhcp << 'DHCP_E
        "exit 0\n" +
        "DHCP_EOF");
 RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S41dhcp");
+
+// Autologin on the serial console — drop the getty/login dance, give us
+// a root shell directly. It's a single-user emulator, not a mainframe.
+// Replace the GENERIC_SERIAL getty line with a direct -/bin/sh respawn.
+Console.WriteLine("Writing inittab override (autologin root on console)...");
+RunWsl($"mkdir -p {wslDir}/board/rvemu/rootfs-overlay/etc");
+RunWsl($"cat > {wslDir}/board/rvemu/rootfs-overlay/etc/inittab << 'INIT_EOF'\n" +
+       "::sysinit:/bin/mount -t proc proc /proc\n" +
+       "::sysinit:/bin/mount -o remount,rw /\n" +
+       "::sysinit:/bin/mkdir -p /dev/pts /dev/shm\n" +
+       "::sysinit:/bin/mount -a\n" +
+       "::sysinit:/bin/mkdir -p /run/lock/subsys\n" +
+       "null::sysinit:/bin/ln -sf /proc/self/fd /dev/fd\n" +
+       "null::sysinit:/bin/ln -sf /proc/self/fd/0 /dev/stdin\n" +
+       "null::sysinit:/bin/ln -sf /proc/self/fd/1 /dev/stdout\n" +
+       "null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr\n" +
+       "::sysinit:/bin/hostname -F /etc/hostname\n" +
+       "::sysinit:/etc/init.d/rcS\n" +
+       // Autologin: just exec a root shell on the console. No getty,
+       // no login prompt, no password. -/bin/sh makes it a login shell
+       // so /etc/profile is sourced.
+       "console::respawn:-/bin/sh\n" +
+       "::shutdown:/etc/init.d/rcK\n" +
+       "::shutdown:/bin/umount -a -r\n" +
+       "INIT_EOF");
 
 // busybox config fragment — enable the `ar` and `tar` applets so the rvpkg
 // install script can crack open the .ipk archives served by the host.
@@ -454,43 +495,65 @@ RunWsl($"cat > {wslDir}/board/rvemu/busybox.fragment << 'BB_EOF'\n" +
        // pure POSIX shell parsing instead.
        "BB_EOF");
 
-// ── Custom buildroot package: doomgeneric ─────────────────────────────────
-// Drop our package recipe into the buildroot tree so the Packageserver
-// sees it under the BR2_PACKAGE_* scan. The user then does
-//   add doomgeneric  →  run     (host)
-//   rvpkg install doomgeneric    (guest)
-// and the .desktop file ships with the .ipk, making the Doom button
-// appear live on the taskbar (mtime-poll picks it up).
+// ── Custom buildroot package: doom-puredoom ───────────────────────────────
+// Replaces the old doomgeneric package. PureDOOM is a single-header port
+// with built-in PCM mixing + MIDI emission — same code path as the bare-
+// metal Examples.Doom demo, so sound effects + music work via the same
+// MMIO peripherals (audio @ 0x30000000, MIDI @ 0x10005004) that
+// Examples.Linux already wires up.
+//
+// Source layout in the rvemu tree (no upstream git):
+//   Examples/Linux.Build_RV32i/doom-puredoom/Config.in
+//   Examples/Linux.Build_RV32i/doom-puredoom/doom-puredoom.mk
+//   Examples/Linux.Build_RV32i/doom-puredoom/src/doom_linux.c
+//   Examples/Linux.Build_RV32i/doom-puredoom/src/Makefile
+// PureDOOM.h itself (~48k LOC) is shared with Examples.Doom and staged
+// into src/ below — no duplication in the repo.
 {
     string hostDoomDir = Path.GetFullPath(Path.Combine(
-        AppContext.BaseDirectory, "..", "..", "..", "..", "doomgeneric"))
+        AppContext.BaseDirectory, "..", "..", "..", "..", "doom-puredoom"))
+        .Replace("\\", "/");
+    string hostPureHdr = Path.GetFullPath(Path.Combine(
+        AppContext.BaseDirectory, "..", "..", "..", "..", "..", "Doom", "Programs", "PureDOOM.h"))
         .Replace("\\", "/");
     string wslDoomDir = $"$(wslpath -u '{hostDoomDir}')";
-    Console.WriteLine("Installing doomgeneric buildroot package...");
-    RunWsl($"rm -rf {wslDir}/package/doomgeneric && mkdir -p {wslDir}/package/doomgeneric");
-    RunWsl($"cp {wslDoomDir}/Config.in           {wslDir}/package/doomgeneric/");
-    RunWsl($"cp {wslDoomDir}/doomgeneric.mk      {wslDir}/package/doomgeneric/");
-    RunWsl($"cp {wslDoomDir}/doomgeneric_rvemu.c {wslDir}/package/doomgeneric/");
-    RunWsl($"cp {wslDoomDir}/Makefile.rvemu      {wslDir}/package/doomgeneric/");
-    // Splice `source "package/doomgeneric/Config.in"` into package/Config.in
-    // (idempotent — only injects if not present already).
-    RunWsl($"grep -q 'package/doomgeneric/Config.in' {wslDir}/package/Config.in || " +
-           $"sed -i '/menu \"Games\"/a\\\tsource \"package/doomgeneric/Config.in\"' " +
+    string wslPureHdr = $"$(wslpath -u '{hostPureHdr}')";
+
+    Console.WriteLine("Installing doom-puredoom buildroot package...");
+    RunWsl($"rm -rf {wslDir}/package/doom-puredoom && " +
+           $"mkdir -p {wslDir}/package/doom-puredoom/src");
+    RunWsl($"cp {wslDoomDir}/Config.in          {wslDir}/package/doom-puredoom/");
+    RunWsl($"cp {wslDoomDir}/doom-puredoom.mk   {wslDir}/package/doom-puredoom/");
+    RunWsl($"cp {wslDoomDir}/src/doom_linux.c   {wslDir}/package/doom-puredoom/src/");
+    RunWsl($"cp {wslDoomDir}/src/Makefile       {wslDir}/package/doom-puredoom/src/");
+    // PureDOOM.h is shared with Examples.Doom; stage it into the package src/.
+    RunWsl($"cp {wslPureHdr}                    {wslDir}/package/doom-puredoom/src/");
+
+    // Splice `source "package/doom-puredoom/Config.in"` into package/Config.in
+    // (idempotent). Also clean up any prior `doomgeneric` Config.in pointer
+    // left over from an older prepare so kconfig doesn't fail on a missing
+    // include when the package dir was removed.
+    RunWsl($"sed -i '/source \"package\\/doomgeneric\\/Config.in\"/d' {wslDir}/package/Config.in");
+    RunWsl($"rm -rf {wslDir}/package/doomgeneric");
+    RunWsl($"grep -q 'package/doom-puredoom/Config.in' {wslDir}/package/Config.in || " +
+           $"sed -i '/menu \"Games\"/a\\\tsource \"package/doom-puredoom/Config.in\"' " +
            $"{wslDir}/package/Config.in");
 
     // Patch upstream doom-wad's Config.in so it accepts being selected by
-    // our doomgeneric package. Upstream only allows chocolate-doom or
-    // prboom — without this our `select BR2_PACKAGE_DOOM_WAD` triggers an
-    // "unmet direct dependencies" warning and the WAD doesn't actually
-    // get into the rootfs.
-    RunWsl($"sed -i 's/depends on BR2_PACKAGE_CHOCOLATE_DOOM || BR2_PACKAGE_PRBOOM$/" +
-           $"depends on BR2_PACKAGE_CHOCOLATE_DOOM || BR2_PACKAGE_PRBOOM || BR2_PACKAGE_DOOMGENERIC/' " +
+    // our package. Upstream only allows chocolate-doom or prboom — without
+    // this our `select BR2_PACKAGE_DOOM_WAD` triggers an "unmet direct
+    // dependencies" warning and the WAD doesn't actually get into the
+    // rootfs. Patch is idempotent: if either DOOMGENERIC or DOOM_PUREDOOM
+    // is already in the list we leave it; otherwise append our flag.
+    RunWsl($"grep -q 'BR2_PACKAGE_DOOM_PUREDOOM' {wslDir}/package/doom-wad/Config.in || " +
+           $"sed -i 's/depends on BR2_PACKAGE_CHOCOLATE_DOOM || BR2_PACKAGE_PRBOOM\\( || BR2_PACKAGE_DOOMGENERIC\\)\\?$/" +
+           $"depends on BR2_PACKAGE_CHOCOLATE_DOOM || BR2_PACKAGE_PRBOOM || BR2_PACKAGE_DOOMGENERIC || BR2_PACKAGE_DOOM_PUREDOOM/' " +
            $"{wslDir}/package/doom-wad/Config.in");
 
     // Stage Microwindows nano-X client lib + headers into buildroot's
-    // sysroot so packages (doomgeneric, future nano-X apps) can link.
-    // The shell script form sidesteps PowerShell/.NET $HOME expansion
-    // games when passing inline scripts.
+    // sysroot so future nano-X apps can link. doom-puredoom itself doesn't
+    // use nano-X (talks to /dev/mem directly, same as the bare-metal port)
+    // but other packages still depend on the staging being present.
     RunWsl("bash /mnt/c/work/RiscV/RiscVEmulator/Examples/Linux.Build_RV32i/scripts/stage-nanox.sh");
 }
 
@@ -616,6 +679,7 @@ RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-desktop.c\"   {wslDir}/board/rv
 RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-audiotest.c\" {wslDir}/board/rvemu/userspace/");
 RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-audiod.c\"    {wslDir}/board/rvemu/userspace/");
 RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-play.c\"      {wslDir}/board/rvemu/userspace/");
+RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-midid.c\"     {wslDir}/board/rvemu/userspace/");
 RunWsl($"cp \"$(wslpath -u '{hostSrcDir}')/rvemu-keytap.c\"    {wslDir}/board/rvemu/userspace/");
 const string buildScript = @"#!/bin/sh
 set -e
@@ -623,7 +687,7 @@ cd ""$1""
 OVERLAY=""$2""
 CC=""$HOME/rvemu-buildroot/output/host/bin/riscv32-buildroot-linux-uclibc-gcc""
 FLAGS=""-static -fPIC -Wl,-elf2flt=-r -O2 -Wall -Wextra""
-for src in rvemu-input.c rvemu-fbtest.c rvemu-desktop.c rvemu-audiotest.c rvemu-audiod.c rvemu-play.c rvemu-keytap.c; do
+for src in rvemu-input.c rvemu-fbtest.c rvemu-desktop.c rvemu-audiotest.c rvemu-audiod.c rvemu-play.c rvemu-midid.c rvemu-keytap.c; do
     [ -f ""$src"" ] || continue
     out=""${src%.c}""
     echo ""  compiling $src...""
@@ -710,6 +774,34 @@ exit 0
     RunWsl($"echo {s44B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S44audio");
     RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S44audio");
 
+    // S46midi — start the snd-virmidi → MMIO bridge after audio is up.
+    // snd-virmidi (CONFIG_SND_VIRMIDI=y) creates /dev/snd/midiC1D0..D3 at
+    // boot; rvemu-midid opens C1D0 read-only and forwards rawmidi bytes to
+    // the host MidiDevice MMIO at 0x10005000, which calls winmm.midiOutShortMsg
+    // on the Windows side (default GM synth — no extra software needed).
+    const string s46 = @"#!/bin/sh
+# Globbing here: snd-virmidi may land on any card index depending on
+# what else loaded first. As long as ANY rawmidi device exists, start
+# the daemon — rvemu-midid probes /dev/snd/midiC0D0..C7D0 itself.
+case ""$1"" in
+    start)
+        [ -x /usr/bin/rvemu-midid ] || exit 0
+        ls /dev/snd/midiC*D0 >/dev/null 2>&1 || exit 0
+        echo -n 'Starting rvemu-midid (snd-virmidi -> MMIO bridge)... '
+        /usr/bin/rvemu-midid >/dev/null 2>&1 &
+        echo $! > /var/run/rvemu-midid.pid
+        echo 'OK'
+        ;;
+    stop)
+        [ -f /var/run/rvemu-midid.pid ] && kill $(cat /var/run/rvemu-midid.pid) 2>/dev/null
+        ;;
+esac
+exit 0
+";
+    string s46B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s46));
+    RunWsl($"echo {s46B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S46midi");
+    RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S46midi");
+
     // /etc/asound.conf — route ALSA's `default` device through plug:
     //   * plug resamples / reformats whatever the app uses
     //   * down to fixed 44100 / S16_LE / stereo so it matches what
@@ -763,7 +855,7 @@ ctl.!default {
         string[] mwBins = { "nano-X", "nanowm", "rvemu-taskbar", "rvemu-term",
                             "nxstart",
                             "nxclock", "nxeyes", "nxchess", "nxcalc",
-                            "nxtetris", "nxworld",
+                            "nxtetris",
                             "demo-hello", "demo-arc", "demo-blit" };
         // nxchess loads its piece sprites from /usr/share/nxchess/*.gif at
         // runtime (HAVE_GIF_SUPPORT=Y in our MW config enables the decoder).
@@ -782,8 +874,6 @@ ctl.!default {
             ("Chess",    "/usr/bin/nxchess"),
             ("Calc",     "/usr/bin/nxcalc"),
             ("Tetris",   "/usr/bin/nxtetris"),
-            ("World",    "/usr/bin/nxworld"),
-            ("Mine",     "/usr/bin/nxmine"),
             ("Hello",    "/usr/bin/demo-hello"),
             // doomgeneric is now baked into the base image via
             // BR2_PACKAGE_DOOMGENERIC=y. Its own .ipk also ships a
@@ -848,9 +938,14 @@ case ""$1"" in
         echo 'OK'
         ;;
     stop)
-        for f in nxeyes nxclock nanowm nano-X; do
+        # Kill the taskbar first so its parent loop doesn't try to reconnect
+        # to the dying server. Then clients. Then the server itself.
+        for f in rvemu-taskbar nxeyes nxclock nanowm nano-X; do
             [ -f /var/run/$f.pid ] && kill $(cat /var/run/$f.pid) 2>/dev/null
+            rm -f /var/run/$f.pid
         done
+        # Belt-and-suspenders — vfork'd children may not have written pidfiles.
+        killall nxeyes nxclock nanowm rvemu-taskbar nano-X 2>/dev/null
         ;;
 esac
 exit 0
