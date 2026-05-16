@@ -120,9 +120,5 @@ void _start(void)
 
     print_str("malloc_test: done\n");
 
-    __asm__ volatile(
-        "li a7, 93\n"
-        "li a0, 0\n"
-        "ecall"
-    );
+    *(volatile unsigned int *)0x40000000 = 0;   /* HostExit: write exit code -> halt */
 }

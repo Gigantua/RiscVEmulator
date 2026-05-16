@@ -1,4 +1,4 @@
-// Examples.Linux.Build_RV32i — drives WSL to build a network-enabled mini-rv32ima Linux
+// Examples.Linux.Build_RV32i — drives WSL to build a network-enabled RV32I Linux
 // image via buildroot. Outputs to ~/.cache/riscvemu/linux/Image-net and
 // ~/.cache/riscvemu/linux/rvemu-net.dtb. The Examples.Linux project picks
 // these up automatically if present.
@@ -115,7 +115,7 @@ else Console.WriteLine($"Reusing existing buildroot at {wslDir}");
 
 // Vendor cnlohr's two data files into board/rvemu/.
 const string CnlohrRawBase = "https://raw.githubusercontent.com/cnlohr/mini-rv32ima/master/configs";
-Console.WriteLine("Fetching cnlohr's kernel config + DTS from mini-rv32ima...");
+Console.WriteLine("Fetching cnlohr's kernel config + DTS templates...");
 RunWsl($"mkdir -p {wslDir}/board/rvemu");
 RunWsl($"wget -q -O {wslDir}/board/rvemu/cnlohr-kernel.config {CnlohrRawBase}/custom_kernel_config");
 RunWsl($"wget -q -O {wslDir}/board/rvemu/cnlohr-minimal.dts   {CnlohrRawBase}/minimal.dts");
@@ -206,6 +206,15 @@ foreach (var sym in kernelDisable)
                  $"echo '# {sym} is not set' >> {wslDir}/board/rvemu/cnlohr-kernel.config");
 }
 
+// The upstream template advertises "mini-rv32ima" in CONFIG_LOCALVERSION.
+// This build is intentionally rv32i (no A/M), so make the boot banner match
+// the actual generated ISA instead of the template repository name.
+RunWsl($"sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"-rv32i\"|;" +
+       $"s|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=n|' " +
+       $"{wslDir}/board/rvemu/cnlohr-kernel.config");
+RunWslSilent($"grep -q '^CONFIG_LOCALVERSION_AUTO=' {wslDir}/board/rvemu/cnlohr-kernel.config || " +
+             $"echo 'CONFIG_LOCALVERSION_AUTO=n' >> {wslDir}/board/rvemu/cnlohr-kernel.config");
+
 // ── 5. Patch cnlohr's DTS with PLIC + virtio-mmio nodes ─────────────────
 // Uses cnlohr's 64-bit address/size cell convention: <hi lo hi lo>.
 
@@ -271,7 +280,7 @@ const string dtsExtraNodes = """
 """;
 
 Console.WriteLine("Injecting PLIC + virtio-mmio into the DTS...");
-string b64Nodes = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(dtsExtraNodes));
+string b64Nodes = ToBase64Lf(dtsExtraNodes);
 RunWsl($"python3 -c \"" +
        $"import base64;" +
        $"p='{wslDir}/board/rvemu/cnlohr-minimal.dts';" +
@@ -328,6 +337,8 @@ RunWsl($"python3 -c \"" +
 // ── 6. Configure buildroot to use cnlohr's kernel config ────────────────
 
 Console.WriteLine("Running defconfig + wiring kernel config...");
+RunWsl($"sed -i '/source \"package\\/doom-puredoom\\/Config.in\"/d;" +
+       $"/source \"package\\/doomgeneric\\/Config.in\"/d' {wslDir}/package/Config.in");
 int dcfg = RunWsl($"cd {wslDir} && make qemu_riscv32_nommu_virt_defconfig");
 if (dcfg != 0) return dcfg;
 
@@ -346,11 +357,16 @@ RunWsl($"sed -i '/^BR2_LINUX_KERNEL_CUSTOM_VERSION/d;" +
           "/^BR2_TARGET_ROOTFS_INITRAMFS=/d;" +
           "/^BR2_TARGET_ROOTFS_EXT2=/d;" +
           "/^BR2_TARGET_ROOTFS_TAR=/d;" +
-          // Toolchain ISA: match cnlohr (RV32IM, ILP32 ABI, uclibc).
+          // Toolchain ISA: rv32i (NO A or M extension), ILP32 ABI, uclibc.
+          // Hardware atomics, multiply and divide/remainder are NOT in the
+          // target ISA — see the RVA/RVM comments in the heredoc below.
           "/^BR2_riscv_g=/d;" +
           "/^BR2_riscv_custom=/d;" +
           "/^BR2_RISCV_ISA_/d;" +
-          "/^BR2_RISCV_ABI_/d' {wslDir}/.config");
+          "/^BR2_RISCV_ABI_/d;" +
+          // Override the defconfig's BR2_GLOBAL_PATCH_DIR so our own
+          // board/rvemu/patches (kernel div/rem patches) get applied.
+          $"/^BR2_GLOBAL_PATCH_DIR=/d' {wslDir}/.config");
 // Use whatever Linux version buildroot 2024.05.x defaults to (6.6.18) —
 // it ships pre-validated hashes. cnlohr's kernel config was generated against
 // 6.8-rc1, but olddefconfig silently drops symbols missing in 6.6.18.
@@ -362,13 +378,29 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        "# BR2_TARGET_ROOTFS_TAR is not set\n" +
        "BR2_riscv_custom=y\n" +
        "BR2_RISCV_ISA_RVI=y\n" +
-       "BR2_RISCV_ISA_RVM=y\n" +
-       // A-extension (LR.W/SC.W/AMO*). Our emulator implements it fully
-       // (see CLAUDE.md ISA support table). Required by uClibc-ng's
-       // libpthread/linuxthreads/sysdeps/riscv32/pt-machine.h once WCHAR
-       // + LOCALE are enabled, because those pull in pthread atomic
-       // primitives that use `lr.w` / `sc.w` directly.
-       "BR2_RISCV_ISA_RVA=y\n" +
+       // M extension is intentionally LEFT OFF — ENTIRELY. Our native CPU
+       // no longer implements ANY of M: MUL / MULH[SU|U] and
+       // DIV/DIVU/REM/REMU all trap as illegal instructions (see
+       // Native/rv32i_core.cpp). With RVM=y the toolchain would be free to
+       // emit mul/div/rem opcodes anywhere. Keeping RVM off means
+       // arch/arch.mk.riscv does NOT append `m`, so the internal toolchain
+        // default -march computes to `rv32i_zicsr_zifencei` (RV32I +
+       // the two always-on multi-letter extensions). uClibc-ng, busybox,
+        // every package, and bin/xc.sh all inherit that default
+       // automatically (none pass an explicit -march). GCC then lowers
+       // every C `*`, `/` and `%` to libcalls (__mulsi3/__divsi3/...),
+       // which userspace resolves from buildroot-built libgcc and the
+       // kernel resolves from arch/riscv/lib/ (patch 0002).
+       //
+        // A previous milestone kept hardware multiply via a `_zmmul`
+       // suffix; that is now gone. The arch.mk.riscv sed step below
+       // actively strips any stale `_zmmul` so re-using an older tree
+        // still converges to plain `rv32i`.
+        "# BR2_RISCV_ISA_RVM is not set\n" +
+        // A-extension is intentionally LEFT OFF too. The native CPU traps
+        // LR.W/SC.W/AMO* as illegal instructions; kernel no-A fallbacks
+        // are staged from board-patches below.
+        "# BR2_RISCV_ISA_RVA is not set\n" +
        "# BR2_RISCV_ISA_RVF is not set\n" +
        "# BR2_RISCV_ISA_RVD is not set\n" +
        "# BR2_RISCV_ISA_RVC is not set\n" +
@@ -389,6 +421,12 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        "BR2_TOOLCHAIN_BUILDROOT_WCHAR=y\n" +
        "BR2_TOOLCHAIN_BUILDROOT_LOCALE=y\n" +
        "BR2_ENABLE_LOCALE=y\n" +
+       // Buildroot throughput knobs: per-package dirs let configure/build
+       // phases overlap, CONFIG_CACHE avoids repeating autoconf probes, and
+       // ccache makes iterative package rebuilds much faster.
+       "BR2_PER_PACKAGE_DIRECTORIES=y\n" +
+       "BR2_CONFIG_CACHE=y\n" +
+       "BR2_CCACHE=y\n" +
        // Keep only C/POSIX + a couple of common UTF-8 locales — full set
        // bloats the rootfs by several MB and we don't need it.
        "BR2_ENABLE_LOCALE_WHITELIST=\"C en_US en_US.UTF-8\"\n" +
@@ -399,7 +437,84 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        // Examples.Doom bare-metal demo, so SFX + music work out of the box.
        "BR2_PACKAGE_DOOM_PUREDOOM=y\n" +
        "BR2_PACKAGE_DOOM_WAD=y\n" +
+       // Global patch dir for our own package patches. Buildroot applies
+       // every *.patch under <dir>/<pkgname>/ on top of the package's
+       // pristine source. We use it to carry the kernel div/rem patches
+       // (board/rvemu/patches/linux/*.patch) — staged just below. We
+       // override (not extend) the defconfig value: the original
+       // board/qemu/... dir contains no patches we need.
+       "BR2_GLOBAL_PATCH_DIR=\"board/rvemu/patches\"\n" +
        "BR_CFG_EOF");
+
+// ── 6a. Toolchain ISA: keep internal -march at plain rv32i ──────────────
+// Buildroot's internal (buildroot-built) toolchain derives the RISC-V
+// -march in arch/arch.mk.riscv from the BR2_RISCV_ISA_RV* symbols. With
+// RVM/RVA off (see the heredoc above) it computes `rv32i` plus an
+// unconditional `_zicsr_zifencei` suffix (GCC >= 12, which covers
+// buildroot 2024.05's GCC 13.3.0) — giving `rv32i_zicsr_zifencei`.
+//
+// That is EXACTLY the target ISA we now want: RV32I only, no A or M.
+// So nothing needs to be appended. A previous milestone DID patch this
+// file to append `_zmmul` (keeping hardware multiply). That milestone is
+// over — the native CPU no longer implements MUL/MULH* either. If this
+// step is run on a buildroot tree left over from that milestone, the
+// stale `_zmmul` token must be removed, otherwise the toolchain would
+// still emit `mul`/`mulh` opcodes that now trap.
+// Similarly, any stale `a` in a locally patched base string must be
+// removed so the tree converges to the no-A target.
+//
+// So instead of *appending*, we *strip*: delete any `_zmmul` occurrence
+// from arch.mk.riscv and normalize `rv32ia` back to `rv32i`. On a pristine
+// clone this is a harmless no-op, and the result is plain
+// `rv32i_zicsr_zifencei`.
+// On a stale tree it converges to the same string. Idempotent by
+// construction (sed of an absent token does nothing) and re-applied
+// every run, so it survives --clean and a reused checkout alike.
+Console.WriteLine("Patching arch/arch.mk.riscv: no-A/no-M internal toolchain -march stays rv32i...");
+RunWsl($"sed -i -e 's/_zmmul//g' -e 's/rv32ia/rv32i/g' {wslDir}/arch/arch.mk.riscv");
+
+// ── 6a-bis. Stage no-A/no-M package patches into board/rvemu/patches/ ───
+// board/rvemu/patches/<pkg>/*.patch — applied by buildroot on top of each
+// pristine package source (BR2_GLOBAL_PATCH_DIR points here). Key patches:
+//   0001 — sets the kernel's own -march (arch/riscv/Makefile) to
+//          rv32i. The kernel does NOT inherit the toolchain default;
+//          it hard-codes riscv-march-y itself.
+//   0002 — adds arch/riscv/lib/{div32.c,mul32.c} providing the integer
+//          multiply AND divide libcalls (__mulsi3/__muldi3/__divsi3/
+//          __udivsi3/__modsi3/__umodsi3/...). With `m` fully gone GCC
+//          lowers every 32-/64-bit C `*`, `/` and `%` to these libcalls,
+//          and the kernel links neither libgcc nor any existing helper
+//          (arch/riscv/lib/ ships none). All routines are shift+add /
+//          shift-subtract only — they contain no mul/div/rem opcode and
+//          so are themselves valid on the M-less CPU.
+//   uclibc — replaces linuxthreads' RISC-V LR/SC spin primitive with a
+//            no-A single-hart fallback so libc builds for rv32i.
+Console.WriteLine("Staging no-A/no-M patches into board/rvemu/patches/...");
+{
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "board-patches")))
+        dir = dir.Parent;
+    if (dir == null)
+        throw new DirectoryNotFoundException(
+            "Could not locate board-patches/ above " + AppContext.BaseDirectory);
+    string hostPatchDir = Path.Combine(dir.FullName, "board-patches").Replace("\\", "/");
+    RunWsl($"rm -rf {wslDir}/board/rvemu/patches && mkdir -p {wslDir}/board/rvemu/patches");
+    RunWsl($"cp -r \"$(wslpath -u '{hostPatchDir}')/\"* {wslDir}/board/rvemu/patches/");
+    RunWsl($"find {wslDir}/board/rvemu/patches -maxdepth 2 -type f -name '*.patch' -print");
+}
+
+// ── 6a-ter. Ensure linux/linux.hash has an entry for the pinned kernel ──
+// Our kernel config pins Linux 6.6.18, but buildroot 2024.05.3's
+// linux/linux.hash only ships hashes for the versions it currently
+// defaults to (6.6.44, …). When the kernel is force re-extracted (the
+// no-A rebuild below does `linux-dirclean`), buildroot re-runs the
+// download/verify step and aborts with "No hash found for
+// linux-6.6.18.tar.xz". Append the upstream kernel.org sha256 so the
+// (cached or freshly fetched) tarball verifies. Idempotent.
+Console.WriteLine("Ensuring linux-6.6.18 hash entry in linux/linux.hash...");
+RunWsl($"grep -q 'linux-6.6.18.tar.xz' {wslDir}/linux/linux.hash || " +
+       $"echo 'sha256  4e43d8c5fba14f7c82597838011648056487b7550fd83276ad534559e8499b1d  linux-6.6.18.tar.xz' " +
+       $">> {wslDir}/linux/linux.hash");
 
 // ── 6b. Rootfs overlay: drop in an auto-DHCP init script ────────────────
 // Buildroot copies the overlay tree on top of the staged rootfs right
@@ -511,10 +626,10 @@ RunWsl($"cat > {wslDir}/board/rvemu/busybox.fragment << 'BB_EOF'\n" +
 // into src/ below — no duplication in the repo.
 {
     string hostDoomDir = Path.GetFullPath(Path.Combine(
-        AppContext.BaseDirectory, "..", "..", "..", "..", "doom-puredoom"))
+        AppContext.BaseDirectory, "..", "..", "..", "doom-puredoom"))
         .Replace("\\", "/");
     string hostPureHdr = Path.GetFullPath(Path.Combine(
-        AppContext.BaseDirectory, "..", "..", "..", "..", "..", "Doom", "Programs", "PureDOOM.h"))
+        AppContext.BaseDirectory, "..", "..", "..", "..", "Doom", "Programs", "PureDOOM.h"))
         .Replace("\\", "/");
     string wslDoomDir = $"$(wslpath -u '{hostDoomDir}')";
     string wslPureHdr = $"$(wslpath -u '{hostPureHdr}')";
@@ -628,7 +743,7 @@ case ""$1"" in
     *)       echo ""usage: rvpkg {update | list | install <name>}"" ;;
 esac
 ";
-string rvpkgB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(rvpkgScript));
+string rvpkgB64 = ToBase64Lf(rvpkgScript);
 RunWsl($"echo {rvpkgB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/usr/bin/rvpkg");
 RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/usr/bin/rvpkg");
 
@@ -697,8 +812,9 @@ for src in rvemu-input.c rvemu-fbtest.c rvemu-desktop.c rvemu-audiotest.c rvemu-
     file ""$OVERLAY/usr/bin/$out""
 done
 ";
-string bsB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(buildScript));
-RunWsl($"echo {bsB64} | base64 -d > /tmp/rvemu-build-userspace.sh && chmod +x /tmp/rvemu-build-userspace.sh");
+string bsB64 = ToBase64Lf(buildScript);
+RunWsl($"echo {bsB64} | base64 -d > /tmp/rvemu-build-userspace.sh && " +
+       "sed -i 's/\\r$//' /tmp/rvemu-build-userspace.sh && chmod +x /tmp/rvemu-build-userspace.sh");
 string ccCmd =
     $"/tmp/rvemu-build-userspace.sh " +
     $"{wslDir}/board/rvemu/userspace " +
@@ -724,7 +840,7 @@ case ""$1"" in
 esac
 exit 0
 ";
-    string s42B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s42));
+    string s42B64 = ToBase64Lf(s42);
     RunWsl($"echo {s42B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S42input");
     RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S42input");
 
@@ -747,7 +863,7 @@ case ""$1"" in
 esac
 exit 0
 ";
-    string s43B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s43));
+    string s43B64 = ToBase64Lf(s43);
     RunWsl($"echo {s43B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S43desktop");
     RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S43desktop");
 
@@ -770,7 +886,7 @@ case ""$1"" in
 esac
 exit 0
 ";
-    string s44B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s44));
+    string s44B64 = ToBase64Lf(s44);
     RunWsl($"echo {s44B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S44audio");
     RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S44audio");
 
@@ -798,7 +914,7 @@ case ""$1"" in
 esac
 exit 0
 ";
-    string s46B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s46));
+    string s46B64 = ToBase64Lf(s46);
     RunWsl($"echo {s46B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S46midi");
     RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S46midi");
 
@@ -826,7 +942,7 @@ ctl.!default {
     card Loopback
 }
 ";
-    string asoundB64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(asoundConf));
+    string asoundB64 = ToBase64Lf(asoundConf);
     RunWsl($"mkdir -p {wslDir}/board/rvemu/rootfs-overlay/etc");
     RunWsl($"echo {asoundB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/asound.conf");
     RunWsl($"chmod 0644 {wslDir}/board/rvemu/rootfs-overlay/etc/asound.conf");
@@ -855,7 +971,7 @@ ctl.!default {
         string[] mwBins = { "nano-X", "nanowm", "rvemu-taskbar", "rvemu-term",
                             "nxstart",
                             "nxclock", "nxeyes", "nxchess", "nxcalc",
-                            "nxtetris",
+                            "nxtetris", "nxworld",
                             "demo-hello", "demo-arc", "demo-blit" };
         // nxchess loads its piece sprites from /usr/share/nxchess/*.gif at
         // runtime (HAVE_GIF_SUPPORT=Y in our MW config enables the decoder).
@@ -892,7 +1008,7 @@ ctl.!default {
         foreach (var (name, prog) in launchers)
         {
             string body = $"Name={name}\nExec={prog}\n";
-            string b64  = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(body));
+            string b64  = ToBase64Lf(body);
             string file = $"{wslDir}/board/rvemu/rootfs-overlay/etc/rvemu-launchers.d/{name.ToLower()}.desktop";
             RunWsl($"echo {b64} | base64 -d > {file}");
         }
@@ -950,7 +1066,7 @@ case ""$1"" in
 esac
 exit 0
 ";
-        string s45B64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(s45));
+        string s45B64 = ToBase64Lf(s45);
         RunWsl($"echo {s45B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S45microwindows");
         RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S45microwindows");
         // Disable S43desktop on boot — Microwindows takes the framebuffer.
@@ -974,6 +1090,20 @@ else
 }
 
 RunWsl($"cd {wslDir} && yes '' | make olddefconfig");
+
+// ── 6b. Force clean rebuild when Buildroot output-layout knobs toggle on ──
+// BR2_PER_PACKAGE_DIRECTORIES changes where host tools and package outputs
+// live. Reusing an old non-per-package output tree after enabling it leaves
+// packages looking for per-package host tools that do not exist.
+Console.WriteLine("Checking Buildroot throughput-option marker...");
+RunWsl($"cd {wslDir} && " +
+    "if [ ! -f board/rvemu/.buildroot-throughput-options-applied ]; then " +
+    "  echo '  throughput options changed - forcing one clean rebuild'; " +
+    "  make clean && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.buildroot-throughput-options-applied; " +
+    "else " +
+    "  echo '  marker present - throughput options already applied'; " +
+    "fi");
 
 // ── 6c. Force toolchain rebuild when wchar/locale flags toggle on ───────
 // Buildroot caches the toolchain heavily — the uclibc + gcc-final stamp
@@ -1001,6 +1131,43 @@ RunWsl(
     "  mkdir -p board/rvemu && touch board/rvemu/.wchar-applied; " +
     "else " +
     "  echo '  marker present - toolchain already rebuilt with wchar/locale'; " +
+    "fi");
+
+// ── 6d. Force full rebuild for the rv32i no-A/no-M ISA change ───────────
+// Same caching problem as wchar: editing arch/arch.mk.riscv (toolchain
+// -march) and adding/changing kernel patches does NOT invalidate
+// buildroot's stamp files. An existing toolchain/kernel built with
+// `rv32ima`, `rv32ia_zmmul`, or `rv32ia` would be reused as-is, and the
+// produced image would still contain atomic/mul/div/rem opcodes that trap.
+//
+// On the FIRST run after the no-A rv32i change we therefore:
+// An ISA change is NOT a per-package thing: the new toolchain lowers `*`
+// `/` `%` to libcalls instead of M opcodes, so EVERY guest binary must be
+// recompiled. Buildroot only rebuilds a package when its build stamp is
+// invalidated — dir-cleaning just the toolchain + kernel leaves every
+// already-built package (doom-puredoom, ncurses, bc, nano, …) shipping
+// its old M-using binary, which then traps with SIGILL at runtime.
+// The only reliable cure buildroot offers for a toolchain change is a
+// full `make clean` (nukes output/ — toolchain, kernel, every package —
+// but keeps dl/ and .config); the following `make` rebuilds it all M-free.
+//
+// Marker is self-cancelling: present => already rebuilt, skip. The marker
+// name is bumped on every ISA change (e.g. `.rv32ia-applied` ->
+// `.rv32i-noa-applied`) so a tree left over from a previous ISA still gets
+// exactly one forced full rebuild.
+//
+// NOTE: this is a full from-scratch rebuild (toolchain + kernel + all
+// packages, ~1-1.5 h). It only happens once per ISA change. To force it
+// again, `rm board/rvemu/.rv32i-noa-applied` (or run with --clean).
+Console.WriteLine("Checking toolchain/kernel/packages for rv32i no-A/no-M build...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.rv32i-noa-applied ]; then " +
+    "  echo '  first run with rv32i no-A/no-M ISA - forcing FULL rebuild (make clean)'; " +
+    "  rm -f board/rvemu/.zmmul-applied board/rvemu/.rv32ia-applied; " +
+    "  make clean && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.rv32i-noa-applied; " +
+    "else " +
+    "  echo '  marker present - toolchain + kernel + packages already rebuilt for rv32i no-A/no-M'; " +
     "fi");
 
 // ── 7. Build ─────────────────────────────────────────────────────────────
@@ -1211,12 +1378,10 @@ static string ReadPassword(string prompt)
     return sb.ToString();
 }
 
-void WriteFileViaWsl(string wslPath, string content)
+static string ToBase64Lf(string content)
 {
-    // Use base64 to avoid quoting headaches with newlines + quotes in the content.
-    string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(content));
-    int rc = RunWsl($"echo '{b64}' | base64 -d > '{wslPath}'");
-    if (rc != 0) throw new InvalidOperationException($"Failed to write {wslPath}");
+    string normalized = content.Replace("\r\n", "\n").Replace("\r", "\n");
+    return Convert.ToBase64String(Encoding.UTF8.GetBytes(normalized));
 }
 
 static string WindowsToWslPath(string winPath)

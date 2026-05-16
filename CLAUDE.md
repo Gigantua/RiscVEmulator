@@ -6,11 +6,14 @@
 
 ## What Is This?
 
-A RISC-V RV32I + M + A + F emulator with a native C++ CPU hot path and
-C# peripherals/frontend (.NET 10). Single-hart, no D-ext (use `softfloat.c`
-in the guest), no C-ext. Runs bare-metal ELF binaries on a small set of
+A RISC-V RV32I + F emulator with a native C++ CPU hot path and
+C# peripherals/frontend (.NET 10). The **A and M extensions are fully removed** —
+LR.W/SC.W/AMO*, MUL/MULH[SU|U], and DIV/DIVU/REM/REMU all trap as illegal
+instructions, so every guest must be built for `rv32i` (atomic primitives
+must avoid A opcodes; multiply, divide and modulo lower to integer libcalls). Single-hart, no
+D-ext (use `softfloat.c` in the guest), no C-ext. Runs bare-metal ELF binaries on a small set of
 memory-mapped peripherals (framebuffer, keyboard, mouse, audio, UART,
-timer, RTC) and a real mini-rv32ima Linux kernel (`Examples/Linux`).
+timer, RTC) and a real RV32I Linux kernel (`Examples/Linux`).
 Flagship demo is a full Doom port.
 
 ## Solution Structure
@@ -105,8 +108,9 @@ See the header of `Native/rv32i_core.cpp` for the authoritative list.
 | Ext              | Status   | Notes                                                 |
 |------------------|----------|-------------------------------------------------------|
 | RV32I            | full     | all 40 base instructions                              |
-| M                | full     | MUL/MULH[SU\|U]/DIV[U]/REM[U] — always on             |
-| A                | full     | LR.W/SC.W + AMO{SWAP,ADD,XOR,AND,OR,MIN[U],MAX[U]}.W  |
+| M                | no       | MUL/MULH[SU\|U] *and* DIV/DIVU/REM/REMU all trap as   |
+|                  |          | illegal — fully removed; mul/div/rem lowered to libcalls |
+| A                | no       | LR.W/SC.W/AMO*.W all trap as illegal                   |
 | F                | full     | single-precision; no flags, RNE only, rounding ignored |
 | Zicsr / Zifencei | yes / NOP| FENCE/FENCE.I are NOPs                                |
 | Priv M/S/U       | full     | trap delegation (medeleg/mideleg), MRET/SRET, WFI     |
@@ -313,7 +317,49 @@ and a small IRQ-injection trampoline in `rv32i_core.cpp`. See `AGENTS.md`
 
 The networked build comes from `Examples/Linux.Build_RV32i` (formerly
 `Examples.Linux.Prepare`) which drives WSL+buildroot to produce
-`~/.cache/riscvemu/linux/Image-net` and `rvemu-net.dtb`. It also bakes in:
+`~/.cache/riscvemu/linux/Image-net` and `rvemu-net.dtb`.
+
+**A/M-free build (`rv32i`)**: because the native CPU traps every A and M
+instruction (LR.W/SC.W/AMO*, MUL/MULH* and DIV/DIVU/REM/REMU), the entire image —
+kernel, uClibc-ng, busybox, every package, overlay userspace binaries —
+must be built without any A or M opcode. `Examples/Linux.Build_RV32i/
+Program.cs` enforces this two ways:
+
+* **Toolchain**: `BR2_RISCV_ISA_RVA` and `BR2_RISCV_ISA_RVM` are left OFF,
+  so `arch/arch.mk.riscv` computes the internal toolchain `-march` as
+  `rv32i_zicsr_zifencei` (no `a` or `m`). Program.cs additionally sed-strips any stale `_zmmul` token
+  from `arch.mk.riscv` so a buildroot tree left over from the previous
+  multiply-only milestone converges to plain `rv32i`. uClibc-ng,
+  busybox, all packages, `bin/xc.sh`, the doom-puredoom / doomgeneric
+  recipes and the Microwindows build all inherit that default
+  automatically — none pass an explicit `-march`. GCC lowers every C
+  `*`, `/` and `%` to libcalls; userspace resolves them from
+  buildroot-built libgcc.
+* **Kernel**: the RV32 kernel hard-codes its own `-march` (`riscv-march-y`
+  in `arch/riscv/Makefile`) and links no libgcc. Two buildroot kernel
+  patches live in `Examples/Linux.Build_RV32i/board-patches/linux/`
+  (staged into `board/rvemu/patches/linux/`, wired via
+  `BR2_GLOBAL_PATCH_DIR`): `0001` rewrites the kernel `-march` to plain
+  `rv32i`, `0002` adds `arch/riscv/lib/mul32.c` (`__mulsi3`/
+  `__muldi3`/`__mulodi4`) and `arch/riscv/lib/div32.c` (`__divsi3`/
+  `__udivsi3`/`__modsi3`/`__umodsi3` + the 64-bit `__divdi3`/`__udivdi3`/
+  `__moddi3`/`__umoddi3`/`__udivmoddi4` family). Every helper is pure
+  shift+add / shift-subtract — it contains no `mul`/`div`/`rem` opcode,
+  so the helpers are themselves valid on the M-less CPU. `0003` replaces
+  kernel RISC-V LR/SC/AMO atomic, bitop, xchg and cmpxchg helpers with
+  single-hart no-A fallbacks.
+
+`Examples/Linux.Build_RV32i` also rewrites the inherited kernel
+`CONFIG_LOCALVERSION` from the upstream template's `mini-rv32ima` label to
+`-rv32i`. If a boot banner still says `mini-rv32ima`, it is a stale cached
+image or the legacy `--download` image, not the current no-A/no-M
+Build_RV32i output.
+
+A first run after this change forces a full toolchain + kernel rebuild
+(marker file `board/rvemu/.rv32i-noa-applied`; previous ISA markers are
+removed so the rebuild fires exactly once).
+
+It also bakes in:
 
 - `slirp_bridge.dll` + `libslirp-0.dll` are loaded on the host, NAT'd via
   Win32 host-loopback into the guest as `10.0.2.0/24`.

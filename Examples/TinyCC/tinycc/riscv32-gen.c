@@ -39,11 +39,13 @@
 #define SIGN7(x)	((((x) & 0xff) ^ 0x80) - 0x80)
 #define SIGN11(x)	((((x) & 0xfff) ^ 0x800) - 0x800)
 
+/* Note: __riscv_mul / __riscv_zmmul / __riscv_div are intentionally NOT
+   defined — the RV32I emulator implements the bare base ISA with no M
+   extension, so '*', '/' and '%' are lowered to software helper
+   libcalls (see gen_opil_muldivmod). */
 ST_DATA const char * const target_machine_defs =
     "__riscv\0"
     "__riscv_xlen 32\0"
-    "__riscv_div\0"
-    "__riscv_mul\0"
     ;
 
 #define XLEN 4
@@ -953,11 +955,40 @@ ST_FUNC int gjmp_append(int n, int t)
     return t;
 }
 
+/* The RV32I emulator implements the bare base ISA with NO M extension:
+   MUL/MULH* as well as DIV/DIVU/REM/REMU all trap as illegal
+   instructions. Route 32-bit '*', '/' and '%' through software helper
+   libcalls (__mulsi3 / __divsi3 / __udivsi3 / __modsi3 / __umodsi3)
+   instead of emitting a hardware muldiv opcode. The helpers are wired
+   into the JIT'd code via tcc_add_symbol() in tinycc_demo.c. */
+static int gen_opil_muldivmod(int op)
+{
+    int func;
+    switch (op) {
+    case '*':      func = TOK___mulsi3;  break;
+    case '/':
+    case TOK_PDIV: func = TOK___divsi3;  break;
+    case TOK_UDIV: func = TOK___udivsi3; break;
+    case '%':      func = TOK___modsi3;  break;
+    case TOK_UMOD: func = TOK___umodsi3; break;
+    default:       return 0; /* not a mul/div/mod op */
+    }
+    /* stack: ... a b   ->   helper a b ; call helper(a, b) */
+    vpush_helper_func(func);
+    vrott(3);
+    gfunc_call(2);
+    vpushi(0);
+    vtop->r = REG_IRET;
+    return 1;
+}
+
 static void gen_opil(int op, int ll)
 {
     int a, b, d;
     int func3 = 0;
     ll = 0;
+    if (gen_opil_muldivmod(op))
+      return;
     if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST) {
         int fc = vtop->c.i;
         if (fc == vtop->c.i && !LOW_OVERFLOW(fc)) {
@@ -1056,13 +1087,9 @@ static void gen_opil(int op, int ll)
     case TOK_SHL:
         ER(0x33 | ll, 1, d, a, b, 0); // sll d, a, b
         break;
-    case '*':
-        ER(0x33 | ll, 0, d, a, b, 1); // mul d, a, b
-        break;
-    case '/':
-    case TOK_PDIV:
-        ER(0x33 | ll, 4, d, a, b, 1); // div d, a, b
-        break;
+    /* '*', '/', '%', TOK_UDIV, TOK_PDIV, TOK_UMOD are handled above by
+       gen_opil_muldivmod() — the emulator has no M extension, so
+       hardware MUL/DIV/REM all trap as illegal instructions. */
     case '&':
         ER(0x33, 7, d, a, b, 0); // and d, a, b
         break;
@@ -1071,15 +1098,6 @@ static void gen_opil(int op, int ll)
         break;
     case '|':
         ER(0x33, 6, d, a, b, 0); // or d, a, b
-        break;
-    case '%':
-        ER(0x33, 6, d, a, b, 1); // rem d, a, b
-        break;
-    case TOK_UMOD:
-        ER(0x33 | ll, 7, d, a, b, 1); // remu d, a, b
-        break;
-    case TOK_UDIV:
-        ER(0x33 | ll, 5, d, a, b, 1); // divu d, a, b
         break;
     }
 }

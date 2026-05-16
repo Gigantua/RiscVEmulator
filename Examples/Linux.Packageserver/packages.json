@@ -13,16 +13,10 @@
       "IpkFile": "nano_7.2_rv32inommu_uclibc.ipk"
     },
     {
-      "Name": "doom-wad",
-      "BrSymbol": "BR2_PACKAGE_DOOM_WAD",
-      "BuiltVersion": "1.9",
-      "IpkFile": "doom-wad_1.9_rv32inommu_uclibc.ipk"
-    },
-    {
-      "Name": "doomgeneric",
-      "BrSymbol": "BR2_PACKAGE_DOOMGENERIC",
-      "BuiltVersion": "dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284",
-      "IpkFile": "doomgeneric_dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284_rv32inommu_uclibc.ipk"
+      "Name": "lynx",
+      "BrSymbol": "BR2_PACKAGE_LYNX",
+      "BuiltVersion": null,
+      "IpkFile": null
     }
   ]
 }

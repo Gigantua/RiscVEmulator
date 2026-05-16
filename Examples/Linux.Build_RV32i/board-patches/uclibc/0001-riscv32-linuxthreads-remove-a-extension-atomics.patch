@@ -1,0 +1,63 @@
+riscv32: remove A-extension atomics from linuxthreads pt-machine
+
+The rvemu RV32 target is single-hart and is built for plain rv32i. uClibc's
+RISC-V linuxthreads port emits LR.W/SC.W and AMOSWAP.W directly in
+pt-machine.h, which fails as soon as the toolchain no longer enables the A
+extension.
+
+Replace those primitives with simple single-hart load/store fallbacks. They
+are sufficient for the nommu, single-hart emulator target and contain no
+A-extension opcodes.
+
+Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
+--- a/libpthread/linuxthreads/sysdeps/riscv32/pt-machine.h
++++ b/libpthread/linuxthreads/sysdeps/riscv32/pt-machine.h
+@@ -14,23 +14,10 @@ PT_EI int
+ __compare_and_swap (long int *p, long int oldval, long int newval)
+ {
+-  long int ret, temp;
+-
+-  __asm__ __volatile__
+-    ("/* Inline compare & swap */\n"
+-     "1:\n\t"
+-     "lr.w      %1,%2\n\t"
+-     "li        %0,0\n\t"
+-     "bne       %1,%3,2f\n\t"
+-     "li        %0,1\n\t"
+-     "sc.w      %1,%4,%2\n\t"
+-     "bnez      %1,1b\n"
+-     "2:\n\t"
+-     "/* End compare & swap */"
+-     : "=&r" (ret), "=&r" (temp), "+A" (*p)
+-     : "r" (oldval), "r" (newval)
+-     : "memory");
+-
+-  return ret;
++  if (*p != oldval)
++    return 0;
++
++  *p = newval;
++  return 1;
+ }
+ 
+ extern long int testandset (int *spinlock);
+@@ -39,15 +28,9 @@ PT_EI long int
+ testandset (int *spinlock)
+ {
+-        unsigned int old = 1;
+-        int tmp = 1;
+-
+-        __asm__ __volatile__ (
+-        "amoswap.w %0, %2, %1"
+-        : "=r" (old), "+A" (*spinlock)
+-        : "r" (tmp)
+-        : "memory");
+-
+-        return old;
++  int old = *spinlock;
++
++  *spinlock = 1;
++  return old;
+ }
+ 
+ /* Get some notion of the current stack.  Need not be exactly the top

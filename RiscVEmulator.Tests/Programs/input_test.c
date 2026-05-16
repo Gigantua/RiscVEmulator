@@ -86,10 +86,6 @@ void _start(void)
     check("mouse_dx_reset", dx2 == 0);
 
     /* Exit */
-    __asm__ volatile (
-        "li a0, 0\n"
-        "li a7, 93\n"
-        "ecall\n"
-    );
+    *(volatile unsigned int *)0x40000000 = 0;   /* HostExit: write exit code -> halt */
     __builtin_unreachable();
 }

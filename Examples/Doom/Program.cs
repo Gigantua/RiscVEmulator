@@ -90,7 +90,7 @@ foreach (string src in cSources)
 
 // Link all objects into doom.elf
 {
-    string march = enableMExt ? "rv32im" : "rv32i";
+    string march = "rv32i";
     var linkArgs = new List<string>
     {
         "--target=riscv32-unknown-elf", $"-march={march}", "-mabi=ilp32",
@@ -165,7 +165,7 @@ bool Compile(string src, string obj, string[] extraFlags, bool mExt)
     string name = Path.GetFileName(src);
     Console.Write($"  {name}... ");
 
-    string march = mExt ? "rv32im" : "rv32i";
+    string march = "rv32i";
     var compileArgs = new List<string>
     {
         "--target=riscv32-unknown-elf", $"-march={march}", "-mabi=ilp32",

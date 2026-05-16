@@ -19,9 +19,9 @@ void _start(void)
     unsigned int t0_lo = MTIME_LO;
     unsigned int t0_hi = MTIME_HI;
 
-    /* Busy-wait: do some work to advance mtime */
+    /* Busy-wait: enough work to span several wall-clock mtime ticks */
     volatile unsigned int dummy = 0;
-    for (int i = 0; i < 1000; i++)
+    for (int i = 0; i < 1000000; i++)
         dummy += i;
 
     /* Read mtime again */

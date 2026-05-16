@@ -1,0 +1,135 @@
+riscv: route remaining A-extension assembly through rvemu no-A helpers
+
+The rvemu Linux image is single-hart and built without the RISC-V A
+extension. Replace the leftover reservation-clear SC instruction and futex
+AMO/LR/SC sequences with explicit rvemu_noa_* helpers. The helpers are
+single-hart fallbacks owned by this patch, so no A-extension opcodes are
+emitted implicitly.
+
+Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
+--- a/arch/riscv/lib/Makefile
++++ b/arch/riscv/lib/Makefile
+@@ -4,6 +4,7 @@ lib-y			+= delay.o
+ lib-y			+= delay.o
+ lib-$(CONFIG_32BIT)	+= mul32.o
+ lib-$(CONFIG_32BIT)	+= div32.o
++lib-$(CONFIG_32BIT)	+= rvemu_noa.o
+ lib-y			+= memcpy.o
+ lib-y			+= memset.o
+ lib-y			+= memmove.o
+--- /dev/null
++++ b/arch/riscv/lib/rvemu_noa.S
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#include <linux/linkage.h>
++#include <asm/asm.h>
++
++/* No A-extension means there is no architectural LR reservation to clear. */
++SYM_FUNC_START(rvemu_noa_clear_reservation)
++	ret
++SYM_FUNC_END(rvemu_noa_clear_reservation)
++
+--- a/arch/riscv/kernel/entry.S
++++ b/arch/riscv/kernel/entry.S
+@@ -167,2 +167,8 @@
+ 	REG_L  a2, PT_EPC(sp)
++#ifdef CONFIG_SMP
+ 	REG_SC x0, a2, PT_EPC(sp)
++#else
++	call rvemu_noa_clear_reservation
++	REG_L a0, PT_STATUS(sp)
++	REG_L a2, PT_EPC(sp)
++#endif
+--- a/arch/riscv/include/asm/futex.h
++++ b/arch/riscv/include/asm/futex.h
+@@ -20,1 +20,82 @@
+ #endif
++#ifndef CONFIG_SMP
++
++#include <linux/irqflags.h>
++
++static inline int
++rvemu_noa_futex_atomic_op_inuser(int op, int oparg, int *oval, u32 __user *uaddr)
++{
++	u32 *addr = (u32 __force *)uaddr;
++	int oldval, newval;
++	unsigned long flags;
++
++	if (!access_ok(uaddr, sizeof(u32)))
++		return -EFAULT;
++
++	raw_local_irq_save(flags);
++	oldval = READ_ONCE(*addr);
++
++	switch (op) {
++	case FUTEX_OP_SET:
++		newval = oparg;
++		break;
++	case FUTEX_OP_ADD:
++		newval = oldval + oparg;
++		break;
++	case FUTEX_OP_OR:
++		newval = oldval | oparg;
++		break;
++	case FUTEX_OP_ANDN:
++		newval = oldval & ~oparg;
++		break;
++	case FUTEX_OP_XOR:
++		newval = oldval ^ oparg;
++		break;
++	default:
++		raw_local_irq_restore(flags);
++		return -ENOSYS;
++	}
++
++	WRITE_ONCE(*addr, newval);
++	raw_local_irq_restore(flags);
++
++	*oval = oldval;
++	return 0;
++}
++
++static inline int
++rvemu_noa_futex_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
++				 u32 oldval, u32 newval)
++{
++	u32 *addr = (u32 __force *)uaddr;
++	unsigned long flags;
++	u32 val;
++
++	if (!access_ok(uaddr, sizeof(u32)))
++		return -EFAULT;
++
++	raw_local_irq_save(flags);
++	val = READ_ONCE(*addr);
++	if (val == oldval)
++		WRITE_ONCE(*addr, newval);
++	raw_local_irq_restore(flags);
++
++	*uval = val;
++	return 0;
++}
++
++static inline int
++arch_futex_atomic_op_inuser(int op, int oparg, int *oval, u32 __user *uaddr)
++{
++	return rvemu_noa_futex_atomic_op_inuser(op, oparg, oval, uaddr);
++}
++
++static inline int
++futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
++			      u32 oldval, u32 newval)
++{
++	return rvemu_noa_futex_cmpxchg_inatomic(uval, uaddr, oldval, newval);
++}
++
++#else /* CONFIG_SMP */
++
+@@ -100,4 +174,6 @@ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+ 	return ret;
+ }
+ 
++#endif /* CONFIG_SMP */
++
+ #endif /* _ASM_RISCV_FUTEX_H */

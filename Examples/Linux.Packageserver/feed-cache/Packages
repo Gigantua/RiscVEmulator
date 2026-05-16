@@ -7,15 +7,6 @@ Filename: bc_1.07.1_rv32inommu_uclibc.ipk
 Size: 199724
 SHA256sum: 59b1065f4cd1e16376df0c63983ea6bf0157f10534eb31bb493ee1064b6a4d53
 
-Package: doom-wad
-Version: 1.9
-Architecture: rv32inommu_uclibc
-Maintainer: rvemu-feed
-Description: doom-wad (cross-built via buildroot)
-Filename: doom-wad_1.9_rv32inommu_uclibc.ipk
-Size: 1750676
-SHA256sum: cd5a943f09f62fcaf58ace5ea997075f5b3f31e6bb3b3c76dec7db838a521b73
-
 Package: doomgeneric
 Version: dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284
 Architecture: rv32inommu_uclibc

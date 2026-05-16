@@ -11,7 +11,8 @@
  * JIT'd code can call into the emulator's own libc without any shared library.
  *
  * Build: see Examples/TinyCC/Program.cs for the clang invocation.
- * Run:   EnableMExtension = true  (TCC emits MUL/DIV instructions)
+ * Run:   the emulator has no M extension; TCC lowers '*', '/' and '%'
+ *        to software helper libcalls (__mulsi3/__divsi3/...).
  */
 
 /* ── Configuration for TinyCC internals ─────────────────────────────── */
@@ -46,6 +47,29 @@ static TCCState *compile_jit(void)
     /* Wire host runtime symbols into the JIT'd code */
     tcc_add_symbol(s, "printf",  (void *)printf);
     tcc_add_symbol(s, "putchar", (void *)putchar);
+
+    /* The RV32I emulator implements the bare base ISA with NO M
+     * extension: hardware MUL/MULH* and DIV/DIVU/REM/REMU all trap as
+     * illegal instructions. The RV32 code generator therefore lowers
+     * JIT'd '*', '/' and '%' to calls into these software arithmetic
+     * helpers — wire them in so the JIT'd code (e.g. mandelbrot's
+     * fixed-point multiplies and divides) can resolve them. The helpers
+     * live in the host runtime (Runtime/runtime.c). __muldi3 covers
+     * 64-bit (long long) multiply. */
+    {
+        extern unsigned int       __mulsi3(unsigned int, unsigned int);
+        extern unsigned long long __muldi3(unsigned long long, unsigned long long);
+        extern unsigned int __udivsi3(unsigned int, unsigned int);
+        extern unsigned int __umodsi3(unsigned int, unsigned int);
+        extern int          __divsi3(int, int);
+        extern int          __modsi3(int, int);
+        tcc_add_symbol(s, "__mulsi3",  (void *)__mulsi3);
+        tcc_add_symbol(s, "__muldi3",  (void *)__muldi3);
+        tcc_add_symbol(s, "__divsi3",  (void *)__divsi3);
+        tcc_add_symbol(s, "__udivsi3", (void *)__udivsi3);
+        tcc_add_symbol(s, "__modsi3",  (void *)__modsi3);
+        tcc_add_symbol(s, "__umodsi3", (void *)__umodsi3);
+    }
 
     if (tcc_compile_string(s, jit_src) != 0) {
         printf("ERROR: tcc_compile_string() failed\n");

@@ -181,6 +181,7 @@ public abstract class EmulatorTestBase
         var rtc     = new RealTimeClockDevice();
         var audioBuf  = new AudioBufferDevice();
         var audioCtrl = new AudioControlDevice();
+        var clint     = new ClintDevice();   // CLINT mtime/mtimecmp at 0x02000000
         bus.RegisterPeripheral(uart);
         bus.RegisterPeripheral(fb);
         bus.RegisterPeripheral(display);
@@ -189,6 +190,7 @@ public abstract class EmulatorTestBase
         bus.RegisterPeripheral(rtc);
         bus.RegisterPeripheral(audioBuf);
         bus.RegisterPeripheral(audioCtrl);
+        bus.RegisterPeripheral(clint);
 
         // Let test inject keyboard/mouse/uart events before run
         setupKeyboard?.Invoke(kbd);

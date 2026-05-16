@@ -52,6 +52,6 @@ void _start(void)
     /* Done */
     printf("PASS\n");
 
-    __asm__ volatile("li a7, 93\nli a0, 0\necall" ::: "a0", "a7");
+    *(volatile unsigned int *)0x40000000 = 0;   /* HostExit: write exit code -> halt */
     __builtin_unreachable();
 }

@@ -169,7 +169,7 @@ else
 byte[] svidData = File.ReadAllBytes(svidPath);
 
 // ── Compile ──────────────────────────────────────────────────────
-Console.WriteLine("Compiling video player for RV32IM...");
+Console.WriteLine("Compiling video player for RV32I+Zmmul...");
 
 string softfloatC = Path.Combine(runtimeDir, "softfloat.c");
 string[] cSources = { runtimeC, libcC, softfloatC, syscallsC, mallocC };
@@ -201,7 +201,7 @@ string programsDir = Path.Combine(exeDir, "Programs");
 {
     var linkArgs = new List<string>
     {
-        "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char",
         "-fuse-ld=lld", $"-Wl,-T,{linkerLd}",
     };
@@ -271,7 +271,7 @@ bool Compile(string src, string obj, string[] extraFlags)
 
     var compileArgs = new List<string>
     {
-        "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O3",
         "-fno-builtin", "-fsigned-char", "-c",
     };

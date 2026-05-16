@@ -82,7 +82,7 @@ Directory.CreateDirectory(buildDir);
 string elfPath = Path.Combine(buildDir, "tinycc_demo.elf");
 
 Console.WriteLine("TinyCC JIT Demo — RV32I emulator");
-Console.WriteLine($"Compiling TinyCC + demo for RV32I+M...");
+Console.WriteLine($"Compiling TinyCC + demo for RV32I...");
 
 // ── Runtime sources (compiled separately with -O3) ─────────────────
 // tinycc_demo.c is compiled separately (with -O1) because it includes
@@ -133,7 +133,7 @@ foreach (string src in runtimeSources)
 {
     var linkArgs = new List<string>
     {
-        "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O1", "-fno-builtin",
         "-fuse-ld=lld", $"-Wl,-T,{linkerLd}",
     };
@@ -205,7 +205,7 @@ bool CompileO3(string src, string obj, string[] extraFlags)
 {
     var args = new List<string>
     {
-        "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char", "-c",
     };
     args.AddRange(extraFlags);
@@ -217,7 +217,7 @@ bool CompileO1(string src, string obj, string[] extraFlags)
 {
     var args = new List<string>
     {
-        "--target=riscv32-unknown-elf", "-march=rv32im", "-mabi=ilp32",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O1", "-fno-builtin", "-fsigned-char", "-c",
         "-Wno-everything",  // TinyCC source has many warnings under clang
     };

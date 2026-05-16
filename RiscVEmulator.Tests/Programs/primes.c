@@ -2,7 +2,7 @@
  * Prints the first 100 prime numbers.
  *
  * Compile:
- *   clang --target=riscv32-unknown-elf -march=rv32im -mabi=ilp32 \
+ *   clang --target=riscv32-unknown-elf -march=rv32i -mabi=ilp32 \
  *         -nostdlib -nostartfiles -O1 -fuse-ld=lld \
  *         -Wl,-Tlinker.ld primes.c -o primes.elf
  *

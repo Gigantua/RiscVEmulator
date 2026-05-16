@@ -227,6 +227,18 @@
      DEF(TOK___moddi3, "__moddi3")
      DEF(TOK___udivdi3, "__udivdi3")
      DEF(TOK___umoddi3, "__umoddi3")
+#if defined TCC_TARGET_RISCV32
+     /* 32-bit software arithmetic helpers — the RV32I emulator implements
+        the bare base ISA with NO M extension (no hardware MUL/DIV/REM),
+        so riscv32-gen.c lowers '*', '/' and '%' to calls into these.
+        __muldi3 covers 64-bit (long long) multiply. */
+     DEF(TOK___mulsi3, "__mulsi3")
+     DEF(TOK___muldi3, "__muldi3")
+     DEF(TOK___divsi3, "__divsi3")
+     DEF(TOK___modsi3, "__modsi3")
+     DEF(TOK___udivsi3, "__udivsi3")
+     DEF(TOK___umodsi3, "__umodsi3")
+#endif
      DEF(TOK___ashrdi3, "__ashrdi3")
      DEF(TOK___lshrdi3, "__lshrdi3")
      DEF(TOK___ashldi3, "__ashldi3")

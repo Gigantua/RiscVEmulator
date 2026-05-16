@@ -2,7 +2,7 @@
  * Tests scalar IEEE 754 double-precision operations.
  *
  * All values are exactly representable in float64.  Compiled with
- * -march=rv32im -nostdlib; arithmetic provided by softfloat.c.
+ * -march=rv32i -nostdlib; arithmetic provided by softfloat.c.
  *
  * Output: one result per line, printed as a signed integer
  * (cast from double — exact since all test results are whole numbers

@@ -36,6 +36,7 @@
     <None Update="Programs\fb_test.c"      CopyToOutputDirectory="Always" />
     <None Update="Programs\input_test.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\audio_test.c"   CopyToOutputDirectory="Always" />
+    <None Include="Programs\atomic_trap.c" CopyToOutputDirectory="Always" />
     <None Update="Programs\runtime_ops.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\malloc_test.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\vfs_test.c"     CopyToOutputDirectory="Always" />
@@ -65,13 +66,8 @@
     <None Update="Programs\stdlib_test.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\math_test.c"     CopyToOutputDirectory="Always" />
     <None Update="Programs\voxel_mkrgba_test.c"    CopyToOutputDirectory="Always" />
-    <None Update="Programs\voxel_clearscreen_test.c" CopyToOutputDirectory="Always" />
-    <None Update="Programs\voxel_triangle_test.c"  CopyToOutputDirectory="Always" />
-    <None Update="Programs\voxel_render_test.c"    CopyToOutputDirectory="Always" />
-    <None Update="Programs\voxel_fastras_test.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\voxel_worldgen_test.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\voxel_physics_test.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\voxel_midi_test.c"      CopyToOutputDirectory="Always" />
-    <None Update="Programs\voxel_gameloop_test.c"  CopyToOutputDirectory="Always" />
   </ItemGroup>
 </Project>

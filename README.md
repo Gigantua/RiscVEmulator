@@ -135,36 +135,9 @@ static __forceinline void do_step() {
         break;
     }
 
-    case 0x2F:  // AMO (RV32A)
-        if constexpr (AExt) {
-            const uint32_t irmid = (instr >> 27) & 0x1F;
-            const uint32_t addr  = u1;
-            if (irmid == 2) {                                            // LR.W
-                regs[rd] = mem_read<uint32_t>(addr);
-                rsv_addr = addr;
-            } else if (irmid == 3) {                                     // SC.W
-                if (rsv_addr == addr) { mem_write<uint32_t>(addr, u2); regs[rd] = 0; }
-                else                                                       regs[rd] = 1;
-                rsv_addr = ~0u;
-            } else {
-                uint32_t old = mem_read<uint32_t>(addr);
-                regs[rd]     = old;
-                uint32_t nw;
-                switch (irmid) {
-                    case  1: nw = u2;                                       break;  // SWAP
-                    case  0: nw = old + u2;                                 break;  // ADD
-                    case  4: nw = old ^ u2;                                 break;  // XOR
-                    case 12: nw = old & u2;                                 break;  // AND
-                    case  8: nw = old | u2;                                 break;  // OR
-                    case 16: nw = (int32_t)u2 < (int32_t)old ? u2 : old;    break;  // MIN
-                    case 20: nw = (int32_t)u2 > (int32_t)old ? u2 : old;    break;  // MAX
-                    case 24: nw = u2 < old ? u2 : old;                      break;  // MINU
-                    case 28: nw = u2 > old ? u2 : old;                      break;  // MAXU
-                    default: nw = old;                                       break;
-                }
-                mem_write<uint32_t>(addr, nw);
-            }
-        }
+    case 0x2F:  // A-extension removed: LR/SC/AMO trap as illegal
+        trap_cause = 2;
+        trap_tval = instr;
         break;
 
     case 0x07:  // FLW
@@ -220,8 +193,8 @@ static __forceinline void do_step() {
 ## Features
 
 - **RV32I** — all 40 base instructions
-- **M-extension** — `MUL` / `MULH` / `DIV` / `REM` family (opt-in, big speedup for Doom)
-- **A-extension** — atomic instructions (`LR.W`, `SC.W`, `AMO*`) needed for Linux SMP primitives
+- **No M-extension** — `MUL` / `MULH` / `DIV` / `REM` trap; guest code uses libcalls
+- **No A-extension** — `LR.W`, `SC.W`, and `AMO*` trap as illegal instructions
 - **M/S/U privilege modes** — CSRs, traps, `MRET`/`SRET`, timer interrupts, `WFI`
 - **Memory-mapped peripherals** — UART, framebuffer, keyboard, mouse, audio, RTC, CLINT
 - **ELF loader** — loads `PT_LOAD` segments from standard ELF32 binaries
@@ -372,10 +345,13 @@ Options:
 --dtb    <path>   Use a custom DTB
 --ram    <MB>     Guest RAM in MB (default: 96; 96 minimum for the desktop)
 --gui             Open the SDL framebuffer window
---download        Fetch the pre-built mini-rv32ima kernel (legacy serial-only mode)
+--download        Fetch the legacy pre-built mini-rv32ima kernel (serial-only mode)
 ```
 
-The kernel and DTB are cached in `~/.cache/riscvemu/linux/`.
+The Build_RV32i kernel is built for `rv32i` and labels its boot banner with
+`-rv32i`; a `mini-rv32ima` banner means you are running the legacy downloaded
+image or a stale cache. The kernel and DTB are cached in
+`~/.cache/riscvemu/linux/`.
 
 ### Self-hosted package feed
 

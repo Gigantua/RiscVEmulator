@@ -78,10 +78,6 @@ void _start(void)
     print_str("pixels_written: OK\n");
 
     /* Exit */
-    __asm__ volatile (
-        "li a0, 0\n"
-        "li a7, 93\n"
-        "ecall\n"
-    );
+    *(volatile unsigned int *)0x40000000 = 0;   /* HostExit: write exit code -> halt */
     __builtin_unreachable();
 }

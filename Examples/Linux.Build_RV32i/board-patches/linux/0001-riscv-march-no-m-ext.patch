@@ -1,0 +1,40 @@
+riscv: build RV32 kernel for rv32i (no A or M extension)
+
+The RiscVEmulator native CPU no longer implements the A or M extensions:
+LR.W / SC.W / AMO*, hardware MUL / MULH[SU|U], and DIV / DIVU / REM /
+REMU all trap as illegal instructions (see Native/rv32i_core.cpp).
+A previous milestone kept the ratified "Zmmul" multiply-only subset;
+that is now gone too.
+
+The RV32 nommu kernel build hard-codes its own -march as `rv32ima`
+(riscv-march-$(CONFIG_ARCH_RV32I)) -- it does NOT inherit the buildroot
+toolchain default. With any `m` (or `_zmmul`) the compiler is free to
+emit mul / mulh / div / rem opcodes, all of which would trap on this
+CPU. Replace the base ISA string with plain `rv32i` so GCC never emits
+a single A- or M-extension instruction.
+
+With `m` gone, GCC lowers every 32-/64-bit C multiply, division and
+modulo to libcalls (__mulsi3 / __muldi3 / __divsi3 / __udivsi3 /
+__modsi3 / __umodsi3 / ...). The kernel does not link libgcc, so those
+routines are supplied by patch 0002 (arch/riscv/lib/{mul32.c,div32.c}),
+each implemented with shift+add / shift-subtract only -- no mul/div/rem
+opcode anywhere -- so the helpers are themselves valid on this CPU.
+
+Note: the FPU-strip sed further down the Makefile anchors on the literal
+`rv32ima`/`rv64ima` and only fires when an `fd` suffix is present. This
+nommu build never enables CONFIG_FPU, so riscv-march-y has no `fd`
+suffix and that sed is a no-op -- changing only the rv32 base string is
+safe.
+
+Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
+--- a/arch/riscv/Makefile	2026-05-16 13:30:28.658333900 +0200
++++ b/arch/riscv/Makefile	2026-05-16 13:30:28.662329022 +0200
+@@ -55,7 +55,7 @@
+ endif
+
+ # ISA string setting
+-riscv-march-$(CONFIG_ARCH_RV32I)	:= rv32ima
++riscv-march-$(CONFIG_ARCH_RV32I)	:= rv32i
+ riscv-march-$(CONFIG_ARCH_RV64I)	:= rv64ima
+ riscv-march-$(CONFIG_FPU)		:= $(riscv-march-y)fd
+ riscv-march-$(CONFIG_RISCV_ISA_C)	:= $(riscv-march-y)c

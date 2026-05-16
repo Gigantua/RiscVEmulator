@@ -74,7 +74,7 @@ static void ok(const char *label, int pass) {
 }
 
 static void exit_emu(int code) {
-    __asm__ volatile("mv a0, %0\n li a7, 93\n ecall\n" :: "r"(code));
+    *(volatile unsigned int *)0x40000000 = (unsigned int)code;   /* HostExit: halt */
     __builtin_unreachable();
 }
 

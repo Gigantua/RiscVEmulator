@@ -3,8 +3,6 @@
 // ── ISA implemented ─────────────────────────────────────────────────
 //
 //   RV32I            Base integer ISA (all 40 instructions).
-//   M                Integer multiply/divide (MUL, MULH[SU|U], DIV[U], REM[U]).
-//   A                Atomics: LR.W / SC.W + AMO{SWAP,ADD,XOR,AND,OR,MIN[U],MAX[U]}.W.
 //   F                Single-precision float (FLW/FSW, FADD/FSUB/FMUL/FDIV/FSQRT,
 //                    FMIN/FMAX, FMADD/FMSUB/FNMADD/FNMSUB, FSGNJ[N|X],
 //                    FCVT.W[U].S / FCVT.S.W[U], FEQ/FLT/FLE, FCLASS, FMV.X.W/FMV.W.X).
@@ -25,14 +23,6 @@
 //               (from mtime≥mtimecmp); other bits writable via CSR.
 //   No MMU translation — satp is stored but loads/stores use the bare
 //   guest-physical address.
-//
-// ── Not implemented ─────────────────────────────────────────────────
-//
-//   D (double-precision)        — provide via softfloat.c in guest runtime.
-//   C (compressed)               — all instructions are 32-bit.
-//   B / Zb* (bitmanip), V        — not present.
-//   PMP, Sv32 MMU walks          — satp is a dead store.
-//   Misaligned access traps      — host does the access; x86 handles misalign.
 //
 // ── Host integration model ──────────────────────────────────────────
 //
@@ -80,8 +70,6 @@ struct CPU_State {
     int      halted;
     uint64_t mtime;
     uint64_t mtimecmp;
-    uint32_t rsv_addr;          // A-ext LR/SC reservation
-
     uint8_t* mem;               // host base; every guest load/store hits *(mem + addr)
 
     uint32_t priv_mode;
@@ -120,21 +108,11 @@ static constexpr int32_t s_imm(uint32_t i) {
     return ((int32_t)(i & 0xFE000000) >> 20) | (int32_t)((i >> 7) & 0x1Fu);
 }
 
-// ── M-extension (MUL/DIV/REM) ───────────────────────────────────────
-
-static inline uint32_t exec_m(uint32_t f3, int32_t s1, uint32_t u1, int32_t s2, uint32_t u2) {
-    switch (f3) {
-        case 0: return (uint32_t)(s1 * s2);
-        case 1: return (uint32_t)((int64_t)s1 * s2 >> 32);
-        case 2: return (uint32_t)((int64_t)s1 * (int64_t)u2 >> 32);
-        case 3: return (uint32_t)((uint64_t)u1 * u2 >> 32);
-        case 4: return s2 == 0 ? 0xFFFFFFFFu : (s1 == INT32_MIN && s2 == -1 ? (uint32_t)s1 : (uint32_t)(s1 / s2));
-        case 5: return u2 == 0 ? 0xFFFFFFFFu : u1 / u2;
-        case 6: return s2 == 0 ? u1 : (s1 == INT32_MIN && s2 == -1 ? 0u : (uint32_t)(s1 % s2));
-        case 7: return u2 == 0 ? u1 : u1 % u2;
-        default: return 0;
-    }
-}
+// ── M-extension removed ─────────────────────────────────────────────
+//
+// MUL/MULH[SU|U]/DIV[U]/REM[U] are not implemented. Any OP-class
+// instruction with funct7 == 0x01 traps as an illegal instruction;
+// the guest's compiler lowers * and / to __mulsi3 / __divsi3 libcalls.
 
 // ── F-extension (single-precision) ──────────────────────────────────
 
@@ -419,8 +397,9 @@ static constexpr void do_step(CPU_State& cpu) {
 
     case 0x33: {
         uint32_t r = 0;
-        if (f7 == 0x01) {
-            r = exec_m(f3, s1, u1, s2, u2);
+        if (f7 == 0x01) {                        // M-extension removed — MUL/MULH*/DIV*/REM* all trap
+            trap_cause = 2; trap_tval = instr;
+            break;
         } else {
             const int sh = s2 & 0x1F;
             switch (f3) {
@@ -439,32 +418,7 @@ static constexpr void do_step(CPU_State& cpu) {
     }
 
     case 0x2F: {
-        const uint32_t irmid = (instr >> 27) & 0x1F;
-        const uint32_t addr  = u1;
-        if (irmid == 2) {
-            cpu.regs[rd] = mem_read<uint32_t>(cpu, addr);
-            cpu.rsv_addr = addr;
-        } else if (irmid == 3) {
-            if (cpu.rsv_addr == addr) { mem_write<uint32_t>(cpu, addr, u2); cpu.regs[rd] = 0; }
-            else                                                             cpu.regs[rd] = 1;
-            cpu.rsv_addr = ~0u;
-        } else {
-            uint32_t old = mem_read<uint32_t>(cpu, addr);
-            cpu.regs[rd] = old;
-            uint32_t nw = old;
-            switch (irmid) {
-                case  1: nw = u2;                                       break;
-                case  0: nw = old + u2;                                 break;
-                case  4: nw = old ^ u2;                                 break;
-                case 12: nw = old & u2;                                 break;
-                case  8: nw = old | u2;                                 break;
-                case 16: nw = (int32_t)u2 < (int32_t)old ? u2 : old;    break;
-                case 20: nw = (int32_t)u2 > (int32_t)old ? u2 : old;    break;
-                case 24: nw = u2 < old ? u2 : old;                      break;
-                case 28: nw = u2 > old ? u2 : old;                      break;
-            }
-            mem_write<uint32_t>(cpu, addr, nw);
-        }
+        trap_cause = 2; trap_tval = instr;      // A-extension removed — LR/SC/AMO all trap
         break;
     }
 
@@ -568,7 +522,6 @@ extern "C" void rv32i_init(uint8_t* mem, uint32_t entry) {
     cpu           = {};
     cpu.pc        = entry;
     cpu.mtimecmp  = ~0ULL;
-    cpu.rsv_addr  = ~0u;
     cpu.mem       = mem;
     cpu.priv_mode = 3;          // start in M-mode
     wallclock_reset();

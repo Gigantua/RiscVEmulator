@@ -84,8 +84,7 @@ foreach (string src in allSources)
 
 // ── Link ───────────────────────────────────────────────────────────
 {
-    string march = enableFExt ? (enableMExt ? "rv32imf" : "rv32if")
-                              : (enableMExt ? "rv32im"  : "rv32i");
+    string march = enableFExt ? "rv32if" : "rv32i";
     string mabi  = enableFExt ? "ilp32f" : "ilp32";
     var linkArgs = new List<string>
     {
@@ -148,8 +147,7 @@ return window.Run();
 bool Compile(string src, string obj, string[] extraFlags, bool mExt, bool fExt)
 {
     Console.Write($"  {Path.GetFileName(src)}... ");
-    string march = fExt ? (mExt ? "rv32imf" : "rv32if")
-                        : (mExt ? "rv32im"  : "rv32i");
+    string march = fExt ? "rv32if" : "rv32i";
     string mabi  = fExt ? "ilp32f" : "ilp32";
     var compileArgs = new List<string>
     {

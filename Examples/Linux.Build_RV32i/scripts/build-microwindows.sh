@@ -39,10 +39,12 @@ if [ ! -d "$MW_DIR" ]; then
 fi
 
 # 2. Install the rvemu-specific config + screen/keyboard drivers
-echo "==> installing config + scr_rvemu.c + kbd_rvemu.c"
+echo "==> installing config + rvemu drivers/apps"
 cp "$PATCH_DIR/config"        "$MW_DIR/src/config"
 cp "$PATCH_DIR/scr_rvemu.c"   "$MW_DIR/src/drivers/scr_rvemu.c"
 cp "$PATCH_DIR/kbd_rvemu.c"   "$MW_DIR/src/drivers/kbd_rvemu.c"
+cp "$PATCH_DIR/rvemu-taskbar.c" "$MW_DIR/src/demos/nanox/rvemu-taskbar.c"
+cp "$PATCH_DIR/rvemu-term.c"    "$MW_DIR/src/demos/nanox/rvemu-term.c"
 
 # 3. Patch Arch.rules — add UCLINUX-RISCV section
 if ! grep -q "UCLINUX-RISCV" "$MW_DIR/src/Arch.rules"; then
@@ -73,6 +75,8 @@ bash "$SCRIPT_DIR/patch-mw-makefile.sh"
 
 # 7. Enable nanowm target
 python3 "$SCRIPT_DIR/enable-nanowm.py"
+python3 "$SCRIPT_DIR/add-rvemu-taskbar.py"
+python3 "$SCRIPT_DIR/add-rvemu-term.py"
 
 # 8. Build
 echo "==> building"

@@ -2133,10 +2133,22 @@ static void gen_opl(int op)
         vtop->r = reg_iret;
         vtop->r2 = reg_lret;
         break;
+#if defined TCC_TARGET_RISCV32
+    case '*':
+        /* The RV32I emulator has no M extension; the generic 64-bit
+           multiply expansion below relies on TOK_UMULL (a 32x32->64
+           hardware multiply) which riscv32-gen.c cannot emit. Route
+           64-bit (long long) multiply through the __muldi3 libcall,
+           the same way the div/mod cases above are handled. */
+        func = TOK___muldi3;
+        goto gen_func;
+#endif
     case '^':
     case '&':
     case '|':
+#if !defined TCC_TARGET_RISCV32
     case '*':
+#endif
     case '+':
     case '-':
         //pv("gen_opl A",0,2);

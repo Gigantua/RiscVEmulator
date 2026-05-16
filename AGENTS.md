@@ -6,10 +6,11 @@ For deeper docs see `README.md`, `Architecture.md` (ISA reference), `MEMORY_MAP.
 
 ## What this is
 
-A RISC-V RV32I + M + A + F emulator (single-hart, no D, no C-ext) targeting
+A RISC-V RV32I + F emulator (single-hart, no A/M/D, no C-ext) targeting
 Windows. Hot path is a single-file C++ CPU compiled with ClangCL; everything
 else (peripherals, frontend, examples) is .NET 10 C#. Runs bare-metal ELF
-binaries and a real RV32 Linux kernel (`Examples/Linux`, mini-rv32ima image).
+binaries and a real RV32I Linux kernel (`Examples/Linux`, built by
+`Examples/Linux.Build_RV32i`).
 
 ## The one idea you must internalize
 
@@ -74,7 +75,7 @@ introduces libc dependencies.
 ## CPU model (Native/rv32i_core.cpp)
 
 - All CPU state lives in one struct: `CPU_State` (regs, fregs, pc, mtime,
-  mtimecmp, rsv_addr, mem pointer, priv_mode, wfi_pending, CSRs).
+  mtimecmp, mem pointer, priv_mode, wfi_pending, CSRs).
 - `do_step(CPU_State& cpu)` and every helper it calls take `cpu` by reference.
   A single global `static CPU_State cpu;` exists for the C-ABI trampolines
   (`rv32i_step_n`, `rv32i_init`, `rv32i_get_pc`, etc.) — they pass `cpu` into
@@ -100,8 +101,8 @@ introduces libc dependencies.
 | Ext | Status | Notes |
 |---|---|---|
 | RV32I | full | all 40 base instructions |
-| M | full | MUL/DIV/REM family |
-| A | full | LR/SC + 9 AMO ops |
+| M | no | MUL/DIV/REM family traps; use libcalls |
+| A | no | LR/SC/AMO opcodes trap as illegal |
 | F | full | single-precision; no exception flags, rounding ignored |
 | Zicsr / Zifencei | yes / NOP | FENCE is a NOP (single-hart, no I-cache) |
 | Priv M/S/U | yes | trap delegation, MRET/SRET, WFI, ECALL/EBREAK |
@@ -162,7 +163,7 @@ hot bulk-data peripherals like the framebuffer and PCM buffer).
 | `Examples/Midi` | MIDI playback via the MIDI peripheral. |
 | `Examples/Input` | Keyboard + mouse echo. |
 | `Examples/TinyCC` | JIT compiles C inside the emulator at runtime. ~390 KB ELF containing TinyCC. Emits RV32I machine code and runs it. |
-| `Examples/Linux` | Boots a real mini-rv32ima Linux kernel image. Uses `--download` to fetch kernel + DTB. **Caveat:** the prebuilt kernel has `CONFIG_NET=n`, so sockets/networking won't work without a kernel rebuild. |
+| `Examples/Linux` | Boots the RV32I Linux image produced by `Examples/Linux.Build_RV32i`. `--download` fetches the legacy mini-rv32ima serial-only kernel. |
 
 Bare-metal examples link against `RiscVEmulator.Tests/Runtime/` (libc, malloc,
 softfloat for D-ext emulation, syscalls.c, vfs.c). Syscalls.c is misleadingly

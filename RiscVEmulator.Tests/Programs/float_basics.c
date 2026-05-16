@@ -2,7 +2,7 @@
  * Tests scalar IEEE 754 single-precision (float) operations.
  *
  * All values are exactly representable in float32, so no rounding occurs
- * and the results are deterministic.  Compiled with -march=rv32im -nostdlib;
+ * and the results are deterministic.  Compiled with -march=rv32i -nostdlib;
  * float arithmetic is provided by softfloat.c (compiler-rt ABI).
  *
  * Output: one result per line, printed as a signed integer.
