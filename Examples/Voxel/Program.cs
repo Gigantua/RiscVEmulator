@@ -25,7 +25,6 @@ string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
 // ── Parse CLI args ─────────────────────────────────────────────────
 var opts = new SdlWindowOptions { Title = "Voxel — RV32I Emulator", GrabMouse = true };
 bool enableMExt = true;
-bool enableFExt = true;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -35,7 +34,6 @@ for (int i = 0; i < args.Length; i++)
         case "--fps":      opts.TargetFps = int.Parse(args[++i]); break;
         case "--no-grab":  opts.GrabMouse = false; break;
         case "--no-m-ext": enableMExt = false; break;
-        case "--f-ext":    enableFExt = true;  break;
     }
 }
 
@@ -64,7 +62,7 @@ string[] allSources =
 string[] includeDirs = { runtimeDir, programsDir };
 
 // ── Compile ────────────────────────────────────────────────────────
-Console.WriteLine($"Compiling Voxel for RV32I{(enableMExt?"+M":"")}{(enableFExt?"+F":"")}...");
+Console.WriteLine("Compiling Voxel for RV32I...");
 var objFiles = new List<string>();
 
 foreach (string src in allSources)
@@ -77,18 +75,16 @@ foreach (string src in allSources)
     string objName = Path.GetFileNameWithoutExtension(src) + ".o";
     string objPath = Path.Combine(buildDir, objName);
     string[] extra = includeDirs.Select(d => $"-I{d}").ToArray();
-    if (!Compile(src, objPath, extra, enableMExt, enableFExt))
+    if (!Compile(src, objPath, extra, enableMExt))
         return 1;
     objFiles.Add(objPath);
 }
 
 // ── Link ───────────────────────────────────────────────────────────
 {
-    string march = enableFExt ? "rv32if" : "rv32i";
-    string mabi  = enableFExt ? "ilp32f" : "ilp32";
     var linkArgs = new List<string>
     {
-        "--target=riscv32-unknown-elf", $"-march={march}", $"-mabi={mabi}",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char",
         "-fuse-ld=lld", $"-Wl,-T,{linkerLd}",
     };
@@ -144,14 +140,12 @@ var window = new SdlWindow(fb, display, kbd, mouse, audioBuf, audioCtrl, emu, op
 return window.Run();
 
 // ── Helpers ────────────────────────────────────────────────────────
-bool Compile(string src, string obj, string[] extraFlags, bool mExt, bool fExt)
+bool Compile(string src, string obj, string[] extraFlags, bool mExt)
 {
     Console.Write($"  {Path.GetFileName(src)}... ");
-    string march = fExt ? "rv32if" : "rv32i";
-    string mabi  = fExt ? "ilp32f" : "ilp32";
     var compileArgs = new List<string>
     {
-        "--target=riscv32-unknown-elf", $"-march={march}", $"-mabi={mabi}",
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
         "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char", "-c",
     };
     compileArgs.AddRange(extraFlags);

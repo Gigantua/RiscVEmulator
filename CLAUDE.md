@@ -6,13 +6,14 @@
 
 ## What Is This?
 
-A RISC-V RV32I + F emulator with a native C++ CPU hot path and
-C# peripherals/frontend (.NET 10). The **A and M extensions are fully removed** —
-LR.W/SC.W/AMO*, MUL/MULH[SU|U], and DIV/DIVU/REM/REMU all trap as illegal
-instructions, so every guest must be built for `rv32i` (atomic primitives
-must avoid A opcodes; multiply, divide and modulo lower to integer libcalls). Single-hart, no
-D-ext (use `softfloat.c` in the guest), no C-ext. Runs bare-metal ELF binaries on a small set of
-memory-mapped peripherals (framebuffer, keyboard, mouse, audio, UART,
+A RISC-V RV32I emulator with a native C++ CPU hot path and C#
+peripherals/frontend (.NET 10). The **A, M, and F extensions are fully
+removed** — LR.W/SC.W/AMO*, MUL/MULH[SU|U], DIV/DIVU/REM/REMU, and
+FLW/FSW/FMA/OP-FP all trap as illegal instructions, so every guest must be
+built for `rv32i` (atomic primitives must avoid A opcodes; multiply, divide,
+modulo, and floating-point lower to libcalls). Single-hart, no D-ext (use
+`softfloat.c` in the guest), no C-ext. Runs bare-metal ELF binaries on a small
+set of memory-mapped peripherals (framebuffer, keyboard, mouse, audio, UART,
 timer, RTC) and a real RV32I Linux kernel (`Examples/Linux`).
 Flagship demo is a full Doom port.
 
@@ -47,8 +48,8 @@ dotnet test --no-build RiscVEmulator.Tests
 
 The native `rv32i_core.vcxproj` uses the **ClangCL** toolset (VS C++ workload
 with Clang) and links `IgnoreAllDefaultLibraries=true`. The .cpp provides its
-own `memset`, `memcpy`, `_fltused`, and an SSE-based `fsqrt` — do not introduce
-headers that bring in CRT (`<cmath>`, `<cstring>`, `<cstdio>` etc.).
+own `memset` and `memcpy` — do not introduce headers that bring in CRT
+(`<cmath>`, `<cstring>`, `<cstdio>` etc.).
 
 Tests compile C programs to RV32I ELF using
 `clang --target=riscv32-unknown-elf -march=rv32i -mabi=ilp32 -nostdlib -O3 -fuse-ld=lld`,
@@ -111,7 +112,7 @@ See the header of `Native/rv32i_core.cpp` for the authoritative list.
 | M                | no       | MUL/MULH[SU\|U] *and* DIV/DIVU/REM/REMU all trap as   |
 |                  |          | illegal — fully removed; mul/div/rem lowered to libcalls |
 | A                | no       | LR.W/SC.W/AMO*.W all trap as illegal                   |
-| F                | full     | single-precision; no flags, RNE only, rounding ignored |
+| F                | no       | FLW/FSW/FMA/OP-FP opcodes trap as illegal              |
 | Zicsr / Zifencei | yes / NOP| FENCE/FENCE.I are NOPs                                |
 | Priv M/S/U       | full     | trap delegation (medeleg/mideleg), MRET/SRET, WFI     |
 | D                | no       | provide via `Runtime/softfloat.c` in guest            |
@@ -230,8 +231,8 @@ tests).
 - **No condition flags** — RV32I comparisons write results to registers
   (SLT/SLTU/branches).
 - **x0 is a sink** — writes silently zeroed at end of each step.
-- **F-ext is hardware** in the emulator; D-ext is software via
-  `Runtime/softfloat.c` in the guest.
+- **Float is software-only** in guests via `Runtime/softfloat.c`; hardware
+  F/D opcodes trap as illegal.
 - **CPU–render decoupled** — no synchronization; framebuffer is always
   live-read.
 - **Doom memory layout**: code at 0x1000, stack at 0x9FFF00 (grows down),
@@ -284,9 +285,8 @@ which pulls in everything else.
 compile-time C string array (via `tccdefs_.h`), bypassing the need to open
 any files at runtime.
 
-The Mandelbrot demo uses 32-bit fixed-point integers (scale = 256) because
-the emulator's F-ext is single-precision and the demo wants to demonstrate
-JIT'd integer code, not float.
+The Mandelbrot demo uses 32-bit fixed-point integers (scale = 256) to
+demonstrate JIT'd integer code, not software float.
 
 ### Run
 

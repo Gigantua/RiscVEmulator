@@ -6,10 +6,10 @@ For deeper docs see `README.md`, `Architecture.md` (ISA reference), `MEMORY_MAP.
 
 ## What this is
 
-A RISC-V RV32I + F emulator (single-hart, no A/M/D, no C-ext) targeting
-Windows. Hot path is a single-file C++ CPU compiled with ClangCL; everything
-else (peripherals, frontend, examples) is .NET 10 C#. Runs bare-metal ELF
-binaries and a real RV32I Linux kernel (`Examples/Linux`, built by
+A RISC-V RV32I emulator (single-hart, no A/M/F/D, no C-ext) targeting Windows.
+Hot path is a single-file C++ CPU compiled with ClangCL; everything else
+(peripherals, frontend, examples) is .NET 10 C#. Runs bare-metal ELF binaries
+and a real RV32I Linux kernel (`Examples/Linux`, built by
 `Examples/Linux.Build_RV32i`).
 
 ## The one idea you must internalize
@@ -68,14 +68,13 @@ dotnet run --no-build --project Examples\Doom -p:Platform=x64
 ```
 
 The native `rv32i_core.dll` builds with `IgnoreAllDefaultLibraries=true` — there
-is no CRT. The file provides its own `memset`, `memcpy`, `_fltused`, and a tiny
-`fsqrt` SSE wrapper. Do not add `<cstring>`, `<cmath>`, or any header that
-introduces libc dependencies.
+is no CRT. The file provides its own `memset` and `memcpy`. Do not add
+`<cstring>`, `<cmath>`, or any header that introduces libc dependencies.
 
 ## CPU model (Native/rv32i_core.cpp)
 
-- All CPU state lives in one struct: `CPU_State` (regs, fregs, pc, mtime,
-  mtimecmp, mem pointer, priv_mode, wfi_pending, CSRs).
+- All CPU state lives in one struct: `CPU_State` (regs, pc, mtime, mtimecmp,
+  mem pointer, priv_mode, wfi_pending, CSRs).
 - `do_step(CPU_State& cpu)` and every helper it calls take `cpu` by reference.
   A single global `static CPU_State cpu;` exists for the C-ABI trampolines
   (`rv32i_step_n`, `rv32i_init`, `rv32i_get_pc`, etc.) — they pass `cpu` into
@@ -103,7 +102,7 @@ introduces libc dependencies.
 | RV32I | full | all 40 base instructions |
 | M | no | MUL/DIV/REM family traps; use libcalls |
 | A | no | LR/SC/AMO opcodes trap as illegal |
-| F | full | single-precision; no exception flags, rounding ignored |
+| F | no | FLW/FSW/FMA/OP-FP opcodes trap as illegal; use software float in guest |
 | Zicsr / Zifencei | yes / NOP | FENCE is a NOP (single-hart, no I-cache) |
 | Priv M/S/U | yes | trap delegation, MRET/SRET, WFI, ECALL/EBREAK |
 | D | no | use `Runtime/softfloat.c` in guest |
@@ -184,8 +183,7 @@ named — most operations route through MMIO writes, not ECALL.
 1. **Do not add CRT dependencies to `rv32i_core.cpp`.** The DLL builds
    `-nodefaultlib`. Anything that emits a libc call (memcpy on aggregate
    copy, sqrtf libcall at -O0, std::sqrt, etc.) will fail to link in Debug.
-   Provide a TU-local inline if needed (see existing `fsqrt`, `memset`,
-   `memcpy`).
+   Provide a TU-local inline if needed (see existing `memset`, `memcpy`).
 
 2. **Do not assume the CPU dispatches MMIO.** The dispatch lives in
    `MmioDispatcher.cs` via Windows VEH. If you're seeing reads/writes
@@ -203,8 +201,8 @@ named — most operations route through MMIO writes, not ECALL.
    take `CPU_State&`. Both forms are correct — the global is there only so
    the trampoline names like `rv32i_get_pc()` can be parameter-less.
 
-6. **`EnablePrivMode`, `EnableMExtension`, `EnableFExtension`,
-   `EnableAExtension`, `RamOffset`** on `Emulator` are inert compatibility
+6. **`EnablePrivMode`, `EnableMExtension`, `EnableAExtension`, `RamOffset`**
+   on `Emulator` are inert compatibility
    shims — the CPU handles everything unconditionally. Don't introduce new
    call sites that rely on them doing anything.
 

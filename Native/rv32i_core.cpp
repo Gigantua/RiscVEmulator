@@ -3,10 +3,6 @@
 // ── ISA implemented ─────────────────────────────────────────────────
 //
 //   RV32I            Base integer ISA (all 40 instructions).
-//   F                Single-precision float (FLW/FSW, FADD/FSUB/FMUL/FDIV/FSQRT,
-//                    FMIN/FMAX, FMADD/FMSUB/FNMADD/FNMSUB, FSGNJ[N|X],
-//                    FCVT.W[U].S / FCVT.S.W[U], FEQ/FLT/FLE, FCLASS, FMV.X.W/FMV.W.X).
-//                    No exception flags, rounding mode ignored (RNE only).
 //   Zicsr            CSR R/W (CSRRW, CSRRS, CSRRC + immediate variants).
 //   Zifencei         FENCE / FENCE.I — implemented as NOP (single-hart, no I-cache).
 //
@@ -41,11 +37,6 @@
 // trampolines. step() never special-cases CLINT addresses.
 
 #include <cstdint>
-#include <xmmintrin.h>          // _mm_sqrt_ss — avoids -O0 libcall to sqrtf.
-
-extern "C" int _fltused = 0;    // MSVC float-ABI marker; required by the linker.
-
-static inline float fsqrt(float x) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x))); }
 
 // Provide our own mem{set,cpy} so aggregate value-init (`cpu = {}`) and other
 // compiler-emitted copies link without a CRT (we build -nodefaultlib).
@@ -65,7 +56,6 @@ extern "C" void* memcpy(void* dst, const void* src, unsigned long long n) {
 
 struct CPU_State {
     uint32_t regs[32];
-    uint32_t fregs[32];
     uint32_t pc;
     int      halted;
     uint64_t mtime;
@@ -114,77 +104,6 @@ static constexpr int32_t s_imm(uint32_t i) {
 // instruction with funct7 == 0x01 traps as an illegal instruction;
 // the guest's compiler lowers * and / to __mulsi3 / __divsi3 libcalls.
 
-// ── F-extension (single-precision) ──────────────────────────────────
-
-static inline float f_get(CPU_State& cpu, int r)          { float v; __builtin_memcpy(&v, &cpu.fregs[r], 4); return v; }
-static inline void  f_set(CPU_State& cpu, int r, float v) { __builtin_memcpy(&cpu.fregs[r], &v, 4); }
-static inline int   f_isnan(CPU_State& cpu, int r) {
-    return (cpu.fregs[r] & 0x7F800000u) == 0x7F800000u && (cpu.fregs[r] & 0x007FFFFFu);
-}
-
-static void exec_fp_opfp(CPU_State& cpu, int rd, int rs1, int rs2, uint32_t f3, uint32_t f7) {
-    switch (f7) {
-        case 0x00: f_set(cpu, rd, f_get(cpu, rs1) + f_get(cpu, rs2));          return;
-        case 0x04: f_set(cpu, rd, f_get(cpu, rs1) - f_get(cpu, rs2));          return;
-        case 0x08: f_set(cpu, rd, f_get(cpu, rs1) * f_get(cpu, rs2));          return;
-        case 0x0C: f_set(cpu, rd, f_get(cpu, rs1) / f_get(cpu, rs2));          return;
-        case 0x2C: f_set(cpu, rd, fsqrt(f_get(cpu, rs1)));                     return;
-        case 0x10: {
-            uint32_t a = cpu.fregs[rs1], b = cpu.fregs[rs2];
-            uint32_t sgn = (f3 == 0) ? b : (f3 == 1) ? ~b : a ^ b;
-            cpu.fregs[rd] = (sgn & 0x80000000u) | (a & 0x7FFFFFFFu);
-            return;
-        }
-        case 0x14: {
-            float fa = f_get(cpu, rs1), fb = f_get(cpu, rs2);
-            int   na = f_isnan(cpu, rs1), nb = f_isnan(cpu, rs2);
-            if      (na && nb) cpu.fregs[rd] = 0x7FC00000u;
-            else if (na)       f_set(cpu, rd, fb);
-            else if (nb)       f_set(cpu, rd, fa);
-            else               f_set(cpu, rd, (f3 == 0) ? (fa < fb ? fa : fb) : (fa > fb ? fa : fb));
-            return;
-        }
-        case 0x50: {
-            int valid = !f_isnan(cpu, rs1) && !f_isnan(cpu, rs2);
-            float fa = f_get(cpu, rs1), fb = f_get(cpu, rs2);
-            uint32_t r = 0;
-            if (valid) {
-                if      (f3 == 2) r = fa == fb;
-                else if (f3 == 1) r = fa <  fb;
-                else if (f3 == 0) r = fa <= fb;
-            }
-            cpu.regs[rd] = r;
-            return;
-        }
-        case 0x60: {
-            float fa = f_get(cpu, rs1);
-            cpu.regs[rd] = (rs2 == 0)
-                ? (f_isnan(cpu, rs1) ? 0x7FFFFFFFu : (uint32_t)(int32_t)fa)
-                : ((f_isnan(cpu, rs1) || fa < 0.0f) ? 0u : (uint32_t)fa);
-            return;
-        }
-        case 0x68:
-            f_set(cpu, rd, rs2 == 0 ? (float)(int32_t)cpu.regs[rs1] : (float)cpu.regs[rs1]);
-            return;
-        case 0x70:
-            if (f3 == 0) { cpu.regs[rd] = cpu.fregs[rs1]; return; }
-            if (f3 == 1) {
-                uint32_t b = cpu.fregs[rs1], sgn = b >> 31, exp = (b >> 23) & 0xFF, m = b & 0x7FFFFF;
-                uint32_t r;
-                if      (exp == 0xFF) r = (m == 0) ? (sgn ? 1u : 128u) : ((m & 0x400000) ? 512u : 256u);
-                else if (exp == 0)    r = (m == 0) ? (sgn ? 8u :  16u) : (sgn ? 4u : 32u);
-                else                  r = sgn ? 2u : 64u;
-                cpu.regs[rd] = r;
-            }
-            return;
-        case 0x78:
-            cpu.fregs[rd] = cpu.regs[rs1];
-            return;
-        default:
-            return;
-    }
-}
-
 // ── Privileged-mode CSR / trap ──────────────────────────────────────
 //
 // Single CSR accessor returning a reference to the backing slot. Reads dereference
@@ -212,7 +131,7 @@ static uint32_t& priv_csr(CPU_State& cpu, uint32_t csrno) {
         case 0x142:             return cpu.csr_scause;
         case 0x143:             return cpu.csr_stval;
         case 0x180:             return cpu.csr_satp;
-        case 0x301:             scratch = 0x40401101u;            return scratch;  // misa (RO)
+        case 0x301:             scratch = 0x40000100u;            return scratch;  // misa (RV32I, RO)
         case 0xF11:             scratch = 0xFF0FF0FFu;            return scratch;  // mvendorid (RO)
         case 0xC00: case 0xB00: case 0xC01: case 0xB01: case 0xC02: case 0xB02:
                                 scratch = (uint32_t) cpu.mtime;        return scratch;
@@ -422,27 +341,10 @@ static constexpr void do_step(CPU_State& cpu) {
         break;
     }
 
-    case 0x07:
-        if (f3 == 2) cpu.fregs[rd] = mem_read<uint32_t>(cpu, (uint32_t)(s1 + i_imm(instr)));
-        break;
-
-    case 0x27:
-        if (f3 == 2) mem_write<uint32_t>(cpu, (uint32_t)(s1 + s_imm(instr)), cpu.fregs[rs2]);
-        break;
-
-    case 0x43: case 0x47: case 0x4B: case 0x4F: {
-        const int rs3 = (int)((instr >> 27) & 0x1F);
-        const float fa = f_get(cpu, rs1), fb = f_get(cpu, rs2), fc = f_get(cpu, rs3);
-        float fr = (opcode == 0x43) ?  fa*fb + fc
-                 : (opcode == 0x47) ?  fa*fb - fc
-                 : (opcode == 0x4B) ? -fa*fb + fc
-                 :                    -fa*fb - fc;
-        f_set(cpu, rd, fr);
-        break;
-    }
-
+    case 0x07: case 0x27:
+    case 0x43: case 0x47: case 0x4B: case 0x4F:
     case 0x53:
-        exec_fp_opfp(cpu, rd, rs1, rs2, f3, f7);
+        trap_cause = 2; trap_tval = instr;      // F-extension removed
         break;
 
     case 0x0F: break;

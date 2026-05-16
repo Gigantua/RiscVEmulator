@@ -41,8 +41,8 @@ Every one of these must be found and fixed by hand.
 
 ## Step 0 — Decide the target ISA string
 
-Pick the exact `-march` strings up front. Removing the M extension entirely:
-- Bare-metal: `rv32i` (or `rv32if` if the example uses hardware float).
+Pick the exact `-march` strings up front. Removing the M/F extensions entirely:
+- Bare-metal: `rv32i`; floating-point C must lower to software libcalls.
 - Linux with A still present: `rv32ia`. If removing A too, Linux becomes
   `rv32i` and needs kernel/libc atomic fallbacks because LR/SC/AMO are often
   hand-written assembly.

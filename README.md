@@ -30,7 +30,7 @@ This project demonstrates that **a simple, readable RISC-V implementation can do
 All of this from ~550 lines of core C++ and a thin C# peripheral layer.
 
 ~~~cpp
-template<bool MExt, bool FExt, bool AExt, bool Priv>
+static __forceinline void do_step(CPU_State& cpu)
 static __forceinline void do_step() {
     if constexpr (Priv) {
         if (check_interrupts()) { regs[0] = 0; mtime++; return; }
@@ -140,31 +140,11 @@ static __forceinline void do_step() {
         trap_tval = instr;
         break;
 
-    case 0x07:  // FLW
-        if constexpr (FExt) if (f3 == 2) fregs[rd] = mem_read<uint32_t>((uint32_t)(s1 + i_imm(instr)));
-        break;
-
-    case 0x27:  // FSW
-        if constexpr (FExt) if (f3 == 2) mem_write<uint32_t>((uint32_t)(s1 + s_imm(instr)), fregs[rs2]);
-        break;
-
-    case 0x43: case 0x47: case 0x4B: case 0x4F:  // FMADD/FMSUB/FNMSUB/FNMADD
-        if constexpr (FExt) {
-            const int rs3 = (int)((instr >> 27) & 0x1F);
-            const float fa = f_get(rs1), fb = f_get(rs2), fc = f_get(rs3);
-            float fr;
-            switch (opcode) {
-                case 0x43: fr =  fa*fb + fc; break;
-                case 0x47: fr =  fa*fb - fc; break;
-                case 0x4B: fr = -fa*fb + fc; break;
-                default:   fr = -fa*fb - fc; break;
-            }
-            f_set(rd, fr);
-        }
-        break;
-
-    case 0x53:  // OP-FP
-        if constexpr (FExt) exec_fp_opfp(instr, rd, rs1, rs2, f3, f7);
+    case 0x07: case 0x27:                  // FLW/FSW
+    case 0x43: case 0x47: case 0x4B: case 0x4F: // FMA family
+    case 0x53:                             // OP-FP
+        trap_cause = 2;
+        trap_tval = instr;
         break;
 
     case 0x0F: break;  // FENCE / FENCE.I — NOP
@@ -445,14 +425,14 @@ Default memory layout:
 | Extension | Status | Notes |
 |-----------|--------|-------|
 | RV32I | ✅ All 40 instructions | |
-| M | ✅ opt-in | `Emulator.EnableMExtension = true` |
-| A | ✅ opt-in | `Emulator.EnableAExtension = true` (required for Linux) |
-| Zicsr | ✅ | When `EnablePrivMode = true` |
-| M/S/U privilege | ✅ opt-in | `Emulator.EnablePrivMode = true` (required for Linux) |
-| F / D (float) | ❌ hardware | Use `softfloat.c` in guest |
-| Interrupts | ✅ | Timer interrupt via CLINT; requires `EnablePrivMode` |
+| M | ❌ | MUL/DIV/REM opcodes trap; use integer libcalls |
+| A | ❌ | LR/SC/AMO opcodes trap |
+| F / D (float) | ❌ hardware | F/D opcodes trap; use `softfloat.c` in guest |
+| Zicsr | ✅ | |
+| M/S/U privilege | ✅ | Always enabled |
+| Interrupts | ✅ | Timer interrupt via CLINT |
 | FENCE | NOP | |
-| EBREAK | halts CPU | |
+| ECALL/EBREAK | traps | |
 
 ---
 

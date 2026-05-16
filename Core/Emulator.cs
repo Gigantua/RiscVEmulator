@@ -4,7 +4,7 @@ using RiscVEmulator.Core.Peripherals;
 namespace RiscVEmulator.Core
 {
     /// <summary>
-    /// RV32I+M+F+A emulator. The native CPU just reads and writes memory at
+    /// RV32I emulator. The native CPU just reads and writes memory at
     /// host_base + guest_addr — no peripheral knowledge, no callbacks.
     ///
     /// The Emulator owns a <see cref="HostMemoryReservation"/> covering the
@@ -54,7 +54,6 @@ namespace RiscVEmulator.Core
         // Compatibility shims — old code set these but the CPU now handles all
         // extensions and privilege levels unconditionally, so they're inert.
         public bool EnableMExtension { get; set; }
-        public bool EnableFExtension { get; set; }
         public bool EnableAExtension { get; set; }
         public bool EnablePrivMode   { get; set; }
         public uint RamOffset        { get; set; }

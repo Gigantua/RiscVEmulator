@@ -2,7 +2,7 @@
  * Pure-integer IEEE 754 single- and double-precision soft-float library.
  *
  * Implements every compiler-rt ABI routine emitted by clang when compiling
- * float/double code for a target with no hardware FPU (e.g. -march=rv32im
+ * float/double code for a target with no hardware FPU (e.g. -march=rv32i
  * -mabi=ilp32 -nostdlib).
  *
  * All arithmetic uses only integer operations so this file never calls itself

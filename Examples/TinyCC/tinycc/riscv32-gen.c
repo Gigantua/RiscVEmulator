@@ -251,7 +251,9 @@ ST_FUNC void load(int r, SValue *sv)
 	} else {
             tcc_error("unimp: load(non-local lval)");
         }
-        EI(opcode, func3, rr, br, fc); // l[bhwd][u] / fl[wd] RR, fc(BR)
+        if (opcode == 0x07)
+            tcc_error("RV32I backend does not emit hardware F loads");
+        EI(opcode, func3, rr, br, fc); // l[bhwd][u] RR, fc(BR)
     } else if (v == VT_CONST) {
         int rb = 0, do32bit = 0;
         assert((!is_float(sv->type.t) && is_ireg(r)) || bt == VT_LDOUBLE);
@@ -271,18 +273,12 @@ ST_FUNC void load(int r, SValue *sv)
         EI(0x13, 0, rr, br, fc); // addi R, s0, FC
     } else if (v < VT_CONST) { /* reg-reg */
         //assert(!fc); XXX support offseted regs
-        if (is_freg(r) && is_freg(v))
-          ER(0x53, 0, rr, freg(v), freg(v), bt == VT_DOUBLE ? 0x11 : 0x10); //fsgnj.[sd] RR, V, V == fmv.[sd] RR, V
+        if (is_freg(r) || is_freg(v))
+          tcc_error("RV32I backend does not emit hardware F register moves");
         else if (is_ireg(r) && is_ireg(v))
           EI(0x13, 0, rr, ireg(v), 0); // addi RR, V, 0 == mv RR, V
         else {
-            int func7 = is_ireg(r) ? 0x70 : 0x78;
-            size = type_size(&sv->type, &align);
-            if (size == 8)
-              func7 |= 1;
-            assert(size == 4 || size == 8);
-            o(0x53 | (rr << 7) | ((is_freg(v) ? freg(v) : ireg(v)) << 15)
-              | ((unsigned)func7 << 25)); // fmv.{w.x, x.w, d.x, x.d} RR, VR
+            tcc_error("unsupported RV32I register move");
         }
     } else if (v == VT_CMP) {
         int op = vtop->cmp_op;
@@ -1111,68 +1107,8 @@ ST_FUNC void gen_opi(int op)
 
 ST_FUNC void gen_opf(int op)
 {
-    int rs1, rs2, rd, dbl, invert;
-    /* For RV32I, LDOUBLE_SIZE==8 so long double == double; fall through to float/double path */
-    gv2(RC_FLOAT, RC_FLOAT);
-    assert(vtop->type.t == VT_DOUBLE || vtop->type.t == VT_FLOAT);
-    dbl = vtop->type.t == VT_DOUBLE;
-    rs1 = freg(vtop[-1].r);
-    rs2 = freg(vtop->r);
-    vtop--;
-    invert = 0;
-    switch(op) {
-    default:
-        assert(0);
-    case '+':
-        op = 0; // fadd
-    arithop:
-        rd = get_reg(RC_FLOAT);
-        vtop->r = rd;
-        rd = freg(rd);
-        ER(0x53, 7, rd, rs1, rs2, dbl | (op << 2)); // fop.[sd] RD, RS1, RS2 (dyn rm)
-        break;
-    case '-':
-        op = 1; // fsub
-        goto arithop;
-    case '*':
-        op = 2; // fmul
-        goto arithop;
-    case '/':
-        op = 3; // fdiv
-        goto arithop;
-    case TOK_EQ:
-        op = 2; // EQ
-    cmpop:
-        rd = get_reg(RC_INT);
-        vtop->r = rd;
-        rd = ireg(rd);
-        ER(0x53, op, rd, rs1, rs2, dbl | 0x50); // fcmp.[sd] RD, RS1, RS2 (op == eq/lt/le)
-        if (invert)
-          EI(0x13, 4, rd, rd, 1); // xori RD, 1
-
-        /* generate VT_CMP output */
-        vset_VT_CMP(TOK_NE);
-        vtop->cmp_r = rd | (0 << 8);
-        break;
-    case TOK_NE:
-        invert = 1;
-        op = 2; // EQ
-        goto cmpop;
-    case TOK_LT:
-        op = 1; // LT
-        goto cmpop;
-    case TOK_LE:
-        op = 0; // LE
-        goto cmpop;
-    case TOK_GT:
-        op = 1; // LT
-        rd = rs1, rs1 = rs2, rs2 = rd;
-        goto cmpop;
-    case TOK_GE:
-        op = 0; // LE
-        rd = rs1, rs1 = rs2, rs2 = rd;
-        goto cmpop;
-    }
+    (void)op;
+    tcc_error("RV32I backend does not emit hardware F arithmetic");
 }
 
 ST_FUNC void gen_cvt_sxtw(void)
@@ -1183,51 +1119,20 @@ ST_FUNC void gen_cvt_sxtw(void)
 
 ST_FUNC void gen_cvt_itof(int t)
 {
-    int rr = ireg(gv(RC_INT)), dr;
-    int u = vtop->type.t & VT_UNSIGNED;
-    int l = (vtop->type.t & VT_BTYPE) == VT_LLONG;
-    /* In RV32I, LDOUBLE_SIZE==8 (same as double) — map VT_LDOUBLE to VT_DOUBLE */
-    int dbl = (t == VT_DOUBLE || t == VT_LDOUBLE) ? 1 : 0;
-    vtop--;
-    dr = get_reg(RC_FLOAT);
-    vtop++;
-    vtop->r = dr;
-    dr = freg(dr);
-    EIu(0x53, 7, dr, rr, ((0x68 | dbl) << 5) | (u ? 1 : 0) | (l ? 2 : 0)); // fcvt.[sd].[wl][u]
+    (void)t;
+    tcc_error("RV32I backend does not emit hardware F conversions");
 }
 
 ST_FUNC void gen_cvt_ftoi(int t)
 {
-    int ft = vtop->type.t & VT_BTYPE;
-    int l = (t & VT_BTYPE) == VT_LLONG;
-    int u = t & VT_UNSIGNED;
-    /* In RV32I, LDOUBLE_SIZE==8 (same as double) — map VT_LDOUBLE to VT_DOUBLE */
-    int dbl = (ft == VT_DOUBLE || ft == VT_LDOUBLE) ? 1 : 0;
-    int rr = freg(gv(RC_FLOAT)), dr;
-    vtop--;
-    dr = get_reg(RC_INT);
-    vtop++;
-    vtop->r = dr;
-    dr = ireg(dr);
-    EIu(0x53, 1, dr, rr, ((0x60 | dbl) << 5) | (u ? 1 : 0) | (l ? 2 : 0)); // fcvt.[wl][u].[sd] rtz
+    (void)t;
+    tcc_error("RV32I backend does not emit hardware F conversions");
 }
 
 ST_FUNC void gen_cvt_ftof(int dt)
 {
-    int st = vtop->type.t & VT_BTYPE, rs, rd;
-    dt &= VT_BTYPE;
-    /* In RV32I, LDOUBLE_SIZE==8 — treat VT_LDOUBLE as VT_DOUBLE */
-    if (st == VT_LDOUBLE) st = VT_DOUBLE;
-    if (dt == VT_LDOUBLE) dt = VT_DOUBLE;
-    if (st == dt)
-      return;
-    rs = gv(RC_FLOAT);
-    rd = get_reg(RC_FLOAT);
-    if (dt == VT_DOUBLE)
-      EI(0x53, 0, freg(rd), freg(rs), 0x21 << 5); // fcvt.d.s RD, RS (no rm)
-    else
-      EI(0x53, 7, freg(rd), freg(rs), (0x20 << 5) | 1); // fcvt.s.d RD, RS (dyn rm)
-    vtop->r = rd;
+    (void)dt;
+    tcc_error("RV32I backend does not emit hardware F conversions");
 }
 
 /* increment tcov counter */

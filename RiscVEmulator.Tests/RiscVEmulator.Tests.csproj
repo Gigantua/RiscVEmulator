@@ -37,6 +37,7 @@
     <None Update="Programs\input_test.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\audio_test.c"   CopyToOutputDirectory="Always" />
     <None Include="Programs\atomic_trap.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\f_trap.c"      CopyToOutputDirectory="Always" />
     <None Update="Programs\runtime_ops.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\malloc_test.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\vfs_test.c"     CopyToOutputDirectory="Always" />
