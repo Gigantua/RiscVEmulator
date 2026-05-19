@@ -1,427 +1,173 @@
-# RV32I RISC-V Emulator
+# RISC-V Emulator — three cores, one design
 
-> **A surprisingly small emulator that runs Linux, Doom, and a C compiler.**
+> ## 🌍 The world's first Linux to boot on a *bare* RV32I core.
+>
+> No `M`, no `A`, no `F`, no `C` — **not even `Zicsr`**. A real Linux 6.6
+> kernel, a graphical desktop, and Doom, all running on the 40 base integer
+> instructions of RV32I and nothing else.
 
-The entire CPU is a single C++ file. The instruction decoder is a `switch` statement.
-There are no JIT, no MMU, no page tables. Plays Doom at full speed,
-and runs TinyCC — a C compiler compiling C *inside the emulator*.
-Boots Linux 6.1
+![Linux](https://img.shields.io/badge/boots-Linux%206.6-brightgreen)
+![Alpine](https://img.shields.io/badge/boots-Alpine%20riscv64-0d597f)
+![Doom](https://img.shields.io/badge/runs-Doom-red)
+![TinyCC](https://img.shields.io/badge/compiles-C%20in%20TinyCC-blue)
+![.NET 10](https://img.shields.io/badge/.NET-10-blueviolet)
 
-This project demonstrates that **a simple, readable RISC-V implementation can do remarkable things.**
+Most "RISC-V Linux" quietly assumes **RV32IMA** — multiply, divide and
+atomics in hardware. The canonical tiny emulator is even *named* for them:
+`mini-rv32ima`. This repository goes the other way. It strips the CPU down to
+the **pure RV32I base integer ISA** — no multiply, no atomics, no float, no
+compressed encodings, and no control-and-status registers at all — and *still*
+boots a real Linux kernel to a windowed Microwindows desktop.
 
-![Doom](https://img.shields.io/badge/runs-Doom-red) ![Linux 6.1](https://img.shields.io/badge/boots-Linux%206.1-brightgreen) ![TinyCC](https://img.shields.io/badge/compiles-C%20in%20TinyCC-blue) ![.NET 10](https://img.shields.io/badge/.NET-10-blueviolet)
+To make that work, the entire image — kernel, uClibc-ng, busybox, every
+package — is rebuilt so that not a single `mul`, `div`, `rem`, `amo`, `lr`,
+`sc` or float opcode is ever emitted; multiply and divide lower to pure
+shift-and-add libcalls. And because there is no `Zicsr`, there are no CSRs:
+traps spill the register file into a memory-mapped **trap-frame page** and
+return through a fixed resume gateway, since the base ISA has no `MRET`.
 
----
-
-## What it can do
-
-| | |
-|---|---|
-| 🎮 **Doom** | Full DOOM running in RISCV c++ emulation layer. Two flavors: bare-metal PureDOOM (`Examples.Doom`) and a windowed `doomgeneric` build that runs inside the Linux desktop. |
-| 🐧 **Linux 6.6 + desktop** | Real nommu kernel boots to a **graphical Microwindows desktop** with taskbar, terminal, clock, eyes, calc, chess, tetris, etc. Drag windows, click buttons, type into apps. |
-| 💻 **Linux Terminal app** | A nano-X terminal-emulator window (`rvemu-term`) runs `sh -i` over a real Unix98 pty with full VT100 escape parsing — nano, vi, less, top all work. |
-| 📦 **Self-hosted OPKG feed** | `Examples.Linux.Packageserver` drives buildroot to cross-compile any of ~2700 buildroot packages, wraps the output as `.ipk`, and serves them over HTTP. The guest's `rvpkg` installs them like a real package manager. |
-| 🛜 **Networking** | Host-loopback NAT through libslirp — `wget`, DHCP, all standard sockets. |
-| 🔊 **Audio + RTC + MIDI** | PCM, real-time clock, and MIDI output peripherals — wired into the bare-metal Doom and reachable from any guest userspace via `/dev/snd` (ALSA bridge). |
-| ⚙️ **TinyCC** | A C compiler running inside the emulator, compiling C programs. |
-| 🎬 **Video** | Software-rendered frame sequences at real-time speed. |
-| 🌄 **Voxel terrain** | Height-map voxel renderer written entirely in guest C. |
-
-All of this from ~355 lines of core C++ and a thin C# peripheral layer.
-
-The Linux build runs a real RV32I kernel ported to the CPU's memory-mapped
-trap-frame ABI: there are no CSRs, traps spill the register file to a fixed
-RAM page, and the kernel returns from a trap by jumping to a resume gateway at
-`0xFFFF0004` (the base ISA has no `MRET`). Userspace enters the kernel with an
-ordinary `ecall`.
-
-The base CPU is a pure integer datapath — it executes the 40 RV32I
-instructions and hands anything else (a `SYSTEM` opcode, or a non-RV32I
-encoding) back to the surrounding trap unit as an exception:
-
-~~~cpp
-// Execute one base RV32I instruction. On success advances pc and returns
-// {EXC_NONE}. On a SYSTEM opcode or a non-RV32I encoding it returns the
-// exception and leaves pc on the offending instruction.
-static CpuException cpu_step(CPU_State& cpu) {
-    const uint32_t instr = mem_read<uint32_t>(cpu, cpu.pc);
-    const int      rd    = (instr >>  7) & 0x1F;
-    const uint32_t f3    = (instr >> 12) & 0x7;
-    const uint32_t f7    = (instr >> 25) & 0x7F;
-    const uint32_t u1    = cpu.regs[(instr >> 15) & 0x1F];   // rs1
-    const uint32_t u2    = cpu.regs[(instr >> 20) & 0x1F];   // rs2
-    const int32_t  s1    = (int32_t)u1;
-    const int32_t  s2    = (int32_t)u2;
-    uint32_t nextpc      = cpu.pc + 4;
-
-    switch (instr & 0x7F) {
-
-    case 0x37: cpu.regs[rd] = instr & 0xFFFFF000u;                        break;  // LUI
-    case 0x17: cpu.regs[rd] = cpu.pc + (instr & 0xFFFFF000u);             break;  // AUIPC
-    case 0x6F: cpu.regs[rd] = cpu.pc + 4; nextpc = cpu.pc + j_imm(instr); break;  // JAL
-    case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;               // JALR
-                 cpu.regs[rd] = cpu.pc + 4; nextpc = t;                   break; }
-
-    case 0x63: {                                                                 // BRANCH
-        int taken = 0;
-        switch (f3) {
-            case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
-            case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
-            case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
-        }
-        if (taken) nextpc = cpu.pc + b_imm(instr);
-        break;
-    }
-
-    case 0x03: {                                                                 // LOAD
-        uint32_t addr = (uint32_t)(s1 + i_imm(instr));
-        switch (f3) {
-            case 0: cpu.regs[rd] = (uint32_t)(int8_t) mem_read<uint8_t> (cpu, addr); break;
-            case 1: cpu.regs[rd] = (uint32_t)(int16_t)mem_read<uint16_t>(cpu, addr); break;
-            case 2: cpu.regs[rd] =                    mem_read<uint32_t>(cpu, addr); break;
-            case 4: cpu.regs[rd] =                    mem_read<uint8_t> (cpu, addr); break;
-            case 5: cpu.regs[rd] =                    mem_read<uint16_t>(cpu, addr); break;
-        }
-        break;
-    }
-
-    case 0x23: {                                                                 // STORE
-        uint32_t addr = (uint32_t)(s1 + s_imm(instr));
-        switch (f3) {
-            case 0: mem_write<uint8_t> (cpu, addr, (uint8_t) u2); break;
-            case 1: mem_write<uint16_t>(cpu, addr, (uint16_t)u2); break;
-            case 2: mem_write<uint32_t>(cpu, addr,           u2); break;
-        }
-        break;
-    }
-
-    case 0x13: {                                                                 // OP-IMM
-        const int32_t imm = i_imm(instr);
-        const int     sh  = (instr >> 20) & 0x1F;
-        // Only SLLI/SRLI/SRAI (f3 1/5) carry a funct7; reserved values illegal.
-        if ((f3 == 1 && f7 != 0x00) || (f3 == 5 && f7 != 0x00 && f7 != 0x20))
-            return { EXC_ILLEGAL, instr };
-        uint32_t r = 0;
-        switch (f3) {
-            case 0: r = (uint32_t)(s1 + imm);                         break;  // ADDI
-            case 1: r = u1 << sh;                                     break;  // SLLI
-            case 2: r = s1 < imm           ? 1u : 0u;                 break;  // SLTI
-            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                 break;  // SLTIU
-            case 4: r = u1 ^ (uint32_t)imm;                           break;  // XORI
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh; break;  // SRAI/SRLI
-            case 6: r = u1 | (uint32_t)imm;                           break;  // ORI
-            case 7: r = u1 & (uint32_t)imm;                           break;  // ANDI
-        }
-        cpu.regs[rd] = r;
-        break;
-    }
-
-    case 0x33: {                                                                 // OP
-        // funct7 must be 0x00, or 0x20 for SUB/SRA (f3 0/5); all else illegal.
-        if (f7 != 0x00 && !(f7 == 0x20 && (f3 == 0 || f3 == 5)))
-            return { EXC_ILLEGAL, instr };
-        const int sh = s2 & 0x1F;
-        uint32_t r = 0;
-        switch (f3) {
-            case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;  // SUB/ADD
-            case 1: r = u1 << sh;                                              break;  // SLL
-            case 2: r = s1 < s2 ? 1u : 0u;                                     break;  // SLT
-            case 3: r = u1 < u2 ? 1u : 0u;                                     break;  // SLTU
-            case 4: r = u1 ^ u2;                                               break;  // XOR
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;          break;  // SRA/SRL
-            case 6: r = u1 | u2;                                               break;  // OR
-            case 7: r = u1 & u2;                                               break;  // AND
-        }
-        cpu.regs[rd] = r;
-        break;
-    }
-
-    case 0x0F: break;                                                            // FENCE → NOP (single-hart)
-
-    case 0x73: return { EXC_SYSTEM,  instr };   // SYSTEM — belongs to the environment
-    default:   return { EXC_ILLEGAL, instr };   // not an RV32I encoding
-    }
-
-    cpu.regs[0] = 0;       // x0 is hardwired to zero
-    cpu.pc = nextpc;
-    return { EXC_NONE, 0 };
-}
-~~~
+That is the punchline. The rest of the repository is the ladder that leads up
+to it and the 64-bit world that grows out of it.
 
 ---
 
-## Features
+## The three cores
 
-- **RV32I** — all 40 base integer instructions
-- **No M-extension** — `MUL` / `MULH` / `DIV` / `REM` trap; guest code uses libcalls
-- **No A-extension** — `LR.W`, `SC.W`, and `AMO*` trap as illegal instructions
-- **M/U privilege path** — ECALL/EBREAK and timer/external interrupts via a hardware trap-frame page; `MRET`, `WFI`, all CSR ops, PMP/machine-ID/ENVCFG/SEED, and S-mode trap illegal
-- **Memory-mapped peripherals** — UART, framebuffer, keyboard, mouse, audio, RTC, CLINT
-- **ELF loader** — loads `PT_LOAD` segments from standard ELF32 binaries
-- **SDL2 frontend** — hardware-accelerated window at ~120 fps via [Silk.NET.SDL](https://github.com/dotnet/Silk.NET)
-- **Bare-metal C runtime** — libc, malloc, softfloat, VFS, syscall shim for writing guest programs in C
-- **Integration test suite** — compiles C programs to RV32I ELF and asserts on output
+This is a monorepo of **three sibling emulators**. They share one design — a
+single-file C++ CPU hot path wrapped in a thin C# peripheral shell — and form
+a deliberate capability ladder from the most minimal RISC-V that can run Linux
+to a full 64-bit machine running a real distribution.
+
+| Folder | CPU ISA | Privilege / trap model | Boots | Flagship demo |
+|--------|---------|------------------------|-------|---------------|
+| [`RiscVEmulator-RV32I`](RiscVEmulator-RV32I/) | `RV32I` — base only | **No CSRs.** Memory-mapped trap-frame page; `0xFFFF0004` resume gateway | Linux 6.6 nommu | Microwindows desktop + Doom |
+| [`RiscVEmulator-RV32IMA_Zicsr`](RiscVEmulator-RV32IMA_Zicsr/) | `RV32I` + `Zicsr` + `Zifencei` | Architectural CSRs; M/S/U modes; trap delegation; `MRET`/`SRET`/`WFI` | Linux 6.1 nommu | bare-metal Doom + TinyCC |
+| [`RiscVEmulator-RV64GC`](RiscVEmulator-RV64GC/) | `RV64GC` — `IMAFDC` | Full M/S/U; **Sv39 MMU**; SBI firmware shim | Alpine Linux `riscv64` | IceWM/XFCE desktop, `apk` |
+
+Each folder is a **self-contained Visual Studio solution** (`RiscVEmulator.sln`)
+with its own native core, peripherals, examples and tests. Pick a folder, open
+its solution, build, run — they do not depend on each other.
+
+### `RiscVEmulator-RV32I` — the bare-metal world first
+
+The hero. A pure integer datapath: 40 RV32I instructions, ~355 lines of core
+C++, and nothing else. Anything outside the base ISA — a `SYSTEM` opcode, an
+`M`/`A`/`F` encoding — is handed back to the surrounding trap unit as an
+exception. There are **no architectural CSRs**: `csrr`/`csrw`/`mret`/`wfi` all
+trap as illegal. Traps work by spilling `epc` + `x1..x31` + `status`/`tval`/
+`cause` into a fixed 36-word landing pad whose layout *is* the Linux
+`struct pt_regs`, so the kernel's own trap frame is the hardware trap frame —
+no translation copy.
+
+It boots a real Linux 6.6 nommu kernel to a graphical **Microwindows nano-X
+desktop** — taskbar, terminal (`sh -i` over a real pty with VT100 parsing),
+clock, chess, tetris, calculator, and a windowed `doomgeneric`. A self-hosted
+package feed (`rvpkg` + `Examples.Linux.Packageserver`) cross-builds and
+installs ~2700 buildroot packages. → [full README](RiscVEmulator-RV32I/README.md)
+
+### `RiscVEmulator-RV32IMA_Zicsr` — the architectural-privilege build
+
+The same RV32I integer core, but with the **standard RISC-V privileged
+architecture** restored: real `Zicsr` CSRs (`mstatus`, `mtvec`, `mepc`,
+`medeleg`/`mideleg`, `satp`, …), M/S/U modes, trap delegation, and
+`MRET`/`SRET`/`WFI`. This is the conventional trap model — the one a stock
+`mini-rv32ima`-class kernel expects — and it is what makes this folder a
+separate variant from the trap-frame-page base core above.
+
+*(Naming note: the `_Zicsr` suffix is the operative distinction. The integer
+datapath is still RV32I — `M` lowers to libcalls and `A`/`F` opcodes trap; the
+`IMA` in the folder name reflects the privileged-spec lineage and the
+`mini-rv32ima` image family it boots.)* → [full README](RiscVEmulator-RV32IMA_Zicsr/README.md)
+
+### `RiscVEmulator-RV64GC` — the 64-bit, MMU, real-distro build
+
+The full machine. A single-file `RV64GC` interpreter — `IMAFDC` + `Zicsr` +
+`Zifencei` — with a three-level **Sv39 MMU** (superpages, hardware A/D bits,
+256-entry TLB) and an **SBI firmware shim**, so the kernel boots directly in
+S-mode. It boots a genuine, unmodified **Alpine Linux `riscv64`** userland,
+runs a windowed **IceWM/XFCE desktop**, installs software with the real `apk`
+package manager from ~10 000 official Alpine packages, has audio, networking
+and a persistent 3 GiB virtio-blk disk, and still runs Doom and TinyCC.
+→ [full README](RiscVEmulator-RV64GC/README.md)
 
 ---
 
-## Repository Layout
+## One design, three times
 
-```
-Core/                    C# emulator engine (P/Invoke shell, memory bus, peripherals)
-Native/                  C++ CPU hot path (single-file, ClangCL vcxproj)
-Frontend/                SDL2 window (rendering, input, audio) via Silk.NET.SDL
-Examples/
-  Doom/                  Full Doom port (PureDOOM, compiles at launch, bare metal)
-  Linux/                 Boot Linux 6.6 nommu kernel + nano-X desktop (--gui)
-  Linux.Build_RV32i/     WSL-driven buildroot prepare: toolchain, kernel,
-                         busybox, Microwindows nano-X, rvemu-{input,taskbar,term},
-                         doomgeneric (windowed), etc. → packed initramfs
-  Linux.Packageserver/   Interactive REPL: pick from ~2700 buildroot packages,
-                         cross-build, wrap as .ipk, serve OPKG feed at :8080
-  Runner/                Generic ELF runner with all peripherals wired
-  Video/                 Software-rendered video playback demo
-  Voxel/                 Voxel terrain renderer demo
-  Sound/                 PCM audio playback demo
-  Input/                 Keyboard and mouse input demo
-  TinyCC/                TinyCC C compiler running inside the emulator
-RiscVEmulator.Tests/     Integration tests (compile C → ELF → run → assert)
-  Programs/              C test programs + linker.ld
-  Runtime/               Bare-metal C library (libc, malloc, softfloat, syscalls, VFS)
-```
-
----
-
-## Architecture
+All three cores are built the same way — that shared architecture is the
+reason a 40-instruction CPU and a full RV64GC machine can live in one repo:
 
 ```
 Emulator (C# P/Invoke shell)
-  │  pins Memory.Data[] → passes IntPtr to native
+  │  reserves the guest's physical address space on the host up front,
+  │  hands the base pointer to the native DLL — both sides share the VA range
   │
-  ├── rv32i_core.dll  (C++ hot path — ClangCL)
-  │     CPU registers, PC, CSRs, mtime — all live in native
-  │     step loop runs entirely in C++
-  │     MMIO / ECALL → callbacks into C#
+  ├── rv32i_core.dll / rv64gc_core.dll   (C++ hot path — ClangCL)
+  │     entire CPU state in one CPU_State struct; do_step(CPU_State&)
+  │     every guest access is one *(volatile T*)(mem + addr) dereference
   │
-  ├── MemoryBus        Routes MMIO by address range → peripheral
-  │     ├── Memory     Pinned byte-array RAM (shared with C++, zero-copy)
-  │     └── IPeripheral[]  UART, timer, framebuffer, keyboard, mouse, audio, RTC
+  ├── MemoryBus + Peripherals
+  │     plain committed pages for RAM / framebuffer / audio PCM;
+  │     guarded PAGE_NOACCESS pages for MMIO registers
   │
-  └── ElfLoader        Loads PT_LOAD segments, returns entry point
+  ├── MmioDispatcher (Windows VEH)
+  │     access violations on guarded pages are decoded from the faulting
+  │     x86-64 MOV and dispatched to IPeripheral.Read/Write — the CPU
+  │     never knows MMIO happened
+  │
+  └── ElfLoader   PT_LOAD segments / RISC-V flat Image header
 ```
 
-The C# layer allocates RAM and pins it with `GCHandle`. The native DLL receives an `IntPtr` and reads/writes directly — no copies. MMIO accesses above the RAM ceiling call back into C#, which routes them through `MemoryBus` to the appropriate peripheral.
+- **Native single-file CPU** — the step loop is one `switch` statement in one
+  C++ file, compiled with the ClangCL toolset, linked with no CRT.
+- **Zero-copy memory** — the C# host reserves the guest address space and the
+  native CPU dereferences it directly. No translation, no per-access dispatch.
+- **MMIO via Windows VEH** — guarded pages fault; a vectored exception handler
+  turns the fault into a peripheral call. The CPU has zero MMIO awareness.
+- **C# is just the shell** — peripherals (UART, framebuffer, keyboard, mouse,
+  audio, RTC, CLINT, PLIC, virtio-net/blk), the SDL2 frontend, the ELF loader
+  and the test harness are all managed code.
 
 ---
 
-## Memory Map
+## Build & run
 
-| Address | Size | Device |
-|---------|------|--------|
-| `0x00000000` | 16 MB (configurable) | RAM |
-| `0x02000000` | 64 KB | CLINT Timer (standard SiFive layout) |
-| `0x10000000` | 256 B | UART 16550 (console I/O) |
-| `0x10001000` | 256 B | Keyboard controller (scancode FIFO) |
-| `0x10002000` | 256 B | Mouse controller (relative deltas + buttons) |
-| `0x10003000` | 256 B | Real-Time Clock (wall-clock µs / ms / epoch) |
-| `0x20000000` | 256 KB | Framebuffer (320×200 RGBA8888) |
-| `0x20100000` | 256 B | Display control (resolution, vsync, palette) |
-| `0x30000000` | 1 MB | Audio PCM buffer |
-| `0x30100000` | 256 B | Audio control (sample rate, channels, play/stop) |
+Each folder builds independently. Pick one, then:
 
-See [MEMORY_MAP.md](MEMORY_MAP.md) for full register-level details.
+```powershell
+# Example: the bare RV32I core
+cd RiscVEmulator-RV32I
 
----
+# Build the C++ core + every C# project
+& "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe" `
+    RiscVEmulator.sln -p:Platform=x64
 
-## Prerequisites
+# Run a demo (bare-metal Doom — no WSL needed)
+dotnet run --no-build --project Examples\Doom -p:Platform=x64
+```
+
+**Prerequisites** (host is Windows-only):
 
 | Tool | Purpose |
 |------|---------|
-| [.NET 10 SDK](https://dotnet.microsoft.com/download) | Build and run C# projects |
-| Visual Studio 2022 / 2026 with **C++ workload + Clang/LLVM** | Build native `rv32i_core.dll` (ClangCL toolset) |
-| [LLVM/Clang](https://releases.llvm.org/) in `PATH` | Cross-compile bare-metal RV32I ELF guest programs |
-| `lld` linker in `PATH` | Link bare-metal RV32I ELF binaries (`-fuse-ld=lld`) |
-| **WSL2 + Ubuntu** (for the Linux desktop) | `Examples.Linux.Build_RV32i` cross-compiles a nommu-uClibc rootfs + Microwindows desktop + ~30 packages via buildroot inside WSL |
+| [.NET 10 SDK](https://dotnet.microsoft.com/download) | Build and run the C# projects |
+| Visual Studio 2022 / 2026 + **C++ workload + Clang/LLVM** | Build the native core (ClangCL toolset) |
+| [LLVM/Clang](https://releases.llvm.org/) + `lld` in `PATH` | Cross-compile bare-metal RISC-V ELF guests |
+| **WSL2 + Ubuntu** | Only for building the Linux images (buildroot runs in WSL) |
 
-> **Windows only** (host). Bare-metal demos work without WSL; the Linux desktop / package feed needs it.
-
----
-
-## Build
-
-```powershell
-# Full solution — builds C++ DLL and all C# projects
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" RiscVEmulator.sln
-```
-
-The native `rv32i_core.dll` is automatically copied to every C# output directory via `ProjectReference`.
+See each folder's `README.md` for the full, variant-specific build and run
+instructions, and its `CLAUDE.md` / `AGENTS.md` for design notes.
 
 ---
 
-## Examples
+## Which one do I want?
 
-### Doom
+- **Want the headline?** → [`RiscVEmulator-RV32I`](RiscVEmulator-RV32I/) —
+  Linux on a CPU with literally nothing but the base integer ISA.
+- **Want the textbook RISC-V privileged model** (CSRs, `mtvec`, `MRET`, trap
+  delegation)? → [`RiscVEmulator-RV32IMA_Zicsr`](RiscVEmulator-RV32IMA_Zicsr/).
+- **Want a real desktop distro, an MMU and a package manager?** →
+  [`RiscVEmulator-RV64GC`](RiscVEmulator-RV64GC/).
 
-The classic. Compiles `doom_main.c` (using [PureDOOM](https://github.com/Daivuk/PureDOOM)) to RV32I ELF at startup, then runs it with a real `doom1.wad`.
-
-```powershell
-cd Examples\Doom\bin\Debug\net10.0
-dotnet Examples.Doom.dll [--wad path\to\doom.wad] [--scale 3] [--no-grab]
-```
-
-- Mouse is grabbed by default; press **Escape** or **Alt+F4** to exit.
-- `--no-m-ext` disables the M-extension (much slower — avoid unless testing).
-
-### Linux desktop
-
-Boots Linux 6.6 (nommu, uClibc) to a **graphical Microwindows nano-X desktop**.
-Run with `--gui` to get an SDL window showing the framebuffer + a taskbar:
-
-```powershell
-dotnet run --no-build --project Examples\Linux -p:Platform=x64 -- --gui
-```
-
-What you get out of the box (everything is a real nano-X client):
-
-- **Terminal** — `rvemu-term`, a Microwindows window running `sh -i` over a Unix98 pty. Sets `TERM=vt100` so ncurses apps work; full VT100 escape parsing (cursor motion, ED/EL, SGR). Backspace, line editing, Ctrl-C all work.
-- **Doom** — `doomgeneric` ported to render into a nano-X window via `GrArea()`. Movable, focusable, close-box. Plays the shareware WAD.
-- **Clock / Eyes / Chess / Tetris / World / Mine / Calculator / Hello** — standard Microwindows demos. Taskbar reads `/etc/rvemu-launchers.d/*.desktop` and dynamically picks up new entries — install a package, click the new button within a second.
-- **Mouse capture** — Esc releases pointer grab; click back in the window to re-capture. Keyboard layout-aware (German/French/Dvorak all type the same Linux KEY_* as US).
-- **Window manager** — nanowm; drag titlebars, alt-tab between apps.
-
-Quick build (needs WSL2 + Ubuntu — the prepare drives buildroot in WSL):
-
-```powershell
-# First-time setup builds buildroot toolchain, kernel, busybox, nano-X, taskbar (~30-40 min)
-dotnet run --no-build --project Examples\Linux.Build_RV32i -p:Platform=x64
-# Then boot:
-dotnet run --no-build --project Examples\Linux -p:Platform=x64 -- --gui
-```
-
-Log in as **root** (no password) on the serial console too. Press **Ctrl+C** in the host shell to exit the emulator.
-
-Options:
-```
---kernel <path>   Use a custom kernel flat binary
---dtb    <path>   Use a custom DTB
---ram    <MB>     Guest RAM in MB (default: 96; 96 minimum for the desktop)
---gui             Open the SDL framebuffer window
---download        Fetch the legacy pre-built mini-rv32ima kernel (serial-only mode)
-```
-
-The Build_RV32i kernel is built for `rv32i` and labels its boot banner with
-`-rv32i`; a `mini-rv32ima` banner means you are running the legacy downloaded
-image or a stale cache. The kernel and DTB are cached in
-`~/.cache/riscvemu/linux/`.
-
-### Self-hosted package feed
-
-`Examples.Linux.Packageserver` is an interactive REPL that drives buildroot to cross-build any of buildroot's ~2700 packages and serves the results as an opkg-compatible `.ipk` feed over HTTP at `http://localhost:8080` (reachable from the guest as `http://10.0.2.2:8080` via libslirp NAT).
-
-Host:
-```
-> search nano                    # find packages buildroot knows about
-> add nano bc dropbear           # pick what you want
-> build                          # cross-build, only un-cached packages
-> rebuild doomgeneric            # force rebuild a cached package
-> run                            # build + serve feed-cache/
-```
-
-Guest, in **Terminal**:
-```
-rvpkg update                     # pull Packages index from the host
-rvpkg list                       # see what's available
-rvpkg install nano               # download .ipk + extract to /
-```
-
-`rvpkg` is a 30-line POSIX-shell installer (no opkg/dpkg — those need MMU + wchar). If a package ships a `/etc/rvemu-launchers.d/*.desktop` file, the desktop's taskbar adds a button for it within ~1 second of install.
-
-Caveats: packages calling `dlopen` (SDL2, anything plugin-loading), or `fork()` directly (vfork is fine) won't build for nommu+uClibc. Pure-C CLI tools (bc, nano, less, vim, dropbear, lynx) work out of the box. ~30 packages from the curated catalog have been verified.
-
-### Runner
-
-Generic ELF runner. Wires up all peripherals and opens an SDL window.
-
-```powershell
-dotnet Examples.Runner.dll <elf-file> [--scale 3] [--ram 16] [--m-ext] [--load <file> <hex-addr>]
-```
-
-### Other demos
-
-| Example | Description |
-|---------|-------------|
-| `Examples.Video` | Software video renderer — plays a raw frame sequence |
-| `Examples.Voxel` | Voxel terrain with height-map rendering |
-| `Examples.Sound` | PCM audio playback via the audio peripheral |
-| `Examples.Input` | Keyboard and mouse event demo |
-| `Examples.TinyCC` | [TinyCC](https://bellard.org/tcc/) running inside the emulator — a C compiler in C |
-
----
-
-## Tests
-
-```powershell
-dotnet test --no-build RiscVEmulator.Tests
-```
-
-Tests compile small C programs with clang → RV32I ELF, load them into the emulator, run them, and assert on console output and exit code. The bare-metal runtime (`Runtime/`) provides libc, malloc, softfloat, and a VFS shim.
-
-**Requirements:** `clang` and `lld` for `riscv32-unknown-elf` must be in `PATH`.
-
----
-
-## Writing Guest Programs
-
-Guest programs are ordinary C compiled for bare-metal RV32I:
-
-```bash
-clang --target=riscv32-unknown-elf -march=rv32i -mabi=ilp32 \
-      -nostdlib -O3 -fuse-ld=lld \
-      -T RiscVEmulator.Tests/Programs/linker.ld \
-      my_program.c RiscVEmulator.Tests/Runtime/runtime.c \
-      RiscVEmulator.Tests/Runtime/libc.c \
-      -o my_program.elf
-```
-
-The runtime provides:
-- `printf` / `puts` / `scanf` / string functions (via UART MMIO)
-- `malloc` / `free` (heap grows upward from BSS end)
-- Soft-float and soft-double (IEEE 754 in software)
-- VFS with `open` / `read` / `write` / `lseek`
-- Syscall shim (`exit`, `write`) over `ECALL`
-
-Default memory layout:
-```
-0x00001000   ELF entry point
-     ↓       .text / .rodata / .data / .bss
-     ↓       heap (grows up)
-     ↑       stack (grows down)
-0x009FFF00   initial stack pointer
-```
-
----
-
-## ISA Support
-
-| Extension | Status | Notes |
-|-----------|--------|-------|
-| RV32I | ⚠️ minus FENCE | FENCE traps illegal in this emulator |
-| M | ❌ | MUL/DIV/REM opcodes trap; use integer libcalls |
-| A | ❌ | LR/SC/AMO opcodes trap |
-| F / D (float) | ❌ hardware | F/D opcodes trap; use `softfloat.c` in guest |
-| Zicsr | ✅ | |
-| M/U privilege | ✅ partial | WFI, PMP/machine-ID/ENVCFG/SEED, SRET/S-mode CSRs trap illegal |
-| Interrupts | ✅ | Timer interrupt via CLINT |
-| FENCE / Zifencei | ❌ / ❌ | Both trap illegal |
-| ECALL/EBREAK | traps | |
-
----
-
-## Syscalls (ECALL)
-
-| a7 | Name | Behavior |
-|----|------|----------|
-| 64 | `write` | Output bytes to `UartDevice.OutputHandler` |
-| 93 | `exit` | Halt emulator, set `ExitCode = a0` |
-| 94 | `exit_group` | Same as `exit` |
-
-Other syscall numbers are silently ignored. The runtime in `Runtime/syscalls.c` maps additional POSIX calls (time, file I/O via VFS) onto these.
+All three play Doom. All three run a C compiler inside the emulator. Only one
+of them does it on a bare RV32I core — and that one had never been done before.

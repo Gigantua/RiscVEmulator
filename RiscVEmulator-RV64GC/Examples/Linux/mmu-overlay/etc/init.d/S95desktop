@@ -1,0 +1,5 @@
+#!/bin/sh
+# NetSurf (option a) is launched by the /etc/inittab `console` respawn
+# entry — running it there gives it a controlling tty, which SDL 1.2's
+# fbcon driver requires. This init script is intentionally a no-op.
+exit 0

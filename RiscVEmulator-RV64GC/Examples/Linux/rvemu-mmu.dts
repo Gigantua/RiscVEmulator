@@ -1,0 +1,77 @@
+/dts-v1/;
+
+/*
+ * Device tree for the MMU (Sv32) RV32 Linux build.
+ *
+ * Paired with `Examples.Linux --mmu`, which boots the buildroot
+ * qemu_riscv32_virt kernel in S-mode with the emulator acting as SBI
+ * firmware (see Native/rv32i_core.cpp, rv32i_set_sbi_mode).
+ *
+ * Deliberately minimal: one hart, one RAM bank, one polled ns16550 UART.
+ * No CLINT node — the S-mode timer is driven through SBI set_timer. No
+ * PLIC node — the UART has no `interrupts` property, so the 8250 driver
+ * falls back to its polling timer (TX + RX both work without an IRQ
+ * controller). A PLIC can be layered on once interrupt routing is wired.
+ */
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "rvemu,mmu";
+	model = "rvemu RV32 Sv32";
+
+	chosen {
+		/* earlycon=sbi → first printk goes through the emulator's SBI
+		 * DBCN console; console=ttyS0 → the 8250 takes over after probe. */
+		bootargs = "console=ttyS0 earlycon=sbi";
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* Matches TIMEBASE_HZ in rv32i_core.cpp and the mtime tick rate. */
+		timebase-frequency = <60000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	/* 512 MB at the conventional RISC-V RAM base — headroom for the
+	 * initramfs unpacked into tmpfs plus the kernel working set.
+	 * Must match the --ram value passed to Examples.Linux --mmu. */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x20000000>;
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		uart0: serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x10000000 0x100>;
+			clock-frequency = <3686400>;
+			reg-shift = <0>;
+		};
+	};
+};

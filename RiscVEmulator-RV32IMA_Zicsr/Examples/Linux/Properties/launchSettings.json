@@ -1,0 +1,13 @@
+{
+  "profiles": {
+    "Examples.Linux": {
+      "commandName": "Project",
+      "commandLineArgs": "--download",
+      "nativeDebugging": false,
+      "environmentVariables": {
+        "COMPlus_EnableDiagnostics": "0",
+        "DOTNET_EnableDiagnostics": "0"
+      }
+    }
+  }
+}

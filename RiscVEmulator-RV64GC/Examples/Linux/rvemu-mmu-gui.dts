@@ -1,0 +1,105 @@
+/dts-v1/;
+
+/*
+ * Device tree for the MMU (Sv32) RV32 Linux build in GUI mode
+ * (`Examples.Linux --mmu --gui`) — the NetSurf desktop.
+ *
+ * Extends rvemu-mmu.dts with:
+ *   - a simple-framebuffer at 0x9FC00000 (the last 4 MiB of the bank);
+ *     /memory stops at 0x9FC00000 so the kernel never allocates the FB;
+ *   - a PLIC interrupt controller at 0x0C000000;
+ *   - a virtio-mmio transport at 0x10008000 (the host VirtioNetDevice),
+ *     wired to PLIC line 1.
+ *
+ * The matching host peripherals are registered by MmuBoot.cs when --gui
+ * is passed; the PLIC IRQ reaches the S-mode kernel as SEIP through the
+ * emulator's SBI path.
+ */
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "rvemu,mmu";
+	model = "rvemu RV32 Sv32 (GUI)";
+
+	chosen {
+		bootargs = "console=ttyS0 earlycon=sbi";
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <60000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	/* 508 MB — stops at the framebuffer so the kernel leaves it alone. */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x1FC00000>;
+	};
+
+	/* simple-framebuffer: 1024x768x32, last 4 MiB of the 512 MiB bank.
+	 * Outside /memory, contiguous with RAM (no PFN gap), so it neither
+	 * perturbs memblock nor triggers an init_unavailable_range walk. */
+	framebuffer@9fc00000 {
+		compatible = "simple-framebuffer";
+		reg = <0x9FC00000 0x300000>;
+		width = <1024>;
+		height = <768>;
+		stride = <4096>;
+		format = "a8r8g8b8";
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		plic: interrupt-controller@c000000 {
+			compatible = "sifive,plic-1.0.0", "riscv,plic0";
+			reg = <0x0C000000 0x4000000>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			#address-cells = <0>;
+			/* hart 0: context 0 = M-mode (IRQ 11), context 1 = S-mode (IRQ 9) */
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+			riscv,ndev = <31>;
+		};
+
+		uart0: serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x10000000 0x100>;
+			clock-frequency = <3686400>;
+			reg-shift = <0>;
+		};
+
+		/* virtio-net — host VirtioNetDevice; PLIC source 1. */
+		virtio_net@10008000 {
+			compatible = "virtio,mmio";
+			reg = <0x10008000 0x1000>;
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+		};
+	};
+};

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Option (a) — the browser owns the framebuffer directly; there is no X
+# server in this configuration. This overlay file overrides the S40xorg
+# script that buildroot's xserver_xorg-server package installs, so the
+# (non-functional on this emulated framebuffer) Xorg is not started at
+# boot — saving boot time and avoiding a doomed start attempt.
+exit 0

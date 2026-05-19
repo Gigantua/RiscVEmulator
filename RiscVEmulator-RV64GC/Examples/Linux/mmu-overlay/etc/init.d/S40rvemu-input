@@ -1,0 +1,13 @@
+#!/bin/sh
+# Bridge the rvemu MMIO keyboard/mouse into /dev/uinput -> /dev/input/event*,
+# so SDL/evdev apps (NetSurf) see a native Linux keyboard and mouse.
+case "$1" in
+  start)
+    printf 'Starting rvemu-input: '
+    /usr/bin/rvemu-input >/dev/null 2>&1 &
+    echo OK
+    ;;
+  stop)
+    ;;
+esac
+exit 0

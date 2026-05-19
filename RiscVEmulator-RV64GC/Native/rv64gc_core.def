@@ -1,0 +1,20 @@
+LIBRARY rv64gc_core
+EXPORTS
+    rv64_init
+    rv64_destroy
+    rv64_step_n
+    rv64_get_pc
+    rv64_set_reg
+    rv64_is_halted
+    rv64_set_halted
+    rv64_get_priv_mode
+    rv64_get_mtime
+    rv64_set_mtime
+    rv64_get_mtimecmp
+    rv64_set_mtimecmp
+    rv64_get_mtime_lo
+    rv64_get_mtime_hi
+    rv64_set_meip
+    rv64_set_seip
+    rv64_set_sbi_mode
+    rv64_dbg

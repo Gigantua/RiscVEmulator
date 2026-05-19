@@ -1,0 +1,398 @@
+riscv: provide RV32 integer multiply/divide libcalls (no M extension)
+
+Companion to patch 0001 (rv32i -march). With the M extension fully
+removed from the build target -- hardware MUL / MULH[SU|U] AND
+DIV / DIVU / REM / REMU all gone -- GCC lowers every C integer
+multiply, division and modulo to a libcall:
+
+  32-bit *           -> __mulsi3
+  64-bit *           -> __muldi3
+  32-bit / %         -> __divsi3 / __udivsi3 / __modsi3 / __umodsi3
+  64-bit / %         -> __divdi3 / __udivdi3 / __moddi3 / __umoddi3
+                        (and the combined __udivmoddi4)
+  overflow-checked * -> __mulodi4   (-fsanitize / __builtin_*_overflow)
+
+The kernel does not link libgcc, and arch/riscv/lib/ historically ships
+no integer mul/div helpers at all -- the RV32 kernel relied entirely on
+hardware M. So we add two files:
+
+  arch/riscv/lib/mul32.c -- __mulsi3 / __muldi3 / __mulodi4
+  arch/riscv/lib/div32.c -- the __[u]divsi3 / __[u]modsi3 family plus
+                            the 64-bit __[u]divdi3 / __[u]moddi3 /
+                            __udivmoddi4 family
+
+CRITICAL CONSTRAINT: every routine here is compiled for -march=rv32i
+too, so it must NOT itself contain a mul / div / rem opcode -- those
+would trap. Therefore:
+
+  * multiply is a shift+add ("Russian-peasant") loop -- shifts, adds
+    and compares only;
+  * division is a restoring shift-subtract long-division loop -- shifts,
+    subtracts and compares only;
+  * 64-bit multiply is built from 32-bit shift+add (no widening mul);
+  * 64-bit divide is a 64-bit restoring shift-subtract loop.
+
+None of them references `*`, `/` or `%` on integers, so GCC has nothing
+to lower into an M opcode or a recursive libcall. (Pointer arithmetic
+and constant power-of-two shifts the compiler folds to shifts are fine.)
+
+All routines are EXPORT_SYMBOL'd so loadable modules built for the same
+target resolve them too. This mirrors how arches without hardware
+multiply/divide (m68k nommu, some arm variants, ...) carry their own
+__mulsi3 / __divsi3 family in arch/*/lib/.
+
+64-bit shift libcalls (__ashldi3 / __ashrdi3 / __lshrdi3) are NOT
+provided here: GCC always inlines 64-bit shifts on rv32 (they need only
+the base-I shift instructions), so they never become libcalls. If a
+future toolchain change made them libcalls, the link would fail loudly
+with an undefined-reference -- an obvious, non-silent signal -- and a
+sibling file could be added then.
+
+Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
+--- a/arch/riscv/lib/Makefile	2026-05-16 13:30:28.666324146 +0200
++++ b/arch/riscv/lib/Makefile	2026-05-16 13:30:28.670319267 +0200
+@@ -1,5 +1,9 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ lib-y			+= delay.o
++# RV32-only integer multiply/divide libcalls — needed because this kernel
++# is built -march=rv32i (no M extension); see board-patches/linux/0001.
++lib-$(CONFIG_32BIT)	+= mul32.o
++lib-$(CONFIG_32BIT)	+= div32.o
+ lib-y			+= memcpy.o
+ lib-y			+= memset.o
+ lib-y			+= memmove.o
+--- /dev/null	2026-05-16 13:26:57.365116023 +0200
++++ b/arch/riscv/lib/mul32.c	2026-05-16 13:30:46.060400073 +0200
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Integer multiply libcalls for RV32 kernels built without the M
++ * extension (-march=rv32i). See board-patches/linux/0001 for the why.
++ *
++ * GCC emits __mulsi3 for every 32-bit C `*`, __muldi3 for every 64-bit
++ * `*`, and __mulodi4 for an overflow-checked 64-bit multiply. The kernel
++ * links no libgcc, so we supply them here.
++ *
++ * Every routine is pure shift+add ("Russian-peasant" multiply): only
++ * shifts, adds, subtracts and compares — never a hardware `mul`, never a
++ * `div`/`rem`, and never a recursive `*`/`/` that GCC could lower back
++ * into an M opcode. So the helpers are themselves valid on the M-less
++ * CPU.
++ *
++ * Forward decl: __divdi3 lives in div32.c (shift-subtract long division)
++ * and is used only by the overflow check in __mulodi4.
++ *
++ * Added by Examples.Linux.Build_RV32i for the RiscVEmulator project.
++ */
++
++#include <linux/export.h>
++#include <linux/types.h>
++
++long long __divdi3(long long a, long long b);
++
++/*
++ * Unsigned 32x32 -> 32 multiply, shift+add. At most 32 iterations; each
++ * step conditionally adds the shifted multiplicand. Signed multiply is
++ * bit-identical to unsigned for the low 32 bits, so __mulsi3 just calls
++ * this with an int signature.
++ */
++static u32 umul32(u32 a, u32 b)
++{
++	u32 res = 0;
++
++	while (b) {
++		if (b & 1u)
++			res += a;
++		a <<= 1;
++		b >>= 1;
++	}
++	return res;
++}
++
++int __mulsi3(int a, int b)
++{
++	return (int)umul32((u32)a, (u32)b);
++}
++EXPORT_SYMBOL(__mulsi3);
++
++/*
++ * Unsigned 32x32 -> 64 multiply, shift+add, tracking a full 64-bit
++ * accumulator. The multiplicand x is widened to u64 so the running sum
++ * never loses high bits. This is the only true widening multiply; the
++ * 64-bit __muldi3 below is composed from it.
++ *
++ * No `*` appears anywhere — `x <<= 1` and `b >>= 1` are base-I shifts,
++ * `acc += x` is a base-I 64-bit add (GCC lowers to add + sltu + add).
++ */
++static u64 umul32_wide(u32 a, u32 b)
++{
++	u64 acc = 0;
++	u64 x = a;
++
++	while (b) {
++		if (b & 1u)
++			acc += x;
++		x <<= 1;
++		b >>= 1;
++	}
++	return acc;
++}
++
++/*
++ * Unsigned 64x64 -> 64 multiply. Standard decomposition:
++ *
++ *   (ahi:alo) * (bhi:blo)
++ *     =  alo*blo                              full 64-bit partial
++ *     + (alo*bhi << 32)                       only low 32 bits survive
++ *     + (ahi*blo << 32)                       only low 32 bits survive
++ *
++ * The ahi*bhi term is shifted left by 64 and vanishes. Cross terms only
++ * reach the high word, so a 32x32->32 product (umul32) suffices for
++ * them; the diagonal term needs the full 32x32->64 (umul32_wide).
++ */
++static u64 umul64(u64 a, u64 b)
++{
++	u32 alo = (u32)a, ahi = (u32)(a >> 32);
++	u32 blo = (u32)b, bhi = (u32)(b >> 32);
++	u64 res;
++
++	res  = umul32_wide(alo, blo);
++	res += ((u64)umul32(alo, bhi)) << 32;
++	res += ((u64)umul32(ahi, blo)) << 32;
++	return res;
++}
++
++long long __muldi3(long long a, long long b)
++{
++	return (long long)umul64((u64)a, (u64)b);
++}
++EXPORT_SYMBOL(__muldi3);
++
++/*
++ * Overflow-checked signed 64-bit multiply (__builtin_mul_overflow lowering
++ * / -fsanitize=signed-integer-overflow). Returns the low 64 bits of a*b;
++ * *overflow is set to 1 iff the true product does not fit in 64 signed
++ * bits. The check divides the result back by a: if a != 0 and
++ * res / a != b, the product wrapped.
++ */
++long long __mulodi4(long long a, long long b, int *overflow)
++{
++	long long res = (long long)umul64((u64)a, (u64)b);
++
++	*overflow = 0;
++	if (a != 0) {
++		if (__divdi3(res, a) != b)
++			*overflow = 1;
++		/* INT64_MIN * -1 wraps to INT64_MIN; divide-back can't see it */
++		if (a == (long long)0x8000000000000000LL && b == -1)
++			*overflow = 1;
++	}
++	return res;
++}
++EXPORT_SYMBOL(__mulodi4);
+--- /dev/null	2026-05-16 13:26:57.365116023 +0200
++++ b/arch/riscv/lib/div32.c	2026-05-16 13:30:46.060400073 +0200
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Integer division/modulo libcalls for RV32 kernels built without the M
++ * extension's DIV / DIVU / REM / REMU instructions (-march=rv32i).
++ * See board-patches/linux/0001 for the why.
++ *
++ * GCC emits calls to:
++ *   __divsi3 / __udivsi3 / __modsi3 / __umodsi3   for 32-bit / and %
++ *   __divdi3 / __udivdi3 / __moddi3 / __umoddi3   for 64-bit / and %
++ *   __udivmoddi4                                  combined 64-bit divmod
++ * The kernel links no libgcc, so we supply them all.
++ *
++ * Every core uses a restoring shift-subtract long-division loop: only
++ * shifts, subtracts and compares — no hardware div/rem, and no multiply
++ * — so it is valid on a CPU with the M extension fully removed.
++ *
++ * Added by Examples.Linux.Build_RV32i for the RiscVEmulator project.
++ */
++
++#include <linux/export.h>
++#include <linux/types.h>
++
++/* ── 32-bit ──────────────────────────────────────────────────────────── */
++
++/*
++ * Unsigned 32-bit divide. Returns the quotient; if rem != NULL also stores
++ * the remainder. Division by zero returns quotient ~0u, remainder = num
++ * (matches the RISC-V hardware DIVU/REMU semantics for div-by-zero).
++ */
++static u32 udivmodsi(u32 num, u32 den, u32 *rem)
++{
++	u32 quot = 0;
++	u32 r = 0;
++	int i;
++
++	if (den == 0) {
++		if (rem)
++			*rem = num;
++		return ~0u;
++	}
++
++	for (i = 31; i >= 0; i--) {
++		r = (r << 1) | ((num >> i) & 1u);
++		if (r >= den) {
++			r -= den;
++			quot |= (1u << i);
++		}
++	}
++
++	if (rem)
++		*rem = r;
++	return quot;
++}
++
++unsigned int __udivsi3(unsigned int a, unsigned int b)
++{
++	return udivmodsi(a, b, NULL);
++}
++EXPORT_SYMBOL(__udivsi3);
++
++unsigned int __umodsi3(unsigned int a, unsigned int b)
++{
++	u32 r;
++
++	udivmodsi(a, b, &r);
++	return r;
++}
++EXPORT_SYMBOL(__umodsi3);
++
++int __divsi3(int a, int b)
++{
++	int neg = 0;
++	u32 ua, ub, q;
++
++	ua = (a < 0) ? (neg ^= 1, (u32)(-(s64)a)) : (u32)a;
++	ub = (b < 0) ? (neg ^= 1, (u32)(-(s64)b)) : (u32)b;
++
++	q = udivmodsi(ua, ub, NULL);
++	return neg ? -(int)q : (int)q;
++}
++EXPORT_SYMBOL(__divsi3);
++
++int __modsi3(int a, int b)
++{
++	int neg = (a < 0);
++	u32 ua, ub, r;
++
++	ua = (a < 0) ? (u32)(-(s64)a) : (u32)a;
++	ub = (b < 0) ? (u32)(-(s64)b) : (u32)b;
++
++	udivmodsi(ua, ub, &r);
++	/* C99: sign of (a % b) follows the dividend a. */
++	return neg ? -(int)r : (int)r;
++}
++EXPORT_SYMBOL(__modsi3);
++
++/*
++ * GCC may also emit __divmodsi4 / __udivmodsi4 (combined quotient+remainder)
++ * at higher optimisation levels. Provide them so the kernel link never
++ * fails on an undefined reference regardless of GCC's lowering choice.
++ */
++unsigned int __udivmodsi4(unsigned int a, unsigned int b, unsigned int *rem)
++{
++	return udivmodsi(a, b, (u32 *)rem);
++}
++EXPORT_SYMBOL(__udivmodsi4);
++
++int __divmodsi4(int a, int b, int *rem)
++{
++	int q = __divsi3(a, b);
++
++	if (rem)
++		*rem = __modsi3(a, b);
++	return q;
++}
++EXPORT_SYMBOL(__divmodsi4);
++
++/* ── 64-bit ──────────────────────────────────────────────────────────── */
++
++/*
++ * Unsigned 64-bit divide, restoring shift-subtract over 64 iterations.
++ * Same algorithm as udivmodsi, widened to u64. Only shifts, subtracts
++ * and compares on 64-bit values — GCC turns those into pairs of 32-bit
++ * base-I ops, never a libcall, never an M opcode. Div-by-zero returns
++ * quotient ~0, remainder = num (DIVU/REMU semantics).
++ */
++static u64 udivmoddi(u64 num, u64 den, u64 *rem)
++{
++	u64 quot = 0;
++	u64 r = 0;
++	int i;
++
++	if (den == 0) {
++		if (rem)
++			*rem = num;
++		return ~0ULL;
++	}
++
++	for (i = 63; i >= 0; i--) {
++		r = (r << 1) | ((num >> i) & 1ULL);
++		if (r >= den) {
++			r -= den;
++			quot |= (1ULL << i);
++		}
++	}
++
++	if (rem)
++		*rem = r;
++	return quot;
++}
++
++/*
++ * __udivmoddi4 is the canonical combined 64-bit divmod GCC emits; the
++ * other 64-bit helpers below are thin wrappers around it.
++ */
++unsigned long long __udivmoddi4(unsigned long long a, unsigned long long b,
++				unsigned long long *rem)
++{
++	return udivmoddi(a, b, (u64 *)rem);
++}
++EXPORT_SYMBOL(__udivmoddi4);
++
++unsigned long long __udivdi3(unsigned long long a, unsigned long long b)
++{
++	return udivmoddi(a, b, NULL);
++}
++EXPORT_SYMBOL(__udivdi3);
++
++unsigned long long __umoddi3(unsigned long long a, unsigned long long b)
++{
++	u64 r;
++
++	udivmoddi(a, b, &r);
++	return r;
++}
++EXPORT_SYMBOL(__umoddi3);
++
++long long __divdi3(long long a, long long b)
++{
++	int neg = 0;
++	u64 ua, ub, q;
++
++	ua = (a < 0) ? (neg ^= 1, (u64)(-a)) : (u64)a;
++	ub = (b < 0) ? (neg ^= 1, (u64)(-b)) : (u64)b;
++
++	q = udivmoddi(ua, ub, NULL);
++	return neg ? -(long long)q : (long long)q;
++}
++EXPORT_SYMBOL(__divdi3);
++
++long long __moddi3(long long a, long long b)
++{
++	int neg = (a < 0);
++	u64 ua, ub, r;
++
++	ua = (a < 0) ? (u64)(-a) : (u64)a;
++	ub = (b < 0) ? (u64)(-b) : (u64)b;
++
++	udivmoddi(ua, ub, &r);
++	/* C99: sign of (a % b) follows the dividend a. */
++	return neg ? -(long long)r : (long long)r;
++}
++EXPORT_SYMBOL(__moddi3);

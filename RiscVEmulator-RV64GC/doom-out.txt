@@ -1,0 +1,52 @@
+Compiling DOOM for RV32I...
+  runtime.c... OK
+  softfloat.c... OK
+  libc.c... OK
+  syscalls.c... OK
+  malloc.c... OK
+  vfs.c... OK
+  doom_main.c... OK
+  Linking... OK
+  doom.elf: 577.056 bytes
+Building SoC...
+  WAD loaded: 4.196.020 bytes at 0x01800000
+Starting DOOM...
+doom_main: starting
+doom_main: WAD registered
+                            DOOM Shareware Startup v1.10                           
+V_Init: allocate screens.
+M_LoadDefaults: Load system defaults.
+Z_Init: Init zone memory allocation daemon. 
+W_Init: Init WADfiles.
+ adding ./doom1.wad
+===========================================================================
+                                Shareware!
+===========================================================================
+M_Init: Init miscellaneous info.
+R_Init: Init DOOM refresh daemon - [                   ]..
+InitTextures
+InitFlats........
+InitSprites
+InitColormaps
+R_InitData
+R_InitPointToAngle
+R_InitTables
+R_InitPlanes
+R_InitLightTables
+R_InitSkyMap
+R_InitTranslationsTables
+P_Init: Init Playloop state.
+I_Init: Setting up machine state.
+I_InitSound: I_InitSound:  pre-cached all sound data
+I_InitSound: sound module ready
+D_CheckNetGame: Checking network game status.
+startskill 2  deathmatch: 0  startmap: 1  startepisode: 1
+player 1 of 1 (1 nodes)
+S_Init: Setting up sound.
+S_Init: default sfx volume 8
+HU_Init: Setting up heads up display.
+ST_Init: Init status bar.
+doom_main: initialized, entering game loop
+[2s] 78M steps, 38,9 MIPS   [4s] 170M steps, 45,9 MIPS   [6s] 260M steps, 44,9 MIPS   [8s] 348M steps, 43,8 MIPS   [10s] 436M steps, 44,0 MIPS   [12s] 524M steps, 43,9 MIPS   [14s] 610M steps, 43,0 MIPS   [16s] 698M steps, 44,0 MIPS   [18s] 786M steps, 43,9 MIPS   [20s] 874M steps, 43,9 MIPS   [22s] 962M steps, 44,0 MIPS   [24s] 1048M steps, 43,0 MIPS   [26s] 1134M steps, 42,9 MIPS   [28s] 1220M steps, 42,9 MIPS   [30s] 1308M steps, 43,9 MIPS   [32s] 1398M steps, 44,9 MIPS   I_ShutdownSound: NOT finishing pending sounds
+
+Exited (code 0), 1.408.469.513 steps in 32,5s (43,4 MIPS avg)
