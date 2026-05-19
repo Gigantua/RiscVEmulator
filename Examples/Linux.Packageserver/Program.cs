@@ -330,14 +330,19 @@ async Task<int> DoBuildAsync()
 
 async Task<(bool ok, string ipkPath, string version)> BuildAndPackAsync(CatalogEntry entry)
 {
-    // 1. Ensure the symbol is enabled in buildroot's .config.
+    // 1. Ensure the symbol is enabled in buildroot's .config, then ALWAYS
+    //    re-sync. olddefconfig must run unconditionally: a previous `add`
+    //    may have written {BrSymbol}=y without ever resolving the symbols
+    //    it pulls in (deps like ncurses, plus unrelated new symbols). If
+    //    .config is left out of sync, the next `make <pkg>-rebuild` drops
+    //    into an INTERACTIVE kconfig that prompts on the console and hangs
+    //    the server forever. olddefconfig resolves every open symbol to its
+    //    default non-interactively.
     var ensure = $@"
         cd {WslBuildroot}
-        grep -q '^{entry.BrSymbol}=y$' .config || {{
-            sed -i '/^# {entry.BrSymbol} is not set$/d; /^{entry.BrSymbol}=/d' .config
-            echo '{entry.BrSymbol}=y' >> .config
-            yes '' | make olddefconfig >/dev/null 2>&1
-        }}
+        sed -i '/^# {entry.BrSymbol} is not set$/d; /^{entry.BrSymbol}=/d' .config
+        echo '{entry.BrSymbol}=y' >> .config
+        yes '' | make olddefconfig
     ";
     if (RunWsl(ensure).rc != 0) return (false, "", "");
 
@@ -352,12 +357,26 @@ async Task<(bool ok, string ipkPath, string version)> BuildAndPackAsync(CatalogE
 
     // 3. Force rebuild + reinstall so the install step touches every file.
     string pkgLower = entry.Name.ToLowerInvariant();
-    var (rc, _, _) = RunWsl($"cd {WslBuildroot} && make {pkgLower}-rebuild", echo: true);
+    //    stdin from /dev/null: belt-and-suspenders so that even if buildroot
+    //    re-triggers kconfig here it sees EOF and takes defaults instead of
+    //    blocking on a console prompt.
+    var (rc, _, _) = RunWsl($"cd {WslBuildroot} && make {pkgLower}-rebuild </dev/null", echo: true);
     if (rc != 0) return (false, "", "");
 
-    // 4. Find everything in target/ newer than the marker.
+    // 4. Find everything newer than the marker. Buildroot per-package
+    //    directories (BR2_PER_PACKAGE_DIRECTORIES=y) make `<pkg>-rebuild`
+    //    install into output/per-package/<pkg>/target/, NOT the global
+    //    output/target/ — so scanning the latter finds nothing. The deps
+    //    rsync'd into the per-package tree keep their original mtimes, so
+    //    `-newer marker` still isolates this package's own freshly-installed
+    //    files. Fall back to the global target dir when PPD is disabled.
+    string ppTarget = $"{WslBuildroot}/output/per-package/{pkgLower}/target";
+    var (_, ppCheck, _) = RunWsl($"test -d {ppTarget} && echo yes || echo no");
+    string targetRoot = ppCheck.Trim() == "yes"
+        ? ppTarget
+        : $"{WslBuildroot}/output/target";
     var (_, newFilesStdout, _) = RunWsl(
-        $"find {WslBuildroot}/output/target -newer {marker} \\( -type f -o -type l \\)");
+        $"find {targetRoot} -newer {marker} \\( -type f -o -type l \\)");
     var newFiles = newFilesStdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).ToList();
     if (newFiles.Count == 0)
     {
@@ -430,7 +449,7 @@ print(out_ipk)
     RunWsl($"cat > {controlPath} << 'CTL_EOF'\n{control}\nCTL_EOF");
     var (prc, _, perr) = RunWsl(
         $"python3 /tmp/rvemu-packipk.py {newFilesList} " +
-        $"$(eval echo {WslBuildroot})/output/target " +
+        $"$(eval echo {targetRoot}) " +
         $"\"$(cat {controlPath})\" {ipkWsl}");
     if (prc != 0)
     {

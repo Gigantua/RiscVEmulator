@@ -37,7 +37,7 @@ This is why `do_step()` has zero MMIO branches — every access is `*(mem + addr
 ## Solution layout
 
 ```
-Native/          C++ CPU hot path. rv32i_core.cpp (~550 lines), ClangCL vcxproj.
+Native/          C++ CPU hot path. rv32i_core.cpp (~355 lines), ClangCL vcxproj.
                  Read the file header for ISA support summary.
 Core/            Emulator shell: P/Invoke wrappers, memory bus, peripherals,
                  ELF loader, register file, MMIO dispatcher.
@@ -73,42 +73,46 @@ is no CRT. The file provides its own `memset` and `memcpy`. Do not add
 
 ## CPU model (Native/rv32i_core.cpp)
 
-- All CPU state lives in one struct: `CPU_State` (regs, pc, mtime, mtimecmp,
-  mem pointer, priv_mode, wfi_pending, CSRs).
-- `do_step(CPU_State& cpu)` and every helper it calls take `cpu` by reference.
-  A single global `static CPU_State cpu;` exists for the C-ABI trampolines
-  (`rv32i_step_n`, `rv32i_init`, `rv32i_get_pc`, etc.) — they pass `cpu` into
-  the parameterized inner functions.
-- Privileged mode is **always on**. The CPU boots in M-mode (`priv_mode = 3`,
-  all CSRs zero). Bare-metal programs that don't ECALL/EBREAK/touch CSRs are
-  unaffected; they exit via MMIO write to `0x40000000` (`HostExitDevice`).
-- `priv_csr(cpu, csrno)` returns a `uint32_t&` to the CSR's backing slot.
-  Reads dereference it; writes assign through it. RO and computed CSRs
-  (misa, mvendorid, mtime aliases) stage into a static scratch — writes
-  there are silently discarded, which is exactly RO semantics.
-- Spec-strict CSR masks (sstatus/sie/sip view masks, mip MTIP write-protect,
-  mepc/sepc low-bit clear) are intentionally dropped for code lean-ness.
-  Linux follows protocol so doesn't trip them; restore if a third-party
-  guest needs strict compliance.
-- mtime is incremented once per `do_step`. mtime ≥ mtimecmp auto-raises
-  MTIP each step. Other interrupt bits (MEIP/SEIP, MSIP/SSIP) are writable
-  via CSR but have no host-side injector yet — that's the missing piece for
-  virtio-net (see "Adding networking" below).
+- The file is two blocks (see the file header): a **base RV32I CPU** and a
+  **trap unit** wrapped around it.
+- CPU state is one struct: `CPU_State` (`regs[32]`, `pc`, `halted`, `mem`
+  pointer). The trap unit keeps its own `TrapUnit` struct — just current
+  privilege and the host interrupt-pin latch. There are **no CSRs**.
+- `cpu_step(CPU_State&)` executes one base instruction; for any SYSTEM opcode
+  or non-RV32I encoding it returns a `CpuException` and never acts on it.
+  `do_step()` drives one step — sample interrupts, handle the trap-return
+  gateway, else `cpu_step` and let the trap unit handle anything raised. Single
+  globals `static CPU_State cpu;` / `TrapUnit trap;` exist for the C-ABI
+  trampolines (`rv32i_step_n`, `rv32i_init`, `rv32i_get_pc`, etc.).
+- Privileged mode is **always on**. The CPU boots in M-mode (`trap.priv =
+  PRIV_M`). Bare-metal programs that don't ECALL/EBREAK are unaffected; they
+  exit via MMIO write to `0x40000000` (`HostExitDevice`).
+- Trap state lives in the **trap-frame page** at guest-physical `0x0F000000`
+  (`TrapFrameDevice`), plain RAM: interrupt-enable flag, per-source mask,
+  handler vector, scratch word, and the 36-word `pt_regs`-layout trap frame.
+  See CLAUDE.md "Hardware trap frame".
+- Every CSR instruction, `MRET`, `SRET`, `WFI`, and S-mode / PMP / machine-ID /
+  ENVCFG / SEED / trap-delegation encodings trap as illegal instructions. The
+  Linux path is M/U NOMMU and does not use S-mode.
+- The core holds no timer state. It has an `mtip` interrupt-input pin
+  (`rv32i_set_mtip`, driven by the C# `ClintDevice`) and an `meip` pin
+  (`rv32i_set_meip`, driven by the PLIC); `mtime`/`mtimecmp` live in
+  `ClintDevice`.
 
 ## ISA support summary (read header of rv32i_core.cpp for details)
 
 | Ext | Status | Notes |
 |---|---|---|
-| RV32I | full | all 40 base instructions |
+| RV32I | yes | all 40 base integer instructions |
 | M | no | MUL/DIV/REM family traps; use libcalls |
 | A | no | LR/SC/AMO opcodes trap as illegal |
 | F | no | FLW/FSW/FMA/OP-FP opcodes trap as illegal; use software float in guest |
-| Zicsr / Zifencei | yes / NOP | FENCE is a NOP (single-hart, no I-cache) |
-| Priv M/S/U | yes | trap delegation, MRET/SRET, WFI, ECALL/EBREAK |
+| Zicsr / Zifencei | no / no | all CSR instructions trap illegal |
+| Priv M/U | partial | ECALL/EBREAK via the trap-frame page; MRET, WFI, all CSR ops, S-mode trap illegal |
 | D | no | use `Runtime/softfloat.c` in guest |
 | C | no | all instructions 32-bit |
 | B / Zb*, V | no |  |
-| MMU walks | no | satp is stored but loads/stores use bare guest-phys |
+| MMU walks | no | no satp; loads/stores use bare guest-phys |
 | Misalign traps | no | host does the access; x86 handles misalign natively |
 
 ## Memory map (high level — see MEMORY_MAP.md for register-level)
@@ -121,6 +125,7 @@ is no CRT. The file provides its own `memset` and `memcpy`. Do not add
 | 0x10001000 | Keyboard FIFO | guarded |
 | 0x10002000 | Mouse | guarded |
 | 0x10003000 | Real-Time Clock | guarded |
+| 0x0F000000 | Trap-frame page (IE flags, vector, 36-word frame) | plain |
 | 0x20000000 | Framebuffer 320×200 RGBA | plain |
 | 0x20100000 | Display control | guarded |
 | 0x30000000 | Audio PCM buffer (1 MB) | plain |
@@ -164,6 +169,19 @@ hot bulk-data peripherals like the framebuffer and PCM buffer).
 | `Examples/TinyCC` | JIT compiles C inside the emulator at runtime. ~390 KB ELF containing TinyCC. Emits RV32I machine code and runs it. |
 | `Examples/Linux` | Boots the RV32I Linux image produced by `Examples/Linux.Build_RV32i`. `--download` fetches the legacy mini-rv32ima serial-only kernel. |
 
+`Examples/Linux.Build_RV32i` ports the kernel to the CPU's trap-frame ABI.
+Userspace enters the kernel through an ordinary `ecall` — an earlier
+`0xFFFF0000` syscall-gateway experiment was dropped, so userspace now uses the
+architectural instruction and the CPU raises the usual environment-call trap.
+The kernel *returns* from a trap by putting its private trap-frame pointer in
+`a0` and jumping to the resume gateway at `0xFFFF0004`; the base ISA has no
+`MRET`. The native CPU has no CSRs at all — all trap state lives in the
+`0x0F000000` trap-frame page (see CLAUDE.md "Hardware trap frame"). The
+Build_RV32i kernel codegen is rewritten to that ABI and boots to userspace; a
+cached `Image-net` built against an older trap-page address must be rebuilt.
+Note `PlicDevice` uses a 4 MB window (not the architectural 64 MB) so the PLIC
+region does not swallow the trap-frame page at `0x0F000000`.
+
 Bare-metal examples link against `RiscVEmulator.Tests/Runtime/` (libc, malloc,
 softfloat for D-ext emulation, syscalls.c, vfs.c). Syscalls.c is misleadingly
 named — most operations route through MMIO writes, not ECALL.
@@ -201,40 +219,41 @@ named — most operations route through MMIO writes, not ECALL.
    take `CPU_State&`. Both forms are correct — the global is there only so
    the trampoline names like `rv32i_get_pc()` can be parameter-less.
 
-6. **`EnablePrivMode`, `EnableMExtension`, `EnableAExtension`, `RamOffset`**
-   on `Emulator` are inert compatibility
-   shims — the CPU handles everything unconditionally. Don't introduce new
-   call sites that rely on them doing anything.
+6. **Legacy `Emulator` configuration shims are gone.** There is no
+   `EnablePrivMode`, `EnableMExtension`, `EnableAExtension`, or `RamOffset`
+   property; the CPU handles privilege and removed extensions unconditionally.
 
-7. **`Examples/Linux` requires `EnablePrivMode = true`** as a vestigial
-   line — it's harmless but no longer functional. Removing it is a no-op.
+## Networking
 
-## Adding networking (FAQ)
+Networking works. `Examples/Linux` runs the libslirp-NAT'd kernel built by
+`Examples/Linux.Build_RV32i`; standard sockets, DHCP and `wget` all function
+inside the guest. How it fits together:
 
-A common request: "make sockets work in `Examples/Linux`." Path:
+1. **Kernel** — `Examples/Linux.Build_RV32i` builds with `CONFIG_NET`,
+   `CONFIG_INET`, `CONFIG_VIRTIO_MMIO` and `CONFIG_VIRTIO_NET` on. (The legacy
+   `--download` mini-rv32ima image is still `CONFIG_NET=n` — serial only.)
+2. **PLIC** — `Core/Peripherals/PlicDevice.cs` at `0x0C000000`. It exposes
+   only a 4 MB window, not the architectural 64 MB, so it does not swallow the
+   trap-frame page at `0x0F000000`.
+3. **virtio-net** — `Core/Peripherals/VirtioNetDevice.cs` implements the
+   virtio-mmio register layout + RX/TX virtqueues; the rings live in guest RAM
+   (plain `*(mem + addr)` accesses — no special handling).
+4. **IRQ pin** — `rv32i_set_meip(int level)` latches the MEIP interrupt pin;
+   `check_interrupts()` consults it, so the PLIC drives the guest IRQ through
+   that one exported call.
+5. **Host backend** — `Core/Networking/` (`INetBackend`, `Win32NatBackend`,
+   `SlirpBridgeBackend`) NATs guest traffic via `slirp_bridge.dll` +
+   `libslirp-0.dll` over Win32 host-loopback; the guest gets `10.0.2.0/24` and
+   auto-DHCPs eth0 at boot.
+6. **DTB** — `Examples/Linux` patches in the `plic` and `virtio_mmio` nodes.
 
-1. The prebuilt kernel has `CONFIG_NET=n` → no `AF_INET`. Must rebuild
-   with `CONFIG_NET=y`, `CONFIG_INET=y`, `CONFIG_VIRTIO_MMIO=y`,
-   `CONFIG_VIRTIO_NET=y` (or `CONFIG_SLIP=y` + a second UART for a
-   simpler-but-slower path).
-2. Add a C# `PlicDevice` (PLIC MMIO peripheral) at `0x0C000000`.
-3. Add a C# `VirtioNetDevice` implementing virtio-mmio register layout +
-   RX/TX virtqueues. Backing data ring lives in guest RAM (plain
-   `*(mem + addr)` accesses — no special handling).
-4. Add **one** thing to the C++ CPU: a host-side IRQ injector
-   (`rv32i_set_meip(int level)`) that flips bit 11 in `cpu.csr_mip`.
-   `check_interrupts()` already walks MEIP/SEIP via the priority array,
-   so once the bit is settable from outside, the trap path Just Works.
-5. Patch the DTB to add `plic` and `virtio_mmio` nodes (Examples/Linux
-   already patches RAM size — extend that step).
-
-The C++ delta is ~30 lines (one trampoline). The C# delta is a few hundred.
-The kernel rebuild is the long pole.
+See CLAUDE.md "Guest-side networking + package install" for the `rvpkg`
+package-feed flow built on top of this.
 
 ## File map for orientation
 
 ```
-Native/rv32i_core.cpp    THE CPU. ~550 lines. Read the header comment first.
+Native/rv32i_core.cpp    THE CPU. ~355 lines. Read the header comment first.
 Native/rv32i_core.def    Export list — keep in sync with extern "C" functions.
 Core/Emulator.cs         P/Invoke shell, peripheral wiring, run loop.
 Core/HostMemoryReservation.cs   4 GB VA reservation + plain/guarded commits.

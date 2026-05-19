@@ -182,6 +182,7 @@ public abstract class EmulatorTestBase
         var audioBuf  = new AudioBufferDevice();
         var audioCtrl = new AudioControlDevice();
         var clint     = new ClintDevice();   // CLINT mtime/mtimecmp at 0x02000000
+        var trapFrame = new TrapFrameDevice();  // hardware trap-frame page at 0x0F000000
         bus.RegisterPeripheral(uart);
         bus.RegisterPeripheral(fb);
         bus.RegisterPeripheral(display);
@@ -191,6 +192,7 @@ public abstract class EmulatorTestBase
         bus.RegisterPeripheral(audioBuf);
         bus.RegisterPeripheral(audioCtrl);
         bus.RegisterPeripheral(clint);
+        bus.RegisterPeripheral(trapFrame);
 
         // Let test inject keyboard/mouse/uart events before run
         setupKeyboard?.Invoke(kbd);

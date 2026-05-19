@@ -38,6 +38,11 @@
     <None Update="Programs\audio_test.c"   CopyToOutputDirectory="Always" />
     <None Include="Programs\atomic_trap.c" CopyToOutputDirectory="Always" />
     <None Include="Programs\f_trap.c"      CopyToOutputDirectory="Always" />
+    <None Include="Programs\s_mode_removed.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\paravirt_syscall_gateway.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\direct_user_ecall.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\nested_trap.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\timer_irq.c" CopyToOutputDirectory="Always" />
     <None Update="Programs\runtime_ops.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\malloc_test.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\vfs_test.c"     CopyToOutputDirectory="Always" />

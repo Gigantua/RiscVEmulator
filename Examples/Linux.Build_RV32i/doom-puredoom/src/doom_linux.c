@@ -451,6 +451,8 @@ int main(int argc, char **argv)
     uint64_t last_midi_us  = now_us();
     uint64_t midi_accum_us = 0;
     const uint64_t MIDI_TICK_US = 7143;   /* 1_000_000 / 140 */
+    const unsigned MAX_MIDI_TICKS_PER_FRAME = 8;
+    const unsigned MAX_MIDI_MESSAGES_PER_FRAME = 128;
 
     while (1) {
         poll_kbd();
@@ -467,12 +469,28 @@ int main(int argc, char **argv)
         uint64_t midi_delta = t - last_midi_us;
         last_midi_us = t;
         midi_accum_us += midi_delta;
-        while (midi_accum_us >= MIDI_TICK_US) {
+
+        /* Do not try to catch up an unbounded MIDI backlog. On the emulated
+         * Linux path, a slow frame can otherwise accumulate thousands of
+         * missed 140 Hz MIDI ticks; processing those ticks makes the next
+         * frame slower, which creates a positive feedback loop until a single
+         * frame takes seconds. Dropping excess MIDI time under load is much
+         * less harmful than letting rendering spiral to a halt. */
+        unsigned midi_ticks = 0;
+        unsigned midi_messages = 0;
+        while (midi_accum_us >= MIDI_TICK_US &&
+               midi_ticks < MAX_MIDI_TICKS_PER_FRAME &&
+               midi_messages < MAX_MIDI_MESSAGES_PER_FRAME) {
             midi_accum_us -= MIDI_TICK_US;
+            midi_ticks++;
             unsigned long m;
-            while ((m = doom_tick_midi()) != 0)
+            while ((m = doom_tick_midi()) != 0) {
                 g_midi[MIDI_SHORT_W] = (uint32_t)m;
+                if (++midi_messages >= MAX_MIDI_MESSAGES_PER_FRAME) break;
+            }
         }
+        if (midi_accum_us >= MIDI_TICK_US)
+            midi_accum_us = 0;
     }
     return 0;
 }

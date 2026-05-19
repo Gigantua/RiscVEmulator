@@ -134,17 +134,20 @@ public unsafe class SdlWindow
         // (which increments WriteGeneration), guaranteeing all registers are set.
         if (newData)
         {
+            _lastQueuedGen = gen;
             uint queued = sdl.GetQueuedAudioSize(_audioDevice);
             if (queued < 8192)
             {
-                _lastQueuedGen = gen;
                 uint start = _audioCtrl.BufStart;
                 uint len = Math.Min(_audioCtrl.BufLength,
                                     (uint)_audioBuf.Length - start);
                 if (len > 0)
                     sdl.QueueAudio(_audioDevice, _audioBuf.RawPtr + start, len);
-                _audioCtrl.Ctrl = 0;
             }
+            // Always acknowledge (clear Ctrl) so the guest never stalls
+            // waiting on us. If SDL is already saturated we drop this
+            // buffer rather than let playback latency grow unbounded.
+            _audioCtrl.Ctrl = 0;
         }
     }
 

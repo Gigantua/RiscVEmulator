@@ -7,12 +7,5 @@ EXPORTS
     rv32i_set_reg
     rv32i_is_halted
     rv32i_set_halted
-    rv32i_get_priv_mode
-    rv32i_get_mtime
-    rv32i_set_mtime
-    rv32i_get_mtimecmp
-    rv32i_set_mtimecmp
-    rv32i_get_mtime_lo
-    rv32i_get_mtime_hi
     rv32i_set_meip
-    rv32i_set_seip
+    rv32i_set_mtip

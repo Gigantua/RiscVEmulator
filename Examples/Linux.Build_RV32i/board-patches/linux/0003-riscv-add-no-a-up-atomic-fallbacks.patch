@@ -158,20 +158,20 @@ Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
 +#define arch_xchg_acquire(ptr, x)					\
 +({									\
 +	__typeof__(*(ptr)) __ret = arch_xchg_relaxed((ptr), (x));	\
-+	__asm__ __volatile__(RISCV_ACQUIRE_BARRIER "" ::: "memory");	\
++	__asm__ __volatile__("" ::: "memory");			\
 +	__ret;								\
 +})
 +
 +#define arch_xchg_release(ptr, x)					\
 +({									\
-+	__asm__ __volatile__(RISCV_RELEASE_BARRIER "" ::: "memory");	\
++	__asm__ __volatile__("" ::: "memory");			\
 +	arch_xchg_relaxed((ptr), (x));					\
 +})
 +
 +#define arch_xchg(ptr, x)						\
 +({									\
 +	__typeof__(*(ptr)) __ret = arch_xchg_relaxed((ptr), (x));	\
-+	__asm__ __volatile__("fence rw, rw" ::: "memory");		\
++	__asm__ __volatile__("" ::: "memory");			\
 +	__ret;								\
 +})
 +
@@ -207,18 +207,18 @@ Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
 +#define arch_cmpxchg_acquire(ptr, o, n)					\
 +({									\
 +	__typeof__(*(ptr)) __ret = arch_cmpxchg_relaxed((ptr), (o), (n)); \
-+	__asm__ __volatile__(RISCV_ACQUIRE_BARRIER "" ::: "memory");	\
++	__asm__ __volatile__("" ::: "memory");			\
 +	__ret;								\
 +})
 +#define arch_cmpxchg_release(ptr, o, n)					\
 +({									\
-+	__asm__ __volatile__(RISCV_RELEASE_BARRIER "" ::: "memory");	\
++	__asm__ __volatile__("" ::: "memory");			\
 +	arch_cmpxchg_relaxed((ptr), (o), (n));				\
 +})
 +#define arch_cmpxchg(ptr, o, n)						\
 +({									\
 +	__typeof__(*(ptr)) __ret = arch_cmpxchg_relaxed((ptr), (o), (n)); \
-+	__asm__ __volatile__("fence rw, rw" ::: "memory");		\
++	__asm__ __volatile__("" ::: "memory");			\
 +	__ret;								\
 +})
 +#define arch_cmpxchg_local(ptr, o, n) arch_cmpxchg_relaxed((ptr), (o), (n))

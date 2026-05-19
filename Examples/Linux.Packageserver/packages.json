@@ -13,8 +13,20 @@
       "IpkFile": "nano_7.2_rv32inommu_uclibc.ipk"
     },
     {
-      "Name": "lynx",
-      "BrSymbol": "BR2_PACKAGE_LYNX",
+      "Name": "sl",
+      "BrSymbol": "BR2_PACKAGE_SL",
+      "BuiltVersion": "5.02",
+      "IpkFile": "sl_5.02_rv32inommu_uclibc.ipk"
+    },
+    {
+      "Name": "frotz",
+      "BrSymbol": "BR2_PACKAGE_FROTZ",
+      "BuiltVersion": "2.54",
+      "IpkFile": "frotz_2.54_rv32inommu_uclibc.ipk"
+    },
+    {
+      "Name": "netsurf",
+      "BrSymbol": "BR2_PACKAGE_NETSURF_ARCH_SUPPORTS",
       "BuiltVersion": null,
       "IpkFile": null
     }

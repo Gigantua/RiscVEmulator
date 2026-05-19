@@ -297,6 +297,7 @@ RunWsl($"python3 -c \"" +
 // based on --ram.
 RunWsl($"sed -i 's|\"sifive,clint0,riscv,clint0\"|\"sifive,clint0\", \"riscv,clint0\"|;" +
        $"      s|compatible = \"hvc\";|compatible = \"ns16550a\";|;" +
+       $"      s|console=ttyS0\"|console=ttyS0 rvemu.nogui=0\"|;" +
        $"      s|0x3ffc000|0x00C0FF03|' " +
        $"{wslDir}/board/rvemu/cnlohr-minimal.dts");
 
@@ -437,6 +438,13 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        // Examples.Doom bare-metal demo, so SFX + music work out of the box.
        "BR2_PACKAGE_DOOM_PUREDOOM=y\n" +
        "BR2_PACKAGE_DOOM_WAD=y\n" +
+       // ncurses in the base image — purely so its terminfo database
+       // (/usr/share/terminfo: vt100, vt102, linux, xterm, ...) ships in
+       // the rootfs. ncurses apps installed later via rvpkg (sl, frotz,
+       // nano) are statically linked, but ncurses still reads terminfo
+       // *data* from disk at runtime — without it they die with
+       // "Error opening terminal: vt100". ~1 MB; unlocks every curses app.
+       "BR2_PACKAGE_NCURSES=y\n" +
        // Global patch dir for our own package patches. Buildroot applies
        // every *.patch under <dir>/<pkgname>/ on top of the package's
        // pristine source. We use it to carry the kernel div/rem patches
@@ -488,7 +496,9 @@ RunWsl($"sed -i -e 's/_zmmul//g' -e 's/rv32ia/rv32i/g' {wslDir}/arch/arch.mk.ris
 //          shift-subtract only — they contain no mul/div/rem opcode and
 //          so are themselves valid on the M-less CPU.
 //   uclibc — replaces linuxthreads' RISC-V LR/SC spin primitive with a
-//            no-A single-hart fallback so libc builds for rv32i.
+//            no-A single-hart fallback so libc builds for rv32i. The
+//            paravirt syscall ABI patch is applied after uClibc extraction
+//            below because that source has varied whitespace across releases.
 Console.WriteLine("Staging no-A/no-M patches into board/rvemu/patches/...");
 {
     var dir = new DirectoryInfo(AppContext.BaseDirectory);
@@ -522,31 +532,75 @@ RunWsl($"grep -q 'linux-6.6.18.tar.xz' {wslDir}/linux/linux.hash || " +
 // to bring up eth0 via DHCP non-blockingly on boot. The script swallows
 // all errors and exits 0, so any failure (no eth0, no slirp_bridge, etc.)
 // can never block boot — the kernel still reaches the login prompt.
+// NOTE: these scripts MUST be transferred base64-encoded, not via a `cat <<
+// 'EOF'` heredoc. wsl.exe mangles the single quotes around the heredoc
+// delimiter, so the delimiter ends up unquoted and bash expands `$1` in the
+// body to the empty string — leaving a broken `case "" in` that never matches
+// `start`. Base64 has no shell metacharacters, so it round-trips intact.
+// (This is the same reason S42input..S46midi below use ToBase64Lf.)
 Console.WriteLine("Writing rootfs overlay (auto-DHCP init script)...");
 RunWsl($"mkdir -p {wslDir}/board/rvemu/rootfs-overlay/etc/init.d");
-RunWsl($"cat > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S41dhcp << 'DHCP_EOF'\n" +
-       "#!/bin/sh\n" +
-       "# Best-effort DHCP on eth0. Never blocks boot — any failure exits 0.\n" +
-       "case \"$1\" in\n" +
-       "    start)\n" +
-       "        [ -d /sys/class/net/eth0 ] || exit 0\n" +
-       "        echo -n 'Bringing up eth0 (DHCP via libslirp)... '\n" +
-       "        ip link set eth0 up 2>/dev/null\n" +
-       "        # -q: quit after lease, -n: exit if no lease (don't hang).\n" +
-       "        # -t 5 -T 2: 5 retries with 2s gap = 10s max wait.\n" +
-       "        if udhcpc -i eth0 -q -n -t 5 -T 2 >/dev/null 2>&1; then\n" +
-       "            echo 'OK'\n" +
-       "        else\n" +
-       "            echo 'no lease (continuing without network)'\n" +
-       "        fi\n" +
-       "        ;;\n" +
-       "    stop)\n" +
-       "        killall udhcpc 2>/dev/null\n" +
-       "        ;;\n" +
-       "esac\n" +
-       "exit 0\n" +
-       "DHCP_EOF");
+const string s41dhcp = @"#!/bin/sh
+# Best-effort DHCP on eth0. Never blocks boot — any failure exits 0.
+case ""$1"" in
+    start)
+        [ -d /sys/class/net/eth0 ] || exit 0
+        echo -n 'Bringing up eth0 (DHCP via libslirp)... '
+        ip link set eth0 up 2>/dev/null
+        # -q: quit after lease, -n: exit if no lease (don't hang).
+        # -t 5 -T 2: 5 retries with 2s gap = 10s max wait.
+        if udhcpc -i eth0 -q -n -t 5 -T 2 >/dev/null 2>&1; then
+            echo 'OK'
+        else
+            echo 'no lease (continuing without network)'
+        fi
+        ;;
+    stop)
+        killall udhcpc 2>/dev/null
+        ;;
+esac
+exit 0
+";
+string s41B64 = ToBase64Lf(s41dhcp);
+RunWsl($"echo {s41B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S41dhcp");
 RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S41dhcp");
+
+// Fallback /etc/resolv.conf pointing at libslirp's built-in DNS proxy
+// (10.0.2.3 — see slirp_bridge.cpp topology). udhcpc's bound-hook
+// (/usr/share/udhcpc/default.script) normally overwrites this from the
+// DHCP `dns` option on a successful lease, so this file only matters when
+// DHCP failed or offered no DNS server. Without it, `ping google.at` /
+// any hostname lookup fails with "bad address" even though `ping 1.1.1.1`
+// works. libslirp's DNS proxy forwards queries to the host's real
+// resolvers, so 10.0.2.3 resolves anything the Windows host can.
+Console.WriteLine("Writing rootfs overlay (fallback /etc/resolv.conf -> 10.0.2.3)...");
+const string resolvConf = "# Fallback resolver: libslirp DNS proxy. udhcpc overwrites this on lease.\n" +
+                          "nameserver 10.0.2.3\n";
+string resolvB64 = ToBase64Lf(resolvConf);
+RunWsl($"echo {resolvB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/resolv.conf");
+RunWsl($"chmod 0644 {wslDir}/board/rvemu/rootfs-overlay/etc/resolv.conf");
+
+// S49rvpkg — refresh the rvpkg package feed automatically once eth0 is up,
+// so `rvpkg install <pkg>` works without a manual `rvpkg update` first.
+// Best-effort and non-blocking: runs `rvpkg update` in the background so an
+// unreachable/absent host package server can never delay boot. Numbered S49
+// (after S41dhcp brings the network up) and the only prerequisite is eth0.
+Console.WriteLine("Writing rootfs overlay (auto rvpkg-update init script)...");
+const string s49rvpkg = @"#!/bin/sh
+# Auto-refresh the rvpkg feed after networking. Never blocks boot.
+case ""$1"" in
+    start)
+        [ -d /sys/class/net/eth0 ] || exit 0
+        [ -x /usr/bin/rvpkg ] || exit 0
+        echo 'Refreshing rvpkg feed in background (rvpkg update)...'
+        rvpkg update >/var/log/rvpkg-update.log 2>&1 &
+        ;;
+esac
+exit 0
+";
+string s49B64 = ToBase64Lf(s49rvpkg);
+RunWsl($"echo {s49B64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S49rvpkg");
+RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/etc/init.d/S49rvpkg");
 
 // Autologin on the serial console — drop the getty/login dance, give us
 // a root shell directly. It's a single-user emulator, not a mainframe.
@@ -605,6 +659,20 @@ RunWsl($"cat > {wslDir}/board/rvemu/busybox.fragment << 'BB_EOF'\n" +
        "CONFIG_VMSTAT=y\n" +
        "CONFIG_PIDOF=y\n" +
        "CONFIG_KILLALL=y\n" +
+       // Networking diagnostics. CONFIG_PING is on in the buildroot busybox
+       // default, but pin it explicitly so the fragment is the single source
+       // of truth. busybox `ping` uses an ICMP socket; on this target it
+       // works because the guest shell runs as root (autologin) — and the
+       // host-side libslirp can't relay ICMP, so slirp_bridge.cpp services
+       // echo requests itself via the Win32 IcmpSendEcho API.
+       // FEATURE_FANCY_PING enables -c/-w/-W and the per-reply RTT output.
+       "CONFIG_PING=y\n" +
+       "CONFIG_PING6=y\n" +
+       "CONFIG_FEATURE_FANCY_PING=y\n" +
+       // nslookup — lets a user verify the DNS path (10.0.2.3) independently
+       // of ping, which is invaluable when triaging name-resolution issues.
+       "CONFIG_NSLOOKUP=y\n" +
+       "CONFIG_FEATURE_NSLOOKUP_BIG=y\n" +
        // awk is built but broken in our nommu uclibc build (""Access to
        // negative field"" on `$1`). Leaving the symbols out — rvpkg uses
        // pure POSIX shell parsing instead.
@@ -625,11 +693,16 @@ RunWsl($"cat > {wslDir}/board/rvemu/busybox.fragment << 'BB_EOF'\n" +
 // PureDOOM.h itself (~48k LOC) is shared with Examples.Doom and staged
 // into src/ below — no duplication in the repo.
 {
-    string hostDoomDir = Path.GetFullPath(Path.Combine(
-        AppContext.BaseDirectory, "..", "..", "..", "doom-puredoom"))
-        .Replace("\\", "/");
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "doom-puredoom")))
+        dir = dir.Parent;
+    if (dir == null)
+        throw new DirectoryNotFoundException(
+            "Could not locate doom-puredoom/ above " + AppContext.BaseDirectory);
+
+    string hostDoomDir = Path.Combine(dir.FullName, "doom-puredoom").Replace("\\", "/");
     string hostPureHdr = Path.GetFullPath(Path.Combine(
-        AppContext.BaseDirectory, "..", "..", "..", "..", "Doom", "Programs", "PureDOOM.h"))
+        dir.FullName, "..", "Doom", "Programs", "PureDOOM.h"))
         .Replace("\\", "/");
     string wslDoomDir = $"$(wslpath -u '{hostDoomDir}')";
     string wslPureHdr = $"$(wslpath -u '{hostPureHdr}')";
@@ -747,6 +820,41 @@ string rvpkgB64 = ToBase64Lf(rvpkgScript);
 RunWsl($"echo {rvpkgB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/usr/bin/rvpkg");
 RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/usr/bin/rvpkg");
 
+// apt / apt-get compatibility shim — this nommu+uclibc system has no
+// dpkg/apt; packages come from the rvemu host feed via rvpkg. The shim maps
+// the familiar apt verbs onto rvpkg so `apt install <pkg>` Just Works.
+Console.WriteLine("Writing /usr/bin/apt (rvpkg compatibility shim)...");
+const string aptShim = @"#!/bin/sh
+# apt/apt-get compatibility shim → rvpkg. No dpkg/apt on this system;
+# packages are served by Examples.Linux.Packageserver and fetched by rvpkg.
+cmd=""$1""
+[ $# -gt 0 ] && shift
+case ""$cmd"" in
+    install|add|get)
+        [ -z ""$1"" ] && { echo ""usage: apt install <pkg>"" >&2; exit 1; }
+        for p in ""$@""; do rvpkg install ""$p"" || exit 1; done ;;
+    update|refresh)             exec rvpkg update ;;
+    list|list-installed)        exec rvpkg list ;;
+    search|find)
+        [ -z ""$1"" ] && exec rvpkg list
+        rvpkg list | grep -i ""$1"" ;;
+    show|info)                  rvpkg list | grep -i ""$1"" ;;
+    upgrade|full-upgrade|dist-upgrade)
+        echo ""apt: rvpkg has no upgrade — reinstall with 'apt install <pkg>'"" >&2 ;;
+    remove|purge|autoremove)
+        echo ""apt: rvpkg cannot uninstall packages"" >&2; exit 1 ;;
+    """"|help|-h|--help)
+        echo ""usage: apt {update | install <pkg> | list | search <q>}   (rvpkg shim)"" ;;
+    *)
+        echo ""apt: unknown command '$cmd' (this is an rvpkg shim)"" >&2; exit 1 ;;
+esac
+";
+string aptB64 = ToBase64Lf(aptShim);
+RunWsl($"echo {aptB64} | base64 -d > {wslDir}/board/rvemu/rootfs-overlay/usr/bin/apt");
+RunWsl($"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/usr/bin/apt");
+// apt-get → apt (same shim). Symlink so both names resolve.
+RunWsl($"ln -sf apt {wslDir}/board/rvemu/rootfs-overlay/usr/bin/apt-get");
+
 // rvemu-input — userspace daemon that bridges our MMIO keyboard/mouse to
 // the kernel input subsystem via /dev/uinput. After it's running,
 // /dev/input/event0 (kbd) and event1 (mouse) appear and any standard
@@ -828,6 +936,7 @@ if (ccRc == 0)
     const string s42 = @"#!/bin/sh
 case ""$1"" in
     start)
+        grep -qw 'rvemu.nogui=1' /proc/cmdline && exit 0
         [ -e /dev/uinput ] && [ -x /usr/bin/rvemu-input ] || exit 0
         echo -n 'Starting rvemu-input (MMIO→uinput bridge)... '
         /usr/bin/rvemu-input >/dev/null 2>&1 &
@@ -851,6 +960,7 @@ exit 0
     const string s43 = @"#!/bin/sh
 case ""$1"" in
     start)
+        grep -qw 'rvemu.nogui=1' /proc/cmdline && exit 0
         [ -x /usr/bin/rvemu-desktop ] && [ -c /dev/input/event0 ] || exit 0
         echo -n 'Starting rvemu-desktop... '
         /usr/bin/rvemu-desktop >/dev/null 2>&1 &
@@ -874,6 +984,7 @@ exit 0
     const string s44 = @"#!/bin/sh
 case ""$1"" in
     start)
+        grep -qw 'rvemu.nogui=1' /proc/cmdline && exit 0
         [ -x /usr/bin/rvemu-audiod ] && [ -c /dev/snd/pcmC0D1c ] || exit 0
         echo -n 'Starting rvemu-audiod (snd-aloop -> MMIO bridge)... '
         /usr/bin/rvemu-audiod >/dev/null 2>&1 &
@@ -901,6 +1012,7 @@ exit 0
 # the daemon — rvemu-midid probes /dev/snd/midiC0D0..C7D0 itself.
 case ""$1"" in
     start)
+        grep -qw 'rvemu.nogui=1' /proc/cmdline && exit 0
         [ -x /usr/bin/rvemu-midid ] || exit 0
         ls /dev/snd/midiC*D0 >/dev/null 2>&1 || exit 0
         echo -n 'Starting rvemu-midid (snd-virmidi -> MMIO bridge)... '
@@ -1014,6 +1126,12 @@ ctl.!default {
         }
         foreach (var bin in mwBins)
         {
+            RunWsl($"if [ -f $HOME/rvemu-mw/microwindows/src/bin/{bin} ] && " +
+                   $"   [ \"$(head -c 4 $HOME/rvemu-mw/microwindows/src/bin/{bin} 2>/dev/null)\" = bFLT ] && " +
+                   $"   [ -x {wslDir}/output/host/bin/riscv32-buildroot-linux-uclibc-flthdr ]; then " +
+                   $"  {wslDir}/output/host/bin/riscv32-buildroot-linux-uclibc-flthdr -s 1048576 " +
+                   $"    $HOME/rvemu-mw/microwindows/src/bin/{bin}; " +
+                   $"fi");
             RunWsl($"cp $HOME/rvemu-mw/microwindows/src/bin/{bin} " +
                    $"{wslDir}/board/rvemu/rootfs-overlay/usr/bin/{bin} 2>/dev/null && " +
                    $"chmod 0755 {wslDir}/board/rvemu/rootfs-overlay/usr/bin/{bin}");
@@ -1026,6 +1144,7 @@ ctl.!default {
         const string s45 = @"#!/bin/sh
 case ""$1"" in
     start)
+        grep -qw 'rvemu.nogui=1' /proc/cmdline && exit 0
         [ -x /usr/bin/nano-X ] && [ -c /dev/input/event0 ] || exit 0
         # If rvemu-desktop is up, stop it — it owns the same framebuffer.
         [ -x /etc/init.d/S43desktop ] && /etc/init.d/S43desktop stop 2>/dev/null
@@ -1170,6 +1289,237 @@ RunWsl(
     "  echo '  marker present - toolchain + kernel + packages already rebuilt for rv32i no-A/no-M'; " +
     "fi");
 
+// ── 6e. Force full rebuild for the resume-gateway trap-return ABI ───────
+// The base RV32I CPU has no MRET. Userspace still enters the kernel through a
+// real ECALL, but the kernel returns from traps by jumping to the resume
+// gateway at 0xFFFF0004 (a0 = pt_regs) instead of executing MRET. The kernel
+// trap path changes, so the kernel — and every userspace package linked
+// against it — must be rebuilt; a full clean is the reliable Buildroot
+// invalidation boundary for that ABI change.
+Console.WriteLine("Checking userspace/kernel for the resume-gateway trap ABI...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.rv32i-resume-gateway-v1-applied ]; then " +
+    "  echo '  first run with the resume-gateway trap ABI - forcing FULL rebuild (make clean)'; " +
+    "  make clean && " +
+    "  rm -f board/rvemu/.real-ecall-mret-v1-applied board/rvemu/.pv-syscall-gateway-v9-applied board/rvemu/.pv-sigreturn-gateway-v3-applied && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.rv32i-resume-gateway-v1-applied; " +
+    "else " +
+    "  echo '  marker present - userspace/kernel already rebuilt for the resume-gateway trap ABI'; " +
+    "fi");
+
+// doom-puredoom is a local package copied from this repository. Buildroot will
+// not necessarily rebuild it just because doom_linux.c changed, so force a
+// one-time package dirclean for fixes to the guest Doom runtime loop.
+Console.WriteLine("Checking doom-puredoom package rebuild marker...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.doom-puredoom-midi-catchup-v1-applied ]; then " +
+    "  echo '  first run with doom-puredoom MIDI catch-up cap - rebuilding package'; " +
+    "  make doom-puredoom-dirclean || true; " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.doom-puredoom-midi-catchup-v1-applied; " +
+    "else " +
+    "  echo '  marker present - doom-puredoom already rebuilt with MIDI catch-up cap'; " +
+    "fi");
+
+// ── 6e-bis. Linux rebuild marker for the real-ECALL trap ABI ──────────
+// NOMMU signal delivery copies __user_rt_sigreturn (li a7; ecall) onto the
+// user stack. It keeps its upstream architectural ECALL — no rewrite — so
+// this block just ensures Linux is rebuilt when the trap ABI changes.
+Console.WriteLine("Checking Linux rebuild marker for the real-ECALL trap ABI...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.pv-sigreturn-gateway-v3-applied ]; then " +
+    "  echo '  first run with paravirt sigreturn/vdso gateway - forcing linux rebuild'; " +
+    "  make linux-dirclean && " +
+    "  rm -f board/rvemu/.pv-sigreturn-gateway-v1-applied board/rvemu/.pv-sigreturn-gateway-v2-applied && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.pv-sigreturn-gateway-v3-applied; " +
+    "else " +
+    "  echo '  marker present - linux already rebuilt for paravirt sigreturn/vdso gateway'; " +
+    "fi");
+
+Console.WriteLine("Checking Linux for rvemu no-WFI patch...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.rv32i-no-wfi-v2-applied ]; then " +
+    "  echo '  first run with no-WFI Linux patch v2 - applying incrementally'; " +
+    "  rm -f board/rvemu/.rv32i-no-wfi-v1-applied && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.rv32i-no-wfi-v2-applied; " +
+    "else " +
+    "  echo '  marker present - linux already rebuilt without WFI'; " +
+    "fi");
+
+Console.WriteLine("Checking Linux for rvemu no machine-probe CSR patch...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.rv32i-no-machine-probe-csrs-v1-applied ]; then " +
+    "  echo '  first run without machine-ID/PMP CSR probes - applying incrementally'; " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.rv32i-no-machine-probe-csrs-v1-applied; " +
+    "else " +
+    "  echo '  marker present - linux already rebuilt without machine-ID/PMP CSR probes'; " +
+    "fi");
+
+Console.WriteLine("Checking Linux for rvemu paravirt irqflags patch...");
+RunWsl(
+    $"cd {wslDir} && if [ ! -e board/rvemu/.rv32i-trapframe-v1-applied ]; then " +
+    "  echo '  first run with the hardware trap frame (entry.S retargeted to the 0x0F000000 trap-frame page) - forcing linux rebuild'; " +
+    "  make linux-dirclean && " +
+    "  rm -f board/rvemu/.rv32i-zicsr-v1-applied board/rvemu/.rv32i-pv-irqflags-v1-applied board/rvemu/.rv32i-pv-irqflags-v2-applied board/rvemu/.rv32i-pv-irqflags-v3-applied board/rvemu/.rv32i-pv-resume-v1-applied && " +
+    "  mkdir -p board/rvemu && touch board/rvemu/.rv32i-trapframe-v1-applied; " +
+    "else " +
+    "  echo '  marker present - linux already rebuilt against the trap-frame page'; " +
+    "fi");
+
+Console.WriteLine("Patching Linux entry.S/head.S for the trap-frame page + resume gateway...");
+RunWsl(
+    $"cd {wslDir} && make linux-patch && " +
+    "python3 - <<'PY'\n" +
+    "from pathlib import Path\n" +
+    "import re\n" +
+    "root = next(Path('output/build').glob('linux-*'))\n" +
+    "# rt_sigreturn.S and signal.c keep their upstream `li a7; ecall` pair —\n" +
+    "# userspace enters the kernel through a real ECALL. p/signal stay defined\n" +
+    "# only for the report loop below.\n" +
+    "p = root / 'arch/riscv/kernel/vdso/rt_sigreturn.S'\n" +
+    "signal = root / 'arch/riscv/kernel/signal.c'\n" +
+    "entry = root / 'arch/riscv/kernel/entry.S'\n" +
+    "s = entry.read_text()\n" +
+    "s = '\\n'.join('nop' if line.strip() == 'wfi' else line for line in s.splitlines()) + ('\\n' if s.endswith('\\n') else '')\n" +
+    "if '\\tmret\\n' in s or '\\nmret\\n' in s:\n" +
+    "    # Trap return: the base ISA has no MRET. pt_regs IS the trap frame\n" +
+    "    # (matching layout), so point a0 at it and jump to the resume gateway\n" +
+    "    # at 0xFFFF0004. The CPU reloads x1..x31 from a0, epc from a0[0] and\n" +
+    "    # status from a0[32]. t0 is clobbered to hold the gateway address but\n" +
+    "    # is itself reloaded from the frame, so the clobber is harmless.\n" +
+    "    mret_seq = ['mv a0, sp', 'li t0, 0xFFFF0004', 'jr t0']\n" +
+    "    # csrrc s1, CSR_STATUS, t0 -> read the trap-frame status word (a real\n" +
+    "    # mstatus image at landing pad +0x80) into s1; the &= ~t0 write-back\n" +
+    "    # is harmless (the live enable is the separate IE_FLAG word).\n" +
+    "    csrrc_seq = ['li t1, 0x0F000180', 'lw s1, 0(t1)', 'not t2, t0', 'and t2, s1, t2', 'sw t2, 0(t1)']\n" +
+    "    csr_rw = {\n" +
+    "        'csrr tp, CSR_SCRATCH': ['li tp, 0x0F00000C', 'lw tp, 0(tp)'],\n" +
+    "        'csrr s2, CSR_EPC': ['li t0, 0x0F000100', 'lw s2, 0(t0)'],\n" +
+    "        'csrr s3, CSR_TVAL': ['li t0, 0x0F000184', 'lw s3, 0(t0)'],\n" +
+    "        'csrr s4, CSR_CAUSE': ['li t0, 0x0F000188', 'lw s4, 0(t0)'],\n" +
+    "        'csrr s5, CSR_SCRATCH': ['li t0, 0x0F00000C', 'lw s5, 0(t0)'],\n" +
+    "        'csrw CSR_SCRATCH, x0': ['li t0, 0x0F00000C', 'sw x0, 0(t0)'],\n" +
+    "        'csrw CSR_SCRATCH, tp': ['li t0, 0x0F00000C', 'sw tp, 0(t0)'],\n" +
+    "        # epc/status are read straight from pt_regs by the gateway, so\n" +
+    "        # just make sure the (possibly modified) values land back in the\n" +
+    "        # frame instead of a (removed) CSR.\n" +
+    "        'csrw CSR_STATUS, a0': ['REG_S a0, PT_STATUS(sp)'],\n" +
+    "        'csrw CSR_EPC, a2': ['REG_S a2, PT_EPC(sp)'],\n" +
+    "    }\n" +
+    "    out = []\n" +
+    "    for line in s.splitlines():\n" +
+    "        st = line.strip()\n" +
+    "        prefix = line[:len(line) - len(line.lstrip())]\n" +
+    "        if st == 'mret':\n" +
+    "            # Idempotent by construction: a full rewrite leaves no 'mret'\n" +
+    "            # token, so the outer guard skips this block on a re-run.\n" +
+    "            out.extend([prefix + x for x in mret_seq])\n" +
+    "        elif st == 'REG_L x2,  PT_SP(sp)' or st == 'csrrw tp, CSR_SCRATCH, tp':\n" +
+    "            continue\n" +
+    "        elif st == 'csrrc s1, CSR_STATUS, t0':\n" +
+    "            out.extend([prefix + x for x in csrrc_seq])\n" +
+    "        elif st in csr_rw:\n" +
+    "            out.extend([prefix + x for x in csr_rw[st]])\n" +
+    "        else:\n" +
+    "            out.append(line)\n" +
+    "    s = '\\n'.join(out) + ('\\n' if s.endswith('\\n') else '')\n" +
+    "entry.write_text(s)\n" +
+    "head = root / 'arch/riscv/kernel/head.S'\n" +
+    "lines = head.read_text().splitlines()\n" +
+    "out = []\n" +
+    "for line in lines:\n" +
+    "    prefix = line[:len(line) - len(line.lstrip())]\n" +
+    "    stripped = line.strip()\n" +
+    "    compact = ' '.join(stripped.split())\n" +
+    "    def pv_store(reg, offset):\n" +
+    "        out.append(prefix + 'li t0, 0x0F000000')\n" +
+    "        out.append(prefix + f'sw {reg}, {offset}(t0)')\n" +
+    "    if compact == 'wfi':\n" +
+    "        out.append(prefix + 'nop')\n" +
+    "    elif compact.startswith('csrw CSR_TVEC,'):\n" +
+    "        pv_store(compact.split(',', 1)[1].strip(), 4)\n" +
+    "    elif compact.startswith('csrw CSR_SCRATCH,'):\n" +
+    "        reg = compact.split(',', 1)[1].strip()\n" +
+    "        pv_store('zero' if reg == '0' else reg, 12)\n" +
+    "    elif compact == 'csrw CSR_IE, zero':\n" +
+    "        pv_store('zero', 8)\n" +
+    "    elif compact == 'csrw CSR_IP, zero':\n" +
+    "        out.append(prefix + 'nop')\n" +
+    "    elif compact in ('csrc CSR_STATUS, t0', 'csrs CSR_STATUS, t1'):\n" +
+    "        out.append(prefix + 'nop')\n" +
+    "    elif compact in ('csrw CSR_PMPADDR0, a0', 'csrw CSR_PMPCFG0, a0'):\n" +
+    "        out.append(prefix + 'nop')\n" +
+    "    elif compact == 'csrr a0, CSR_MHARTID':\n" +
+    "        out.append(prefix + 'li a0, 0')\n" +
+    "    else:\n" +
+    "        out.append(line)\n" +
+    "head.write_text('\\n'.join(out) + ('\\n' if head.read_text().endswith('\\n') else ''))\n" +
+    "for q in (root / 'arch/riscv/kernel/alternative.c', root / 'arch/riscv/kernel/cpu.c'):\n" +
+    "    s = q.read_text()\n" +
+    "    s = s.replace('csr_read(CSR_MVENDORID)', '0')\n" +
+    "    s = s.replace('csr_read(CSR_MARCHID)', '0')\n" +
+    "    s = s.replace('csr_read(CSR_MIMPID)', '0')\n" +
+    "    q.write_text(s)\n" +
+    "cpufeature = root / 'arch/riscv/kernel/cpufeature.c'\n" +
+    "s = cpufeature.read_text()\n" +
+    "s = s.replace('csr_set(CSR_ENVCFG, ENVCFG_CBZE);', '; /* rvemu: MENVCFG CSR removed. */')\n" +
+    "s = s.replace('\\n/* rvemu: MENVCFG CSR removed. */', '\\n; /* rvemu: MENVCFG CSR removed. */')\n" +
+    "cpufeature.write_text(s)\n" +
+    "archrandom = root / 'arch/riscv/include/asm/archrandom.h'\n" +
+    "s = archrandom.read_text()\n" +
+    "s = s.replace('unsigned long csr_seed = csr_swap(CSR_SEED, 0);', 'unsigned long csr_seed = SEED_OPST_DEAD;')\n" +
+    "archrandom.write_text(s)\n" +
+    "irqflags = root / 'arch/riscv/include/asm/irqflags.h'\n" +
+    "irqflags.write_text('''/* SPDX-License-Identifier: GPL-2.0-only */\\n#ifndef _ASM_RISCV_IRQFLAGS_H\\n#define _ASM_RISCV_IRQFLAGS_H\\n\\n#include <asm/csr.h>\\n\\n/* IE_FLAG word of the hardware trap-frame page (mstatus image; bit3 = MIE). */\\n#define RVEMU_PV_IRQFLAGS ((volatile unsigned long *)0x0F000000UL)\\n\\nstatic inline unsigned long arch_local_save_flags(void)\\n{\\n\\treturn RVEMU_PV_IRQFLAGS[0];\\n}\\n\\nstatic inline void arch_local_irq_enable(void)\\n{\\n\\tRVEMU_PV_IRQFLAGS[0] = SR_IE;\\n}\\n\\nstatic inline void arch_local_irq_disable(void)\\n{\\n\\tRVEMU_PV_IRQFLAGS[0] = 0;\\n}\\n\\nstatic inline unsigned long arch_local_irq_save(void)\\n{\\n\\tunsigned long flags = RVEMU_PV_IRQFLAGS[0];\\n\\tRVEMU_PV_IRQFLAGS[0] = 0;\\n\\treturn flags;\\n}\\n\\nstatic inline int arch_irqs_disabled_flags(unsigned long flags)\\n{\\n\\treturn !(flags & SR_IE);\\n}\\n\\nstatic inline int arch_irqs_disabled(void)\\n{\\n\\treturn arch_irqs_disabled_flags(arch_local_save_flags());\\n}\\n\\nstatic inline void arch_local_irq_restore(unsigned long flags)\\n{\\n\\tRVEMU_PV_IRQFLAGS[0] = flags;\\n}\\n\\n#endif /* _ASM_RISCV_IRQFLAGS_H */\\n''')\n" +
+    "for q in [root / 'drivers/clocksource/timer-clint.c', root / 'drivers/irqchip/irq-riscv-intc.c', root / 'drivers/perf/riscv_pmu_sbi.c', root / 'arch/riscv/kernel/suspend.c']:\n" +
+    "    if not q.exists():\n" +
+    "        continue\n" +
+    "    s = q.read_text()\n" +
+    "    s = re.sub(r'csr_set\\(CSR_IE,\\s*([^;]+?)\\);', r'do { volatile unsigned long *rvemu_pv = (volatile unsigned long *)0x0F000000UL; rvemu_pv[2] = rvemu_pv[2] | (\\1); } while (0);', s)\n" +
+    "    s = re.sub(r'csr_clear\\(CSR_IE,\\s*([^;]+?)\\);', r'do { volatile unsigned long *rvemu_pv = (volatile unsigned long *)0x0F000000UL; rvemu_pv[2] = rvemu_pv[2] & ~(\\1); } while (0);', s)\n" +
+    "    s = s.replace('context->ie = csr_read(CSR_IE);', 'context->ie = ((volatile unsigned long *)0x0F000000UL)[2];')\n" +
+    "    s = s.replace('csr_write(CSR_IE, context->ie);', '((volatile unsigned long *)0x0F000000UL)[2] = context->ie;')\n" +
+    "    q.write_text(s)\n" +
+    "fence_h = root / 'arch/riscv/include/asm/fence.h'\n" +
+    "if fence_h.exists():\n" +
+    "    fence_h.write_text('#ifndef _ASM_RISCV_FENCE_H\\n#define _ASM_RISCV_FENCE_H\\n\\n#define RISCV_ACQUIRE_BARRIER \"\"\\n#define RISCV_RELEASE_BARRIER \"\"\\n\\n#endif /* _ASM_RISCV_FENCE_H */\\n')\n" +
+    "barrier_h = root / 'arch/riscv/include/asm/barrier.h'\n" +
+    "if barrier_h.exists():\n" +
+    "    barrier_h.write_text('#ifndef _ASM_RISCV_BARRIER_H\\n#define _ASM_RISCV_BARRIER_H\\n\\n#ifndef __ASSEMBLY__\\n#define nop() __asm__ __volatile__(\"nop\")\\n#define __nops(n) \"\"\\n#define nops(n) do { } while (0)\\n#define RISCV_FENCE(p, s) __asm__ __volatile__(\"\" : : : \"memory\")\\n#define mb() barrier()\\n#define rmb() barrier()\\n#define wmb() barrier()\\n#define __smp_mb() barrier()\\n#define __smp_rmb() barrier()\\n#define __smp_wmb() barrier()\\n#define __smp_store_release(p, v) do { compiletime_assert_atomic_type(*p); WRITE_ONCE(*p, v); } while (0)\\n#define __smp_load_acquire(p) ({ typeof(*p) ___p1 = READ_ONCE(*p); compiletime_assert_atomic_type(*p); ___p1; })\\n#define smp_mb__after_spinlock() barrier()\\n#include <asm-generic/barrier.h>\\n#endif /* __ASSEMBLY__ */\\n\\n#endif /* _ASM_RISCV_BARRIER_H */\\n')\n" +
+    "for q in list((root / 'arch/riscv').rglob('*.S')) + list((root / 'arch/riscv').rglob('*.h')) + list((root / 'arch/riscv').rglob('*.c')):\n" +
+    "    s = q.read_text(errors='ignore')\n" +
+    "    ns = s.replace('fence.i', 'nop')\n" +
+    "    ns = re.sub(r'(?m)^(\\s*)fence(?:\\s+[^\\n#]+)?(\\s*(?:#.*)?)$', r'\\1nop\\2', ns)\n" +
+    "    ns = re.sub(r'\"fence[^\"]*\"', '\"\"', ns)\n" +
+    "    ns = ns.replace('\"pause\"', '\"\"')\n" +
+    "    ns = ns.replace('\".4byte 0x100000F\"', '\"\"')\n" +
+    "    ns = ns.replace('\".4byte 0x0100000F\"', '\"\"')\n" +
+    "    ns = ns.replace('\".4byte 0x0100000f\"', '\"\"')\n" +
+    "    if ns != s:\n" +
+    "        q.write_text(ns)\n" +
+    "processor = root / 'arch/riscv/include/asm/processor.h'\n" +
+    "s = processor.read_text()\n" +
+    "s = s.replace('__asm__ __volatile__ (\"wfi\");', '__asm__ __volatile__ (\"nop\");')\n" +
+    "processor.write_text(s)\n" +
+    "reset = root / 'arch/riscv/kernel/reset.c'\n" +
+    "s = reset.read_text()\n" +
+    "s = s.replace('while (1)\\n\\t\\twait_for_interrupt();', 'while (1)\\n\\t\\tcpu_relax();')\n" +
+    "s = s.replace('while (1)wait_for_interrupt();', 'while (1)cpu_relax();')\n" +
+    "reset.write_text(s)\n" +
+    "for p in (p, signal, entry, head, root / 'arch/riscv/kernel/alternative.c', root / 'arch/riscv/kernel/cpu.c', cpufeature, archrandom, irqflags, processor, reset):\n" +
+    "  print(p)\n" +
+    "  for n, line in enumerate(p.read_text().splitlines(), 1):\n" +
+    "    if 'rt_sigreturn' in line or 'ecall' in line or '0xffff0' in line or '0x0F000' in line or 'RVEMU_PV_IRQFLAGS' in line or 'jalr ra, t0' in line or 'wfi' in line or 'fence' in line or '\"nop\"' in line or 'CSR_PMP' in line or 'CSR_MHARTID' in line or 'CSR_MVENDORID' in line or 'CSR_MARCHID' in line or 'CSR_MIMPID' in line or 'CSR_ENVCFG' in line or 'CSR_SEED' in line or 'SEED_OPST_DEAD' in line:\n" +
+    "        print(f'{n}:{line}')\n" +
+    "for q in sorted((root / 'arch/riscv/kernel/vdso').glob('*.S')):\n" +
+    "  for n, line in enumerate(q.read_text().splitlines(), 1):\n" +
+    "    if 'ecall' in line or '0xffff0' in line or 'jalr ra, t0' in line:\n" +
+    "      print(f'{q}:{n}:{line}')\n" +
+    "PY\n");
+
+// uClibc's RISC-V syscall stubs are left untouched: userspace enters the
+// kernel through an architectural ECALL, which the CPU turns into an
+// environment-call trap (cause 8 from U-mode). No syscall-stub rewrite.
+
 // ── 7. Build ─────────────────────────────────────────────────────────────
 
 Console.WriteLine();
@@ -1181,6 +1531,175 @@ Console.WriteLine();
 RunWsl($"cd {wslDir} && make linux-reconfigure");
 int bld = RunWsl($"cd {wslDir} && make -j{jobs}");
 if (bld != 0) return bld;
+
+// ── 7b. Report shipped user ECALL instructions ────────────────────────────
+//
+// Direct ECALL is part of the guest ABI and must keep working: unmodified user
+// binaries should still be able to enter Linux normally. Keep this as a report
+// so we can distinguish direct ECALL traffic from the optional rvemu gateway,
+// but do not fail the build for architectural ECALL instructions.
+Console.WriteLine("Reporting staged BFLT executables that contain direct user ECALL instructions...");
+RunWsl(
+    $"cd {wslDir} && python3 - <<'PY'\n" +
+    "from pathlib import Path\n" +
+    "import struct\n" +
+    "bad = []\n" +
+    "for p in Path('output/target').rglob('*'):\n" +
+    "    if not p.is_file():\n" +
+    "        continue\n" +
+    "    try:\n" +
+    "        data = p.read_bytes()\n" +
+    "    except OSError:\n" +
+    "        continue\n" +
+    "    if data[:4] != b'bFLT' or len(data) < 64:\n" +
+    "        continue\n" +
+    "    version, entry, data_start = struct.unpack('>III', data[4:16])\n" +
+    "    if version != 4 or entry >= data_start or data_start > len(data):\n" +
+    "        bad.append((str(p), ['invalid-bflt-header']))\n" +
+    "        continue\n" +
+    "    text = data[entry:data_start]\n" +
+    "    hits = []\n" +
+    "    i = text.find(b'\\x73\\x00\\x00\\x00')\n" +
+    "    while i != -1:\n" +
+    "        hits.append(entry + i)\n" +
+    "        i = text.find(b'\\x73\\x00\\x00\\x00', i + 1)\n" +
+    "    if hits:\n" +
+    "        bad.append((str(p), [hex(x) for x in hits[:16]]))\n" +
+    "if bad:\n" +
+    "    print('  Direct ECALL instructions found in staged user executables:')\n" +
+    "    for path, hits in bad:\n" +
+    "        print(f'    {path}: {\" \".join(hits)}')\n" +
+    "else:\n" +
+    "    print('  No direct ECALL instructions found in BFLT text segments.')\n" +
+    "PY\n");
+
+// ── 7c. Report remaining privileged/system opcodes ────────────────────────
+//
+// The end-state target is pure RV32I hardware. Keep this non-fatal inventory
+// close to the image build so each paravirt milestone has a static measurement
+// in addition to RVEMU_PRIV_TRACE runtime counters.
+Console.WriteLine("Reporting privileged/system opcode inventory...");
+RunWsl(
+    $"cd {wslDir} && python3 - <<'PY'\n" +
+    "from pathlib import Path\n" +
+    "import bisect, re, struct, subprocess\n" +
+    "mnems = ['mret', 'sret', 'wfi', 'ecall', 'ebreak', 'pause', 'fence', 'fence.i', 'csrr', 'csrw', 'csrrw', 'csrrs', 'csrrc', 'csrrwi', 'csrrsi', 'csrrci']\n" +
+    "objdumps = sorted(Path('output/host/bin').glob('riscv32-*-objdump'))\n" +
+    "vmlinux = next(Path('output/build').glob('linux-*/vmlinux'), None)\n" +
+    "if objdumps and vmlinux and vmlinux.exists():\n" +
+    "    text = subprocess.check_output([str(objdumps[0]), '-d', str(vmlinux)], text=True, errors='replace')\n" +
+    "    sym_addrs = []\n" +
+    "    sym_names = []\n" +
+    "    nms = sorted(Path('output/host/bin').glob('riscv32-*-nm'))\n" +
+    "    if nms:\n" +
+    "        for line in subprocess.check_output([str(nms[0]), '-n', str(vmlinux)], text=True, errors='replace').splitlines():\n" +
+    "            parts = line.split()\n" +
+    "            if len(parts) >= 3 and re.fullmatch(r'[0-9a-fA-F]+', parts[0]) and parts[1] in 'TtWw':\n" +
+    "                sym_addrs.append(int(parts[0], 16))\n" +
+    "                sym_names.append(parts[2])\n" +
+    "    def symbol_for(addr):\n" +
+    "        if not sym_addrs:\n" +
+    "            return '?'\n" +
+    "        i = bisect.bisect_right(sym_addrs, addr) - 1\n" +
+    "        return sym_names[i] if i >= 0 else '?'\n" +
+    "    hits = {m: [] for m in mnems}\n" +
+    "    for line in text.splitlines():\n" +
+    "        m = re.search(r'\\b(' + '|'.join(mnems) + r')\\b', line)\n" +
+    "        if m:\n" +
+    "            hits[m.group(1)].append(line.strip())\n" +
+    "    print(f'  Kernel: {vmlinux}')\n" +
+    "    for m in mnems:\n" +
+    "        if hits[m]:\n" +
+    "            print(f'    {m}: {len(hits[m])}')\n" +
+    "            for line in hits[m][:8]:\n" +
+    "                print(f'      {line}')\n" +
+    "    csr_names = {0x300:'mstatus',0x301:'misa',0x304:'mie',0x305:'mtvec',0x340:'mscratch',0x341:'mepc',0x342:'mcause',0x343:'mtval',0x344:'mip'}\n" +
+    "    csr_totals = {}\n" +
+    "    csr_examples = {}\n" +
+    "    csr_symbols = {}\n" +
+    "    csr_symbol_examples = {}\n" +
+    "    for line in text.splitlines():\n" +
+    "        m = re.search(r':\\s*([0-9a-fA-F]{8})\\b', line)\n" +
+    "        if not m:\n" +
+    "            continue\n" +
+    "        addr = int(line.split(':', 1)[0].strip(), 16)\n" +
+    "        word = int(m.group(1), 16)\n" +
+    "        if (word & 0x7f) != 0x73 or ((word >> 12) & 7) == 0:\n" +
+    "            continue\n" +
+    "        csr = (word >> 20) & 0xfff\n" +
+    "        csr_totals[csr] = csr_totals.get(csr, 0) + 1\n" +
+    "        csr_examples.setdefault(csr, line.strip())\n" +
+    "        key = (csr, symbol_for(addr))\n" +
+    "        csr_symbols[key] = csr_symbols.get(key, 0) + 1\n" +
+    "        csr_symbol_examples.setdefault(key, line.strip())\n" +
+    "    if csr_totals:\n" +
+    "        print('  Kernel CSR references by CSR:')\n" +
+    "        for csr, count in sorted(csr_totals.items(), key=lambda kv: (-kv[1], kv[0])):\n" +
+    "            print(f'    0x{csr:03x} {csr_names.get(csr, \"\")}: {count}')\n" +
+    "            print(f'      {csr_examples[csr]}')\n" +
+    "        print('  Kernel CSR references by symbol (top 32):')\n" +
+    "        for (csr, sym), count in sorted(csr_symbols.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1]))[:32]:\n" +
+    "            print(f'    {count:5} 0x{csr:03x} {csr_names.get(csr, \"\"):8} {sym}')\n" +
+    "            print(f'      {csr_symbol_examples[(csr, sym)]}')\n" +
+    "else:\n" +
+    "    print('  Kernel disassembly unavailable for privileged opcode inventory.')\n" +
+    "\n" +
+    "def system_kind(word):\n" +
+    "    if (word & 0x7f) == 0x0f:\n" +
+    "        if word == 0x0100000f: return 'pause'\n" +
+    "        return 'fence.i' if ((word >> 12) & 7) == 1 else 'fence'\n" +
+    "    if word == 0x00000073: return 'ecall'\n" +
+    "    if word == 0x00100073: return 'ebreak'\n" +
+    "    if word == 0x10200073: return 'sret'\n" +
+    "    if word == 0x30200073: return 'mret'\n" +
+    "    if word == 0x10500073: return 'wfi'\n" +
+    "    if (word & 0x7f) == 0x73 and ((word >> 12) & 7) != 0: return 'csr'\n" +
+    "    return None\n" +
+    "\n" +
+    "def csr_number(word):\n" +
+    "    if (word & 0x7f) == 0x73 and ((word >> 12) & 7) != 0:\n" +
+    "        return (word >> 20) & 0xfff\n" +
+    "    return None\n" +
+    "\n" +
+    "bflt_totals = {}\n" +
+    "bflt_csrs = {}\n" +
+    "bflt_examples = []\n" +
+    "for p in Path('output/target').rglob('*'):\n" +
+    "    if not p.is_file():\n" +
+    "        continue\n" +
+    "    try:\n" +
+    "        data = p.read_bytes()\n" +
+    "    except OSError:\n" +
+    "        continue\n" +
+    "    if data[:4] != b'bFLT' or len(data) < 64:\n" +
+    "        continue\n" +
+    "    version, entry, data_start = struct.unpack('>III', data[4:16])\n" +
+    "    if version != 4 or entry >= data_start or data_start > len(data):\n" +
+    "        continue\n" +
+    "    text = data[entry:data_start]\n" +
+    "    local = {}\n" +
+    "    for off in range(0, len(text) - 3, 4):\n" +
+    "        word = struct.unpack_from('<I', text, off)[0]\n" +
+    "        kind = system_kind(word)\n" +
+    "        if kind:\n" +
+    "            local[kind] = local.get(kind, 0) + 1\n" +
+    "            bflt_totals[kind] = bflt_totals.get(kind, 0) + 1\n" +
+    "        csr = csr_number(word)\n" +
+    "        if csr is not None:\n" +
+    "            bflt_csrs[csr] = bflt_csrs.get(csr, 0) + 1\n" +
+    "    if local and len(bflt_examples) < 24:\n" +
+    "        bflt_examples.append((str(p), local))\n" +
+    "if bflt_totals:\n" +
+    "    print('  BFLT text system-op totals: ' + ', '.join(f'{k}={bflt_totals[k]}' for k in sorted(bflt_totals)))\n" +
+    "    for path, local in bflt_examples:\n" +
+    "        print('    ' + path + ': ' + ', '.join(f'{k}={local[k]}' for k in sorted(local)))\n" +
+    "    if bflt_csrs:\n" +
+    "        print('  BFLT text CSR references by number:')\n" +
+    "        for csr, count in sorted(bflt_csrs.items(), key=lambda kv: (-kv[1], kv[0])):\n" +
+    "            print(f'    0x{csr:03x}: {count}')\n" +
+    "else:\n" +
+    "    print('  No privileged/system opcodes found in BFLT text segments.')\n" +
+    "PY\n");
 
 // ── 8. Copy outputs ──────────────────────────────────────────────────────
 

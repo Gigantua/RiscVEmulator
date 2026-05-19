@@ -23,7 +23,7 @@ Flagship demo is a full Doom port.
 Core/                    Emulator engine: P/Invoke shell, memory bus, MMIO
                          dispatcher, host VA reservation, ELF loader.
 Core/Peripherals/        12 IPeripheral implementations.
-Native/                  C++ CPU hot path (rv32i_core.cpp, ~550 lines, ClangCL).
+Native/                  C++ CPU hot path (rv32i_core.cpp, ~355 lines, ClangCL).
 Frontend/                SDL2 window (rendering, input, audio) via Silk.NET.SDL.
 Examples/                Demo apps: Doom, Voxel, Mp4Player, Video, Sound,
                          Input, Midi, Runner, TinyCC, Linux.
@@ -97,10 +97,49 @@ which peripheral owns the page, decodes the x86 MOV at the faulting RIP
 writes the result into the saved register context, and advances RIP past
 the instruction. The CPU never knows anything happened.
 
-**No ECALL callback**: ECALL/EBREAK trap to mtvec (priv mode is always on).
-The bare-metal runtime exits via MMIO write to `0x40000000` (`HostExitDevice`)
-and writes UART bytes via MMIO at `0x10000000`. There is no syscall hook in
-the CPU.
+**No ECALL callback**: ECALL/EBREAK trap through the hardware trap frame
+(see below; priv mode is always on). The bare-metal runtime exits via MMIO
+write to `0x40000000` (`HostExitDevice`) and writes UART bytes via MMIO at
+`0x10000000`. There is no syscall hook in the CPU.
+
+**Hardware trap frame**: there are no architectural CSRs and no host CSR
+accessors. On any trap the CPU itself spills `epc` plus `x1..x31` plus
+`status`/`tval`/`cause` into a fixed 36-word *landing pad*, clears the
+interrupt enable, enters M-mode and jumps to the guest-installed handler.
+Trap return is the `0xFFFF0004` gateway: the handler puts the address of its
+private frame in `a0` and jumps there, and the CPU reloads `x1..x31` and
+resumes. All of this state lives in the `TrapFrameDevice` page (plain RAM,
+default guest physical `0x0F000000`):
+
+```
++0x000  IE_FLAG      interrupt enable, mstatus image (bit3 MIE = enabled)
++0x004  TRAP_VECTOR  handler entry PC (guest writes once at boot)
++0x008  IE_MASK      per-source enable (bit7 = MTIP, bit11 = MEIP)
++0x00C  TRAP_SCRATCH mscratch-equivalent — trap entry swaps it with tp (x4)
++0x100  landing pad  36-word frame, laid out to match Linux struct pt_regs:
+                       word[0]     = epc
+                       word[1..31] = x1..x31  (word index == reg number)
+                       word[32]    = status   (mstatus image)
+                       word[33]    = badaddr (tval)   word[34] = cause
+```
+
+The frame layout **is** the RISC-V `struct pt_regs`, so the Linux kernel's
+`pt_regs` is itself a valid trap frame — no translation copy. `status` is a
+real mstatus image: trap entry builds it (`MPIE` ← old `MIE`, `MPP` ← old
+priv, `MIE` ← 0) and trap return applies `mret` semantics to it (`MIE` ←
+`MPIE`, priv ← `MPP`). `IE_FLAG` is likewise an mstatus image — only bit 3
+(`MIE`) is consulted. `TRAP_SCRATCH` is the `mscratch` replacement: trap
+entry swaps it with `tp` so a handler entered from U-mode boots with a
+usable kernel thread pointer (the kernel manages the word the rest of the
+time).
+
+Entry always lands in the *shared* fixed pad; the handler must copy it to a
+*private* per-invocation frame before re-enabling interrupts, and return
+through that private frame. This asymmetry is what makes nested traps safe —
+a nested trap reuses the shared pad but cannot corrupt an outer context that
+has already been copied out (regression test: `Programs/nested_trap.c`).
+The only privileged state the CPU keeps in registers is the current
+privilege bit and the host interrupt-pin latch.
 
 ## ISA Support
 
@@ -108,36 +147,38 @@ See the header of `Native/rv32i_core.cpp` for the authoritative list.
 
 | Ext              | Status   | Notes                                                 |
 |------------------|----------|-------------------------------------------------------|
-| RV32I            | full     | all 40 base instructions                              |
+| RV32I            | yes      | all base integer instructions; FENCE/FENCE.I retire as NOP |
 | M                | no       | MUL/MULH[SU\|U] *and* DIV/DIVU/REM/REMU all trap as   |
 |                  |          | illegal — fully removed; mul/div/rem lowered to libcalls |
 | A                | no       | LR.W/SC.W/AMO*.W all trap as illegal                   |
 | F                | no       | FLW/FSW/FMA/OP-FP opcodes trap as illegal              |
-| Zicsr / Zifencei | yes / NOP| FENCE/FENCE.I are NOPs                                |
-| Priv M/S/U       | full     | trap delegation (medeleg/mideleg), MRET/SRET, WFI     |
+| Zicsr / Zifencei | no / no  | all CSR instructions trap illegal; FENCE/FENCE.I are NOPs (base ISA, harmless single-hart) |
+| Priv M/U         | partial  | ECALL/EBREAK via the hardware trap frame; MRET, WFI, all CSR ops trap illegal |
 | D                | no       | provide via `Runtime/softfloat.c` in guest            |
 | C                | no       | all instructions 32-bit                               |
 | B / Zb*, V       | no       |                                                       |
-| MMU walks        | no       | `satp` is stored but loads/stores use bare guest-phys |
+| MMU walks        | no       | no `satp`; loads/stores use bare guest-phys           |
 | Misalign traps   | no       | host does the access; x86 handles misalign natively   |
 
-Privileged mode is **always on**. The CPU boots in M-mode with all CSRs zero.
-There is no `EnablePrivMode` toggle on the native side; the C# property of
-that name on `Emulator` is an inert compat shim.
-
-Spec-strict CSR masks (sstatus/sie/sip view masks, mip MTIP write-protect,
-mepc/sepc low-bit clear) are intentionally **dropped** for code lean-ness.
-Linux follows protocol and is unaffected. A third-party guest that pokes
-those bits directly may misbehave — restore the masks in `priv_csr` if you
-need strict compliance.
+Privileged mode is **always on**. The CPU boots in M-mode. There are no
+architectural CSRs at all — `Zicsr` is removed, so every `csrr`/`csrw` and
+`mret`/`sret`/`wfi` traps as an illegal instruction (`fence`/`fence.i` are
+mandatory base RV32I and retire as NOP, not traps). The trap
+machinery is the hardware trap frame described above; S-mode, PMP,
+machine-ID, ENVCFG/SEED and trap-delegation registers do not exist. The
+Linux path is M/U NOMMU and is unaffected.
 
 ## Interrupts
 
-`check_interrupts()` runs every step. Currently MTIP is the only externally-
-visible interrupt source, auto-raised when `mtime ≥ mtimecmp`. The priority
-table is wired for MEIP/MSIP/MTIP/SEIP/SSIP/STIP — all bits are settable via
-CSR write from the guest, but the host has no injector for MEIP/SEIP yet
-(see `AGENTS.md` "Adding networking" for the missing trampoline).
+`check_interrupts()` runs every step. MTIP and MEIP are host-injected
+interrupt pins — the only trap-unit state the host can touch. A pending pin
+fires only when `IE_MASK` (trap-frame page `+0x008`) enables that source and
+`IE_FLAG` (`+0x000`) has interrupts globally on; both are guest-memory words,
+not CSRs. The C# `ClintDevice` peripheral owns `mtime`/`mtimecmp` and drives
+MTIP via `rv32i_set_mtip` (polled by `Emulator.StepN` between step batches);
+the PLIC drives MEIP via `rv32i_set_meip`. `rv32i_set_mtip`/`rv32i_set_meip`
+are the entire trap-state ABI — a peripheral raises a pin, the CPU does the
+context switch itself.
 
 ## Halting and exit code
 
@@ -159,6 +200,7 @@ poweroff) which sets the emulator halted flag.
 | `0x10001000` | Keyboard (scancode FIFO)                  | guarded  |
 | `0x10002000` | Mouse (relative deltas)                   | guarded  |
 | `0x10003000` | Real-Time Clock (wall-clock µs/ms/epoch)  | guarded  |
+| `0x0F000000` | Trap-frame page (IE flags, vector, frame) | plain    |
 | `0x20000000` | Framebuffer (320×200 RGBA8888)            | plain    |
 | `0x20100000` | Display Control (resolution, vsync, …)    | guarded  |
 | `0x30000000` | Audio PCM buffer (1 MB)                   | plain    |
@@ -327,7 +369,8 @@ Program.cs` enforces this two ways:
 
 * **Toolchain**: `BR2_RISCV_ISA_RVA` and `BR2_RISCV_ISA_RVM` are left OFF,
   so `arch/arch.mk.riscv` computes the internal toolchain `-march` as
-  `rv32i_zicsr_zifencei` (no `a` or `m`). Program.cs additionally sed-strips any stale `_zmmul` token
+  `rv32i_zicsr_zifencei` (no `a` or `m`), then rewrites Linux `fence.i` and
+  base `fence` sites to `nop` because native FENCE/Zifencei are removed. Program.cs additionally sed-strips any stale `_zmmul` token
   from `arch.mk.riscv` so a buildroot tree left over from the previous
   multiply-only milestone converges to plain `rv32i`. uClibc-ng,
   busybox, all packages, `bin/xc.sh`, the doom-puredoom / doomgeneric
@@ -336,7 +379,7 @@ Program.cs` enforces this two ways:
   `*`, `/` and `%` to libcalls; userspace resolves them from
   buildroot-built libgcc.
 * **Kernel**: the RV32 kernel hard-codes its own `-march` (`riscv-march-y`
-  in `arch/riscv/Makefile`) and links no libgcc. Two buildroot kernel
+  in `arch/riscv/Makefile`) and links no libgcc. Four buildroot kernel
   patches live in `Examples/Linux.Build_RV32i/board-patches/linux/`
   (staged into `board/rvemu/patches/linux/`, wired via
   `BR2_GLOBAL_PATCH_DIR`): `0001` rewrites the kernel `-march` to plain
@@ -347,7 +390,11 @@ Program.cs` enforces this two ways:
   shift+add / shift-subtract — it contains no `mul`/`div`/`rem` opcode,
   so the helpers are themselves valid on the M-less CPU. `0003` replaces
   kernel RISC-V LR/SC/AMO atomic, bitop, xchg and cmpxchg helpers with
-  single-hart no-A fallbacks.
+  single-hart no-A fallbacks, and `0004` routes the remaining
+  reservation-clear and futex LR/SC/AMO assembly through those no-A
+  helpers. A fifth patch under `board-patches/uclibc/` strips the
+  LR.W/SC.W/AMOSWAP.W atomics from uClibc-ng's linuxthreads
+  `pt-machine.h`.
 
 `Examples/Linux.Build_RV32i` also rewrites the inherited kernel
 `CONFIG_LOCALVERSION` from the upstream template's `mini-rv32ima` label to
@@ -459,6 +506,34 @@ $CC -static -fPIC -Wl,-elf2flt=-r -O2 src.c -o out
 Without `-Wl,-elf2flt=-r` the binary loads as a process but never reaches
 `main()`. `Examples.Linux.Build_RV32i/Program.cs` drives the cross-compile
 via a small shell script and drops the results into the rootfs overlay.
+
+### Trap-return gateway
+
+The base RV32I CPU has no `MRET`. Userspace enters the kernel through an
+ordinary `ecall` — there is no magic syscall address (an earlier `0xFFFF0000`
+syscall-gateway experiment was dropped; userspace now uses the architectural
+`ecall` and the CPU raises the usual environment-call trap). The kernel
+*returns* from a trap by putting its private trap-frame pointer in `a0` and
+jumping to the fixed resume gateway at `0xFFFF0004`. `rv32i_core.cpp` detects
+that fetch address and applies `mret` semantics (`PV_RESUME_GATEWAY`) — no
+privileged instruction is ever decoded.
+
+> **Trap-frame ABI (verified booting).** The native CPU has no CSRs or CSR
+> MMIO page — trap state lives in the `0x0F000000` trap-frame page (see
+> "Hardware trap frame" above). The Build_RV32i paravirt kernel codegen is
+> ported to it: `entry.S`/`head.S` CSR sites target the trap-frame page,
+> `mret` becomes an `a0`-pointer jump to the `0xFFFF0004` gateway, and
+> `irqflags.h` uses `IE_FLAG`. A cached `Image-net` built against the old
+> `0x10006000` ABI must be rebuilt (rerun `Examples/Linux.Build_RV32i`; the
+> rebuild fires once on the `board/rvemu/.rv32i-trapframe-v1-applied`
+> marker). The current image boots to userspace — `LinuxTest`.
+>
+> **PLIC window sizing matters.** The trap-frame page sits at `0x0F000000`,
+> *inside* the PLIC's architectural 64 MB region (`0x0C000000`). `PlicDevice`
+> therefore exposes only a 4 MB window — enough for every PLIC register —
+> so the trap-frame page stays plain RAM. Restoring the 64 MB window would
+> guard `0x0F000000` and silently break the trap unit (every trap vectors
+> through `0`).
 
 ### Microwindows nano-X (real retained-mode WM)
 

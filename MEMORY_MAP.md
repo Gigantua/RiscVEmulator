@@ -11,6 +11,7 @@
  0x10001000–0x100010FF  256 B      Keyboard Controller    Scancode FIFO + modifiers
  0x10002000–0x100020FF  256 B      Mouse Controller       Delta position + buttons
  0x10003000–0x100030FF  256 B      Real-Time Clock        Wall-clock microseconds & epoch
+ 0x0F000000–0x0F000FFF  4 KB       Trap-Frame Page        IE flags, handler vector, 36-word frame
  0x20000000–0x2003FFFF  256 KB     Framebuffer            320×200 RGBA8888 pixel buffer
  0x20100000–0x201000FF  256 B      Display Control        Resolution, vsync, palette, mode
  0x30000000–0x300FFFFF  1 MB       Audio PCM Buffer       Raw PCM sample data
@@ -128,6 +129,31 @@ unsigned long long get_us(void) {
     return ((unsigned long long)hi << 32) | lo;
 }
 ```
+
+---
+
+## Trap-Frame Page (0x0F000000) — `TrapFrameDevice`
+
+Plain RAM page (no MMIO callback) holding the entire trap unit. There are no
+CSRs and no host accessors: on a trap the CPU spills the register file here
+itself and jumps to the guest handler; trap return reloads it. See CLAUDE.md
+"Hardware trap frame".
+
+| Offset | Name        | R/W | Description |
+|--------|-------------|-----|-------------|
+| 0x000  | IE_FLAG      | R/W | Interrupt enable — mstatus image (bit 3 MIE = enabled) |
+| 0x004  | TRAP_VECTOR  | R/W | Handler entry PC — guest writes once at boot |
+| 0x008  | IE_MASK      | R/W | Per-source enable (bit 7 = MTIP, bit 11 = MEIP) |
+| 0x00C  | TRAP_SCRATCH | R/W | mscratch-equivalent — trap entry swaps it with tp (x4) |
+| 0x100  | landing pad  | R/W | 36-word trap frame (RISC-V `struct pt_regs` layout) |
+
+The landing pad matches Linux `struct pt_regs`: `[0]` = epc, `[1..31]` =
+`x1..x31` (word index == register number), `[32]` = status (mstatus image),
+`[33]` = badaddr/tval, `[34]` = cause, `[35]` = orig_a0 (CPU ignores it). On
+entry the CPU fills the fixed pad; a handler copies it to a private frame
+and returns by jumping to `0xFFFF0004` with `a0` pointing at that frame.
+Trap entry and the resume gateway move `status` through trap-entry /
+trap-return mstatus semantics (`MPIE`/`MPP`); the base ISA has no `MRET`.
 
 ---
 

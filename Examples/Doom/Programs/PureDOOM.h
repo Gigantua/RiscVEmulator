@@ -7560,6 +7560,15 @@ void doom_update()
     int now = I_GetTime();
     int delta_time = now - last_update_time;
 
+    /* Clamp catch-up. I_GetTime() is wall-clock (35 Hz tics). If a heavy
+     * scene makes one D_DoomLoop take longer than a tic, delta_time grows,
+     * so we render more frames, which takes still longer — a compounding
+     * spiral. Cap it: under load the renderer drops frames instead of
+     * spiralling. last_update_time still jumps to `now`, so game time
+     * stays wall-clock-synced. */
+    if (delta_time > 3)
+        delta_time = 3;
+
     while (delta_time-- > 0)
     {
         if (is_wiping_screen)
@@ -16234,7 +16243,7 @@ unsigned long I_TickSong()
             do
             {
                 delay_byte = mus_data[mus_offset++];
-                mus_delay = mus_delay * 128 + delay_byte & 0b01111111;
+                mus_delay = mus_delay * 128 + (delay_byte & 0b01111111);
             } while (delay_byte & 0b10000000);
 
             return midi_event;

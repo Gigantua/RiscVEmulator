@@ -230,14 +230,19 @@ static short clamp16(int v)
     return (short)v;
 }
 
-static void copy_audio(void)
+static int copy_audio(void)
 {
-    short *buf = doom_get_sound_buffer();
-    if (!buf) return;
+    /* Non-blocking handshake. If the host hasn't consumed the previous
+     * buffer yet, skip this slot and let the caller retry next iteration.
+     * A busy-wait here would freeze the whole emulated machine — CPU,
+     * video and MIDI all run on one host thread — which made the music
+     * lurch. doom_get_sound_buffer() advances the mixer, so it must only
+     * run when we are actually going to submit a buffer. */
+    if (AUDIO_CTRL & 1)
+        return 0;
 
-    /* Wait for host to consume previous buffer */
-    while (AUDIO_CTRL & 1)
-        ;
+    short *buf = doom_get_sound_buffer();
+    if (!buf) return 1;
 
     /* Amplify samples by 4× before copying to MMIO */
     volatile short *dst = (volatile short *)AUDIO_BUF;
@@ -253,6 +258,7 @@ static void copy_audio(void)
     AUDIO_BSTART = 0;      /* data starts at offset 0 in audio buffer */
     AUDIO_BLEN  = 2048;
     AUDIO_CTRL  = 1; /* play */
+    return 1;
 }
 
 /* ── Entry Point ───────────────────────────────────────────────── */
@@ -317,7 +323,18 @@ void _start(void)
         poll_keyboard();
         poll_mouse();
         doom_update();
-        copy_framebuffer();
+
+        /* Present at a fixed rate, not once per loop iteration: each call's
+         * vsync MMIO write triggers a full 256 KB framebuffer copy on the
+         * host CPU thread. ~70 Hz is smooth without taxing the emulated CPU. */
+        {
+            static unsigned int last_fb_us = 0;
+            unsigned int now_fb_us = RTC_US_LO;
+            if ((unsigned int)(now_fb_us - last_fb_us) >= 14000u) {
+                last_fb_us = now_fb_us;
+                copy_framebuffer();
+            }
+        }
 
         /* Audio: must be called at exactly the buffer-fill rate (512 samples @ 11025 Hz).
          * doom_get_sound_buffer() internally calls I_UpdateSound() which advances every
@@ -327,8 +344,10 @@ void _start(void)
             static unsigned int last_audio_us = 0;
             unsigned int now_audio_us = RTC_US_LO;
             if ((unsigned int)(now_audio_us - last_audio_us) >= 46440u) {
-                last_audio_us = now_audio_us;
-                copy_audio();
+                /* Only advance the clock when a buffer was actually
+                 * submitted; a skipped slot retries on the next loop. */
+                if (copy_audio())
+                    last_audio_us = now_audio_us;
             }
         }
 
@@ -343,6 +362,12 @@ void _start(void)
             midi_last_us_hi = now_hi;
 
             midi_accum_us += delta_us;
+            /* Clamp catch-up. delta_us is wall-clock time, so a slow frame
+             * asks the next frame to process more ticks — which costs more
+             * time, which demands still more ticks: a compounding spiral.
+             * Cap the backlog so MIDI work per frame stays bounded. */
+            if (midi_accum_us > MIDI_TICK_US * 8)
+                midi_accum_us = MIDI_TICK_US * 8;
             while (midi_accum_us >= MIDI_TICK_US) {
                 midi_accum_us -= MIDI_TICK_US;
                 unsigned long midi;

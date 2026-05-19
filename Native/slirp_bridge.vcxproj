@@ -45,7 +45,7 @@
     </ClCompile>
     <Link>
       <ModuleDefinitionFile>slirp_bridge.def</ModuleDefinitionFile>
-      <AdditionalDependencies>kernel32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;ws2_32.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

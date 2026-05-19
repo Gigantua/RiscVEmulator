@@ -27,144 +27,124 @@ This project demonstrates that **a simple, readable RISC-V implementation can do
 | 🎬 **Video** | Software-rendered frame sequences at real-time speed. |
 | 🌄 **Voxel terrain** | Height-map voxel renderer written entirely in guest C. |
 
-All of this from ~550 lines of core C++ and a thin C# peripheral layer.
+All of this from ~355 lines of core C++ and a thin C# peripheral layer.
+
+The Linux build runs a real RV32I kernel ported to the CPU's memory-mapped
+trap-frame ABI: there are no CSRs, traps spill the register file to a fixed
+RAM page, and the kernel returns from a trap by jumping to a resume gateway at
+`0xFFFF0004` (the base ISA has no `MRET`). Userspace enters the kernel with an
+ordinary `ecall`.
+
+The base CPU is a pure integer datapath — it executes the 40 RV32I
+instructions and hands anything else (a `SYSTEM` opcode, or a non-RV32I
+encoding) back to the surrounding trap unit as an exception:
 
 ~~~cpp
-static __forceinline void do_step(CPU_State& cpu)
-static __forceinline void do_step() {
-    if constexpr (Priv) {
-        if (check_interrupts()) { regs[0] = 0; mtime++; return; }
-        if (wfi_pending)        { regs[0] = 0; mtime++; return; }
-    }
+// Execute one base RV32I instruction. On success advances pc and returns
+// {EXC_NONE}. On a SYSTEM opcode or a non-RV32I encoding it returns the
+// exception and leaves pc on the offending instruction.
+static CpuException cpu_step(CPU_State& cpu) {
+    const uint32_t instr = mem_read<uint32_t>(cpu, cpu.pc);
+    const int      rd    = (instr >>  7) & 0x1F;
+    const uint32_t f3    = (instr >> 12) & 0x7;
+    const uint32_t f7    = (instr >> 25) & 0x7F;
+    const uint32_t u1    = cpu.regs[(instr >> 15) & 0x1F];   // rs1
+    const uint32_t u2    = cpu.regs[(instr >> 20) & 0x1F];   // rs2
+    const int32_t  s1    = (int32_t)u1;
+    const int32_t  s2    = (int32_t)u2;
+    uint32_t nextpc      = cpu.pc + 4;
 
-    const uint32_t instr  = mem_read<uint32_t>(pc);
-    const uint32_t opcode = instr & 0x7F;
-    const int      rd     = (instr >>  7) & 0x1F;
-    const int      rs1    = (instr >> 15) & 0x1F;
-    const int      rs2    = (instr >> 20) & 0x1F;
-    const uint32_t f3     = (instr >> 12) & 0x7;
-    const uint32_t f7     = (instr >> 25) & 0x7F;
-    const int32_t  s1     = (int32_t)regs[rs1];
-    const uint32_t u1     = regs[rs1];
-    const int32_t  s2     = (int32_t)regs[rs2];
-    const uint32_t u2     = regs[rs2];
-    uint32_t nextpc       = pc + 4;
-    uint32_t trap_cause   = 0;
-    uint32_t trap_tval    = 0;
+    switch (instr & 0x7F) {
 
-    switch (opcode) {
-
-    case 0x37: regs[rd] = instr & 0xFFFFF000u;                           break;  // LUI
-    case 0x17: regs[rd] = pc + (instr & 0xFFFFF000u);                    break;  // AUIPC
-    case 0x6F: regs[rd] = pc + 4; nextpc = pc + j_imm(instr);            break;  // JAL
+    case 0x37: cpu.regs[rd] = instr & 0xFFFFF000u;                        break;  // LUI
+    case 0x17: cpu.regs[rd] = cpu.pc + (instr & 0xFFFFF000u);             break;  // AUIPC
+    case 0x6F: cpu.regs[rd] = cpu.pc + 4; nextpc = cpu.pc + j_imm(instr); break;  // JAL
     case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;               // JALR
-                 regs[rd] = pc + 4; nextpc = t;                          break; }
+                 cpu.regs[rd] = cpu.pc + 4; nextpc = t;                   break; }
 
-    case 0x63: {  // BRANCH
-        int taken;
+    case 0x63: {                                                                 // BRANCH
+        int taken = 0;
         switch (f3) {
             case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
             case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
             case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
-            default: taken = 0;
         }
-        if (taken) nextpc = pc + b_imm(instr);
+        if (taken) nextpc = cpu.pc + b_imm(instr);
         break;
     }
 
-    case 0x03: {  // LOAD
+    case 0x03: {                                                                 // LOAD
         uint32_t addr = (uint32_t)(s1 + i_imm(instr));
         switch (f3) {
-            case 0: regs[rd] = (uint32_t)(int8_t) mem_read<uint8_t> (addr); break;
-            case 1: regs[rd] = (uint32_t)(int16_t)mem_read<uint16_t>(addr); break;
-            case 2: regs[rd] =                    mem_read<uint32_t>(addr); break;
-            case 4: regs[rd] =                    mem_read<uint8_t> (addr); break;
-            case 5: regs[rd] =                    mem_read<uint16_t>(addr); break;
+            case 0: cpu.regs[rd] = (uint32_t)(int8_t) mem_read<uint8_t> (cpu, addr); break;
+            case 1: cpu.regs[rd] = (uint32_t)(int16_t)mem_read<uint16_t>(cpu, addr); break;
+            case 2: cpu.regs[rd] =                    mem_read<uint32_t>(cpu, addr); break;
+            case 4: cpu.regs[rd] =                    mem_read<uint8_t> (cpu, addr); break;
+            case 5: cpu.regs[rd] =                    mem_read<uint16_t>(cpu, addr); break;
         }
         break;
     }
 
-    case 0x23: {  // STORE
+    case 0x23: {                                                                 // STORE
         uint32_t addr = (uint32_t)(s1 + s_imm(instr));
         switch (f3) {
-            case 0: mem_write<uint8_t> (addr, (uint8_t) u2); break;
-            case 1: mem_write<uint16_t>(addr, (uint16_t)u2); break;
-            case 2: mem_write<uint32_t>(addr,            u2); break;
+            case 0: mem_write<uint8_t> (cpu, addr, (uint8_t) u2); break;
+            case 1: mem_write<uint16_t>(cpu, addr, (uint16_t)u2); break;
+            case 2: mem_write<uint32_t>(cpu, addr,           u2); break;
         }
         break;
     }
 
-    case 0x13: {  // OP-IMM
+    case 0x13: {                                                                 // OP-IMM
         const int32_t imm = i_imm(instr);
         const int     sh  = (instr >> 20) & 0x1F;
-        uint32_t r;
+        // Only SLLI/SRLI/SRAI (f3 1/5) carry a funct7; reserved values illegal.
+        if ((f3 == 1 && f7 != 0x00) || (f3 == 5 && f7 != 0x00 && f7 != 0x20))
+            return { EXC_ILLEGAL, instr };
+        uint32_t r = 0;
         switch (f3) {
-            case 0: r = (uint32_t)(s1 + imm);                            break;
-            case 1: r = u1 << sh;                                         break;
-            case 2: r = s1 < imm           ? 1u : 0u;                    break;
-            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                    break;
-            case 4: r = u1 ^ (uint32_t)imm;                              break;
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;    break;
-            case 6: r = u1 | (uint32_t)imm;                              break;
-            case 7: r = u1 & (uint32_t)imm;                              break;
-            default: r = 0;
+            case 0: r = (uint32_t)(s1 + imm);                         break;  // ADDI
+            case 1: r = u1 << sh;                                     break;  // SLLI
+            case 2: r = s1 < imm           ? 1u : 0u;                 break;  // SLTI
+            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                 break;  // SLTIU
+            case 4: r = u1 ^ (uint32_t)imm;                           break;  // XORI
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh; break;  // SRAI/SRLI
+            case 6: r = u1 | (uint32_t)imm;                           break;  // ORI
+            case 7: r = u1 & (uint32_t)imm;                           break;  // ANDI
         }
-        regs[rd] = r;
+        cpu.regs[rd] = r;
         break;
     }
 
-    case 0x33: {  // OP
-        uint32_t r;
-        if (MExt && f7 == 0x01) {
-            r = exec_m(f3, s1, u1, s2, u2);
-        } else {
-            const int sh = s2 & 0x1F;
-            switch (f3) {
-                case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
-                case 1: r = u1 << sh;                                                break;
-                case 2: r = s1 < s2 ? 1u : 0u;                                       break;
-                case 3: r = u1 < u2 ? 1u : 0u;                                       break;
-                case 4: r = u1 ^ u2;                                                  break;
-                case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;            break;
-                case 6: r = u1 | u2;                                                  break;
-                case 7: r = u1 & u2;                                                  break;
-                default: r = 0;
-            }
+    case 0x33: {                                                                 // OP
+        // funct7 must be 0x00, or 0x20 for SUB/SRA (f3 0/5); all else illegal.
+        if (f7 != 0x00 && !(f7 == 0x20 && (f3 == 0 || f3 == 5)))
+            return { EXC_ILLEGAL, instr };
+        const int sh = s2 & 0x1F;
+        uint32_t r = 0;
+        switch (f3) {
+            case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;  // SUB/ADD
+            case 1: r = u1 << sh;                                              break;  // SLL
+            case 2: r = s1 < s2 ? 1u : 0u;                                     break;  // SLT
+            case 3: r = u1 < u2 ? 1u : 0u;                                     break;  // SLTU
+            case 4: r = u1 ^ u2;                                               break;  // XOR
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;          break;  // SRA/SRL
+            case 6: r = u1 | u2;                                               break;  // OR
+            case 7: r = u1 & u2;                                               break;  // AND
         }
-        regs[rd] = r;
+        cpu.regs[rd] = r;
         break;
     }
 
-    case 0x2F:  // A-extension removed: LR/SC/AMO trap as illegal
-        trap_cause = 2;
-        trap_tval = instr;
-        break;
+    case 0x0F: break;                                                            // FENCE → NOP (single-hart)
 
-    case 0x07: case 0x27:                  // FLW/FSW
-    case 0x43: case 0x47: case 0x4B: case 0x4F: // FMA family
-    case 0x53:                             // OP-FP
-        trap_cause = 2;
-        trap_tval = instr;
-        break;
-
-    case 0x0F: break;  // FENCE / FENCE.I — NOP
-
-    case 0x73: {  // SYSTEM
-        const uint32_t f3s = (instr >> 12) & 0x7;
-        trap_cause = exec_system<Priv>(instr, rd, f3s, nextpc, trap_tval);
-        break;
+    case 0x73: return { EXC_SYSTEM,  instr };   // SYSTEM — belongs to the environment
+    default:   return { EXC_ILLEGAL, instr };   // not an RV32I encoding
     }
 
-    }  // switch (opcode)
-
-    if constexpr (Priv) {
-        if (trap_cause) { do_trap(trap_cause, trap_tval); regs[0] = 0; mtime++; return; }
-    }
-
-    regs[0] = 0;
-    pc = nextpc;
-    if constexpr (Priv) { if (priv_mode == 0) umode_count++; }
-    mtime++;
+    cpu.regs[0] = 0;       // x0 is hardwired to zero
+    cpu.pc = nextpc;
+    return { EXC_NONE, 0 };
 }
 ~~~
 
@@ -172,10 +152,10 @@ static __forceinline void do_step() {
 
 ## Features
 
-- **RV32I** — all 40 base instructions
+- **RV32I** — all 40 base integer instructions
 - **No M-extension** — `MUL` / `MULH` / `DIV` / `REM` trap; guest code uses libcalls
 - **No A-extension** — `LR.W`, `SC.W`, and `AMO*` trap as illegal instructions
-- **M/S/U privilege modes** — CSRs, traps, `MRET`/`SRET`, timer interrupts, `WFI`
+- **M/U privilege path** — ECALL/EBREAK and timer/external interrupts via a hardware trap-frame page; `MRET`, `WFI`, all CSR ops, PMP/machine-ID/ENVCFG/SEED, and S-mode trap illegal
 - **Memory-mapped peripherals** — UART, framebuffer, keyboard, mouse, audio, RTC, CLINT
 - **ELF loader** — loads `PT_LOAD` segments from standard ELF32 binaries
 - **SDL2 frontend** — hardware-accelerated window at ~120 fps via [Silk.NET.SDL](https://github.com/dotnet/Silk.NET)
@@ -424,14 +404,14 @@ Default memory layout:
 
 | Extension | Status | Notes |
 |-----------|--------|-------|
-| RV32I | ✅ All 40 instructions | |
+| RV32I | ⚠️ minus FENCE | FENCE traps illegal in this emulator |
 | M | ❌ | MUL/DIV/REM opcodes trap; use integer libcalls |
 | A | ❌ | LR/SC/AMO opcodes trap |
 | F / D (float) | ❌ hardware | F/D opcodes trap; use `softfloat.c` in guest |
 | Zicsr | ✅ | |
-| M/S/U privilege | ✅ | Always enabled |
+| M/U privilege | ✅ partial | WFI, PMP/machine-ID/ENVCFG/SEED, SRET/S-mode CSRs trap illegal |
 | Interrupts | ✅ | Timer interrupt via CLINT |
-| FENCE | NOP | |
+| FENCE / Zifencei | ❌ / ❌ | Both trap illegal |
 | ECALL/EBREAK | traps | |
 
 ---

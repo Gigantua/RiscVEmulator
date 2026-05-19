@@ -381,14 +381,19 @@ main(void)
      * default subset and matches our parser well — cursor motion, ED, EL,
      * SGR; no fancy colors. Without TERM set, apps print the raw
      * capability strings (%p1%p2…) as literal text. */
-    putenv((char *)"TERM=vt100");
-    /* Match the pty's window size so curses knows the grid. The shell
-     * also picks this up via TIOCGWINSZ on its tty. */
-    char rows[16], cols[16];
-    snprintf(rows, sizeof(rows), "LINES=%d", ROWS);
-    snprintf(cols, sizeof(cols), "COLUMNS=%d", COLS);
-    putenv(rows);
-    putenv(cols);
+    setenv("TERM", "vt100", 1);
+    /* Do NOT export LINES/COLUMNS. ncurses' _nc_get_screensize() treats
+     * those env vars as an *unclamped* override of the TIOCGWINSZ ioctl
+     * result: a bogus value (inherited from the desktop launch chain, or a
+     * stale env entry) makes curses malloc a (lines+2)*(cols+6) screen of
+     * multiple gigabytes — the kernel kills the process ("nommu:
+     * Allocation of length ... failed"). The serial console works
+     * precisely because its environment has no LINES/COLUMNS, so curses
+     * uses the bounded pty winsize instead. Clear them here so apps run
+     * under this terminal behave the same — the grid still comes through
+     * via the TIOCSWINSZ below. */
+    unsetenv("LINES");
+    unsetenv("COLUMNS");
 
     if (GrOpen() < 0) { fprintf(stderr, "rvemu-term: GrOpen failed\n"); return 1; }
     if (start_shell() < 0) { fprintf(stderr, "rvemu-term: shell spawn failed: %s\n", strerror(errno)); return 1; }

@@ -46,10 +46,24 @@ cp "$PATCH_DIR/kbd_rvemu.c"   "$MW_DIR/src/drivers/kbd_rvemu.c"
 cp "$PATCH_DIR/rvemu-taskbar.c" "$MW_DIR/src/demos/nanox/rvemu-taskbar.c"
 cp "$PATCH_DIR/rvemu-term.c"    "$MW_DIR/src/demos/nanox/rvemu-term.c"
 
-# 3. Patch Arch.rules — add UCLINUX-RISCV section
-if ! grep -q "UCLINUX-RISCV" "$MW_DIR/src/Arch.rules"; then
-    echo "==> patching Arch.rules"
-    cat >> "$MW_DIR/src/Arch.rules" <<'EOF'
+# 3. Patch Arch.rules — add/refresh UCLINUX-RISCV section. This is intentionally
+# not "append once": older local trees may carry a stale block with too-small
+# or non-exported BFLT stack flags.
+echo "==> patching Arch.rules"
+python3 - "$MW_DIR/src/Arch.rules" <<'PY'
+from pathlib import Path
+import re
+path = Path(__import__("sys").argv[1])
+s = path.read_text()
+s = re.sub(
+    r"\n# rvemu RV32I nommu BFLT target .*?\nifeq \(\$\(ARCH\), UCLINUX-RISCV\)\n.*?\nendif\n",
+    "\n",
+    s,
+    flags=re.S,
+)
+path.write_text(s.rstrip() + "\n")
+PY
+cat >> "$MW_DIR/src/Arch.rules" <<'EOF'
 
 # rvemu RV32I nommu BFLT target (buildroot uclibc toolchain).
 ifeq ($(ARCH), UCLINUX-RISCV)
@@ -57,10 +71,16 @@ TOOLSPREFIX = $(RISCVTOOLSPREFIX)
 DEFINES += -DLINUX=1 -DUNIX=1 -DUCLINUX=1
 CFLAGS += -fPIC
 LDFLAGS += -Wl,-elf2flt=-r
-FLTFLAGS += -s 64000
+# BFLT stack size. elf2flt's default is 4 KB — far too small for recursive
+# clients (tuxchess negamax+quiescence overflows it and, with no nommu guard
+# page, corrupts the flat address space and takes the whole desktop down).
+# `export` is required for toolchains whose elf2flt wrapper reads FLTFLAGS from
+# the environment. We also run flthdr after linking below so stale wrappers or
+# makefiles that ignore FLTFLAGS still get the correct header.
+FLTFLAGS += -s 1048576
+export FLTFLAGS
 endif
 EOF
-fi
 
 # 4. Patch Objects.rules — register SCREEN=RVEMU
 python3 "$SCRIPT_DIR/inject-rvemu-screen.py"
@@ -84,6 +104,18 @@ cd "$MW_DIR/src"
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 make clean >/dev/null 2>&1 || true
 make -j"$(nproc)"
+
+echo "==> forcing BFLT stack headers"
+FLTHDR="$BUILDROOT_HOST/bin/riscv32-buildroot-linux-uclibc-flthdr"
+if [ -x "$FLTHDR" ]; then
+    for f in "$MW_DIR"/src/bin/*; do
+        [ -f "$f" ] || continue
+        [ "$(head -c 4 "$f" 2>/dev/null)" = "bFLT" ] || continue
+        "$FLTHDR" -s 1048576 "$f"
+    done
+else
+    echo "warning: flthdr not found at $FLTHDR; BFLT stack headers not patched"
+fi
 
 echo
 echo "==> done. Binaries:"

@@ -1,79 +1,68 @@
-// rv32i_core.cpp — Native RISC-V hot path. Windows only (ClangCL).
+// rv32i_core.cpp — Native RV32I core. Windows only (ClangCL).
 //
-// ── ISA implemented ─────────────────────────────────────────────────
+// This file is two independent hardware blocks:
 //
-//   RV32I            Base integer ISA (all 40 instructions).
-//   Zicsr            CSR R/W (CSRRW, CSRRS, CSRRC + immediate variants).
-//   Zifencei         FENCE / FENCE.I — implemented as NOP (single-hart, no I-cache).
+//   PART 1  BASE RV32I CPU — a pure integer datapath. It executes the 40
+//           base instructions and knows nothing else: no traps, no
+//           privilege modes, no interrupts. FENCE retires as NOP. Any
+//           instruction it cannot execute — a SYSTEM instruction, or an
+//           encoding outside RV32I — is handed back to the caller as a
+//           CpuException. The CPU never acts on it and never advances past
+//           it. cpu_step() is the whole of the CPU.
 //
-// ── Privileged architecture (always on; CPU boots in M-mode) ───────
+//   PART 2  TRAP UNIT — separate hardware wrapped around the CPU. It owns
+//           privilege mode (M/U), the host interrupt pins, and the
+//           trap-frame page, and turns CPU exceptions and interrupt pins
+//           into trap-frame context switches. Nothing in PART 1 references
+//           anything in PART 2.
 //
-//   Machine, Supervisor, User modes with trap delegation (medeleg/mideleg).
-//   MRET / SRET / WFI / ECALL / EBREAK.
-//   CSRs: mstatus, misa(RO), medeleg, mideleg, mie, mip, mtvec, mscratch,
-//         mepc, mcause, mtval, sstatus(view), sie(view), stvec, sscratch,
-//         sepc, scause, stval, sip(view), satp (stored only — no MMU walk),
-//         mhartid(RO=0), cycle/time/instret counters (alias mtime).
-//   Interrupts: M/S timer (MTIP/STIP), M/S software (MSIP/SSIP),
-//               M/S external (MEIP/SEIP). Currently only MTIP is auto-raised
-//               (from mtime≥mtimecmp); other bits writable via CSR.
-//   No MMU translation — satp is stored but loads/stores use the bare
-//   guest-physical address.
+// The trap unit keeps two registers of state — current privilege and the
+// host interrupt-pin latch. Everything else (interrupt-enable flag,
+// per-source mask, handler vector, saved context) lives in the trap-frame
+// page at guest-physical 0x0F000000 (TrapFrameDevice). See CLAUDE.md.
 //
-// ── Host integration model ──────────────────────────────────────────
+//   +0x000  IE_FLAG      global interrupt enable (bit 3)
+//   +0x004  TRAP_VECTOR  handler entry PC
+//   +0x008  IE_MASK      per-source enable (bit 7 = timer, bit 11 = external)
+//   +0x00C  TRAP_SCRATCH scratch register (trap entry swaps it with tp)
+//   +0x100  trap frame   word[0]=epc  word[1..31]=x1..x31  word[32]=status
+//                        word[33]=tval  word[34]=cause
 //
-// The CPU knows nothing about peripherals. Every memory access is a single
-// pointer dereference into a host-provided base buffer:
-//     mem_read<T>(addr) = *(volatile T*)(cpu.mem + addr)
-//
-// The host (Emulator.cs) reserves one big chunk of VA and commits pages at
-// guest offsets — PAGE_READWRITE for plain memory (RAM, FB, PCM) and
-// PAGE_NOACCESS for guarded peripherals. Accesses to guarded pages raise
-// AVs that the host's vectored exception handler dispatches to peripheral
-// Read/Write. From step()'s perspective every access is just memory.
-//
-// mtime/mtimecmp are CPU-internal counters (like a CSR), accessed by the
-// host's CLINT peripheral via the rv32i_get_mtime{,cmp} / rv32i_set_*
-// trampolines. step() never special-cases CLINT addresses.
+// Memory: every access is one dereference into a host base buffer,
+// *(volatile T*)(cpu.mem + addr). The host commits guarded peripheral pages
+// PAGE_NOACCESS and dispatches the resulting AVs from a VEH (see Emulator.cs).
 
 #include <cstdint>
 
-// Provide our own mem{set,cpy} so aggregate value-init (`cpu = {}`) and other
-// compiler-emitted copies link without a CRT (we build -nodefaultlib).
+// Our own memset — we link -nodefaultlib, so no CRT.
 extern "C" void* memset(void* dst, int c, unsigned long long n) {
     auto* d = (unsigned char*)dst;
     for (unsigned long long i = 0; i < n; i++) d[i] = (unsigned char)c;
     return dst;
 }
-extern "C" void* memcpy(void* dst, const void* src, unsigned long long n) {
-    auto* d = (unsigned char*)dst;
-    auto* s = (const unsigned char*)src;
-    for (unsigned long long i = 0; i < n; i++) d[i] = s[i];
-    return dst;
-}
 
-// ── State ────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════
+// PART 1 — BASE RV32I CPU
+//
+// Pure integer datapath. No traps, no privilege, no interrupts. Whatever it
+// cannot execute it reports as a CpuException, leaving pc on the offending
+// instruction so the surrounding hardware can act on it.
+// ════════════════════════════════════════════════════════════════════
 
 struct CPU_State {
     uint32_t regs[32];
     uint32_t pc;
-    int      halted;
-    uint64_t mtime;
-    uint64_t mtimecmp;
-    uint8_t* mem;               // host base; every guest load/store hits *(mem + addr)
-
-    uint32_t priv_mode;
-    int      wfi_pending;
-    uint32_t csr_mstatus, csr_mtvec, csr_mie, csr_mip;
-    uint32_t csr_mepc, csr_mtval, csr_mcause, csr_mscratch;
-    uint32_t csr_medeleg, csr_mideleg;
-    uint32_t csr_stvec, csr_sscratch, csr_sepc, csr_scause, csr_stval, csr_satp;
+    int      halted;     // run/stop bit driven by the host
+    uint8_t* mem;        // host base; guest access = *(mem + addr)
 };
 
-static CPU_State cpu;
+// What cpu_step hands back. EXC_NONE: instruction retired. EXC_ILLEGAL: the
+// encoding is not RV32I. EXC_SYSTEM: a SYSTEM-opcode instruction, which the
+// integer datapath does not execute — it belongs to the environment.
+enum : uint32_t { EXC_NONE = 0, EXC_ILLEGAL = 1, EXC_SYSTEM = 2 };
+struct CpuException { uint32_t kind, instr; };
 
-// ── Memory access ───────────────────────────────────────────────────
-
+// ── Memory access ────────────────────────────────────────────────────
 template<typename T>
 static __forceinline T mem_read(CPU_State& cpu, uint32_t addr) {
     return *(volatile T*)(cpu.mem + addr);
@@ -83,8 +72,7 @@ static __forceinline void mem_write(CPU_State& cpu, uint32_t addr, T val) {
     *(volatile T*)(cpu.mem + addr) = val;
 }
 
-// ── Immediate decoders ──────────────────────────────────────────────
-
+// ── Immediate decoders ───────────────────────────────────────────────
 static constexpr uint32_t j_imm(uint32_t i) {
     uint32_t v = ((i>>31)&1u)<<20 | ((i>>12)&0xFFu)<<12 | ((i>>20)&1u)<<11 | ((i>>21)&0x3FFu)<<1;
     return (v & 0x100000u) ? v | 0xFFE00000u : v;
@@ -98,172 +86,29 @@ static constexpr int32_t s_imm(uint32_t i) {
     return ((int32_t)(i & 0xFE000000) >> 20) | (int32_t)((i >> 7) & 0x1Fu);
 }
 
-// ── M-extension removed ─────────────────────────────────────────────
-//
-// MUL/MULH[SU|U]/DIV[U]/REM[U] are not implemented. Any OP-class
-// instruction with funct7 == 0x01 traps as an illegal instruction;
-// the guest's compiler lowers * and / to __mulsi3 / __divsi3 libcalls.
+// Execute one base RV32I instruction. On success advances pc and returns
+// {EXC_NONE}. On a SYSTEM opcode or a non-RV32I encoding it returns the
+// exception and leaves pc on the offending instruction.
+static CpuException cpu_step(CPU_State& cpu) {
+    const uint32_t instr = mem_read<uint32_t>(cpu, cpu.pc);
+    const int      rd    = (instr >>  7) & 0x1F;
+    const uint32_t f3    = (instr >> 12) & 0x7;
+    const uint32_t f7    = (instr >> 25) & 0x7F;
+    const uint32_t u1    = cpu.regs[(instr >> 15) & 0x1F];   // rs1
+    const uint32_t u2    = cpu.regs[(instr >> 20) & 0x1F];   // rs2
+    const int32_t  s1    = (int32_t)u1;
+    const int32_t  s2    = (int32_t)u2;
+    uint32_t nextpc      = cpu.pc + 4;
 
-// ── Privileged-mode CSR / trap ──────────────────────────────────────
-//
-// Single CSR accessor returning a reference to the backing slot. Reads dereference
-// the result; writes assign through it. RO/computed CSRs (misa, mvendorid, mtime
-// views, unknown numbers) stage their value in a static scratch slot — writes
-// there are discarded, which is exactly RO semantics. S-mode views (sstatus,
-// sie, sip) alias the M-mode storage directly.
+    switch (instr & 0x7F) {
 
-static uint32_t& priv_csr(CPU_State& cpu, uint32_t csrno) {
-    static uint32_t scratch;
-    switch (csrno) {
-        case 0x300: case 0x100: return cpu.csr_mstatus;     // mstatus / sstatus
-        case 0x302:             return cpu.csr_medeleg;
-        case 0x303:             return cpu.csr_mideleg;
-        case 0x304: case 0x104: return cpu.csr_mie;         // mie / sie
-        case 0x305:             return cpu.csr_mtvec;
-        case 0x340:             return cpu.csr_mscratch;
-        case 0x341:             return cpu.csr_mepc;
-        case 0x342:             return cpu.csr_mcause;
-        case 0x343:             return cpu.csr_mtval;
-        case 0x344: case 0x144: return cpu.csr_mip;         // mip / sip
-        case 0x105:             return cpu.csr_stvec;
-        case 0x140:             return cpu.csr_sscratch;
-        case 0x141:             return cpu.csr_sepc;
-        case 0x142:             return cpu.csr_scause;
-        case 0x143:             return cpu.csr_stval;
-        case 0x180:             return cpu.csr_satp;
-        case 0x301:             scratch = 0x40000100u;            return scratch;  // misa (RV32I, RO)
-        case 0xF11:             scratch = 0xFF0FF0FFu;            return scratch;  // mvendorid (RO)
-        case 0xC00: case 0xB00: case 0xC01: case 0xB01: case 0xC02: case 0xB02:
-                                scratch = (uint32_t) cpu.mtime;        return scratch;
-        case 0xC80: case 0xB80: case 0xC81: case 0xB81: case 0xC82: case 0xB82:
-                                scratch = (uint32_t)(cpu.mtime >> 32); return scratch;
-        default:                scratch = 0;                  return scratch;
-    }
-}
+    case 0x37: cpu.regs[rd] = instr & 0xFFFFF000u;                        break;  // LUI
+    case 0x17: cpu.regs[rd] = cpu.pc + (instr & 0xFFFFF000u);             break;  // AUIPC
+    case 0x6F: cpu.regs[rd] = cpu.pc + 4; nextpc = cpu.pc + j_imm(instr); break;  // JAL
+    case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;               // JALR
+                 cpu.regs[rd] = cpu.pc + 4; nextpc = t;                   break; }
 
-static void do_trap(CPU_State& cpu, uint32_t cause, uint32_t tval) {
-    bool     is_intr = (cause & 0x80000000u) != 0u;
-    uint32_t cidx    = cause & 0x1Fu;
-    uint32_t bit     = 1u << cidx;
-    bool     to_s    = (cpu.priv_mode < 3) &&
-                       (is_intr ? (cpu.csr_mideleg & bit) : (cpu.csr_medeleg & bit));
-
-    cpu.wfi_pending = 0;
-
-    if (to_s) {
-        cpu.csr_sepc   = cpu.pc;
-        cpu.csr_scause = cause;
-        cpu.csr_stval  = tval;
-        uint32_t sie = (cpu.csr_mstatus >> 1) & 1u;
-        uint32_t spp = cpu.priv_mode & 1u;
-        cpu.csr_mstatus = (cpu.csr_mstatus & ~0x122u) | (spp << 8) | (sie << 5);
-        cpu.priv_mode   = 1;
-        cpu.pc = (is_intr && (cpu.csr_stvec & 1u)) ? (cpu.csr_stvec & ~3u) + cidx*4u : (cpu.csr_stvec & ~3u);
-    } else {
-        cpu.csr_mepc   = cpu.pc;
-        cpu.csr_mcause = cause;
-        cpu.csr_mtval  = tval;
-        uint32_t mie_b = (cpu.csr_mstatus >> 3) & 1u;
-        cpu.csr_mstatus  = (cpu.csr_mstatus & ~0x1888u) | (cpu.priv_mode << 11) | (mie_b << 7);
-        cpu.priv_mode    = 3;
-        cpu.pc = (is_intr && (cpu.csr_mtvec & 1u)) ? (cpu.csr_mtvec & ~3u) + cidx*4u : (cpu.csr_mtvec & ~3u);
-    }
-}
-
-static bool check_interrupts(CPU_State& cpu) {
-    if (cpu.mtime >= cpu.mtimecmp) cpu.csr_mip |=  (1u << 7);
-    else                           cpu.csr_mip &= ~(1u << 7);
-
-    uint32_t pending = cpu.csr_mip & cpu.csr_mie;
-    if (!pending) return false;
-
-    uint32_t mie_b = (cpu.csr_mstatus >> 3) & 1u;
-    uint32_t sie_b = (cpu.csr_mstatus >> 1) & 1u;
-    static const uint32_t prio[6] = { 11, 3, 7, 9, 1, 5 };
-    for (int i = 0; i < 6; i++) {
-        uint32_t b = 1u << prio[i];
-        if (!(pending & b)) continue;
-        bool delegated = (cpu.csr_mideleg & b) != 0u;
-        bool fire = delegated
-            ? (cpu.priv_mode == 0 || (cpu.priv_mode == 1 && sie_b))
-            : (cpu.priv_mode <  3 || mie_b);
-        if (fire) { do_trap(cpu, 0x80000000u | prio[i], 0); return true; }
-    }
-    return false;
-}
-
-static uint32_t exec_system(CPU_State& cpu, uint32_t instr, int rd, uint32_t f3s,
-                            uint32_t& nextpc, uint32_t& trap_tval) {
-    uint32_t fn = (instr >> 20) & 0xFFF;
-    if (f3s == 0) {
-        if (fn == 0)      return (cpu.priv_mode == 3) ? 11u : (cpu.priv_mode == 1) ? 9u : 8u;
-        if (fn == 1)      { trap_tval = cpu.pc; return 3u; }
-        if (fn == 0x102) {
-            uint32_t spie = (cpu.csr_mstatus >> 5) & 1u;
-            uint32_t spp  = (cpu.csr_mstatus >> 8) & 1u;
-            cpu.csr_mstatus = (cpu.csr_mstatus & ~0x122u) | (1u << 5) | (spie << 1);
-            cpu.priv_mode   = spp;
-            nextpc          = cpu.csr_sepc;
-        } else if (fn == 0x302) {
-            uint32_t mpie = (cpu.csr_mstatus >> 7) & 1u;
-            uint32_t mpp  = (cpu.csr_mstatus >> 11) & 3u;
-            cpu.csr_mstatus = (cpu.csr_mstatus & ~0x1888u) | (1u << 7) | (mpie << 3);
-            cpu.priv_mode   = mpp;
-            nextpc          = cpu.csr_mepc;
-        } else if (fn == 0x105) {
-            cpu.csr_mstatus |= 8u;
-            cpu.wfi_pending  = 1;
-        }
-        return 0;
-    }
-    int       rs1imm = (instr >> 15) & 0x1F;
-    uint32_t  rs1v   = cpu.regs[rs1imm];
-    uint32_t& slot   = priv_csr(cpu, fn);
-    uint32_t  old    = slot;
-    cpu.regs[rd] = old;
-    uint32_t nval = old;
-    switch (f3s) {
-        case 1: nval = rs1v;                    break;
-        case 2: nval = old |  rs1v;             break;
-        case 3: nval = old & ~rs1v;             break;
-        case 5: nval = (uint32_t)rs1imm;        break;
-        case 6: nval = old |  (uint32_t)rs1imm; break;
-        case 7: nval = old & ~(uint32_t)rs1imm; break;
-    }
-    if (f3s == 1 || f3s == 5 || rs1imm != 0) slot = nval;
-    return 0;
-}
-
-// ── do_step ─────────────────────────────────────────────────────────
-
-static constexpr void do_step(CPU_State& cpu) {
-    if (check_interrupts(cpu)) { cpu.regs[0] = 0; return; }
-    if (cpu.wfi_pending)       { cpu.regs[0] = 0; return; }
-
-    const uint32_t instr  = mem_read<uint32_t>(cpu, cpu.pc);
-    const uint32_t opcode = instr & 0x7F;
-    const int      rd     = (instr >>  7) & 0x1F;
-    const int      rs1    = (instr >> 15) & 0x1F;
-    const int      rs2    = (instr >> 20) & 0x1F;
-    const uint32_t f3     = (instr >> 12) & 0x7;
-    const uint32_t f7     = (instr >> 25) & 0x7F;
-    const int32_t  s1     = (int32_t)cpu.regs[rs1];
-    const uint32_t u1     = cpu.regs[rs1];
-    const int32_t  s2     = (int32_t)cpu.regs[rs2];
-    const uint32_t u2     = cpu.regs[rs2];
-    uint32_t nextpc       = cpu.pc + 4;
-    uint32_t trap_cause   = 0;
-    uint32_t trap_tval    = 0;
-
-    switch (opcode) {
-
-    case 0x37: cpu.regs[rd] = instr & 0xFFFFF000u;                       break;
-    case 0x17: cpu.regs[rd] = cpu.pc + (instr & 0xFFFFF000u);            break;
-    case 0x6F: cpu.regs[rd] = cpu.pc + 4; nextpc = cpu.pc + j_imm(instr); break;
-    case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;
-                 cpu.regs[rd] = cpu.pc + 4; nextpc = t;                  break; }
-
-    case 0x63: {
+    case 0x63: {                                                                 // BRANCH
         int taken = 0;
         switch (f3) {
             case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
@@ -274,7 +119,7 @@ static constexpr void do_step(CPU_State& cpu) {
         break;
     }
 
-    case 0x03: {
+    case 0x03: {                                                                 // LOAD
         uint32_t addr = (uint32_t)(s1 + i_imm(instr));
         switch (f3) {
             case 0: cpu.regs[rd] = (uint32_t)(int8_t) mem_read<uint8_t> (cpu, addr); break;
@@ -286,182 +131,224 @@ static constexpr void do_step(CPU_State& cpu) {
         break;
     }
 
-    case 0x23: {
+    case 0x23: {                                                                 // STORE
         uint32_t addr = (uint32_t)(s1 + s_imm(instr));
         switch (f3) {
             case 0: mem_write<uint8_t> (cpu, addr, (uint8_t) u2); break;
             case 1: mem_write<uint16_t>(cpu, addr, (uint16_t)u2); break;
-            case 2: mem_write<uint32_t>(cpu, addr,            u2); break;
+            case 2: mem_write<uint32_t>(cpu, addr,           u2); break;
         }
         break;
     }
 
-    case 0x13: {
+    case 0x13: {                                                                 // OP-IMM
         const int32_t imm = i_imm(instr);
         const int     sh  = (instr >> 20) & 0x1F;
+        // Only SLLI/SRLI/SRAI (f3 1/5) carry a funct7; reserved values illegal.
+        if ((f3 == 1 && f7 != 0x00) || (f3 == 5 && f7 != 0x00 && f7 != 0x20))
+            return { EXC_ILLEGAL, instr };
         uint32_t r = 0;
         switch (f3) {
-            case 0: r = (uint32_t)(s1 + imm);                            break;
-            case 1: r = u1 << sh;                                         break;
-            case 2: r = s1 < imm           ? 1u : 0u;                    break;
-            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                    break;
-            case 4: r = u1 ^ (uint32_t)imm;                              break;
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;    break;
-            case 6: r = u1 | (uint32_t)imm;                              break;
-            case 7: r = u1 & (uint32_t)imm;                              break;
+            case 0: r = (uint32_t)(s1 + imm);                         break;  // ADDI
+            case 1: r = u1 << sh;                                     break;  // SLLI
+            case 2: r = s1 < imm           ? 1u : 0u;                 break;  // SLTI
+            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                 break;  // SLTIU
+            case 4: r = u1 ^ (uint32_t)imm;                           break;  // XORI
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh; break;  // SRAI/SRLI
+            case 6: r = u1 | (uint32_t)imm;                           break;  // ORI
+            case 7: r = u1 & (uint32_t)imm;                           break;  // ANDI
         }
         cpu.regs[rd] = r;
         break;
     }
 
-    case 0x33: {
+    case 0x33: {                                                                 // OP
+        // funct7 must be 0x00, or 0x20 for SUB/SRA (f3 0/5); all else illegal.
+        if (f7 != 0x00 && !(f7 == 0x20 && (f3 == 0 || f3 == 5)))
+            return { EXC_ILLEGAL, instr };
+        const int sh = s2 & 0x1F;
         uint32_t r = 0;
-        if (f7 == 0x01) {                        // M-extension removed — MUL/MULH*/DIV*/REM* all trap
-            trap_cause = 2; trap_tval = instr;
-            break;
-        } else {
-            const int sh = s2 & 0x1F;
-            switch (f3) {
-                case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
-                case 1: r = u1 << sh;                                                break;
-                case 2: r = s1 < s2 ? 1u : 0u;                                       break;
-                case 3: r = u1 < u2 ? 1u : 0u;                                       break;
-                case 4: r = u1 ^ u2;                                                  break;
-                case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;            break;
-                case 6: r = u1 | u2;                                                  break;
-                case 7: r = u1 & u2;                                                  break;
-            }
+        switch (f3) {
+            case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;  // SUB/ADD
+            case 1: r = u1 << sh;                                              break;  // SLL
+            case 2: r = s1 < s2 ? 1u : 0u;                                     break;  // SLT
+            case 3: r = u1 < u2 ? 1u : 0u;                                     break;  // SLTU
+            case 4: r = u1 ^ u2;                                               break;  // XOR
+            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;          break;  // SRA/SRL
+            case 6: r = u1 | u2;                                               break;  // OR
+            case 7: r = u1 & u2;                                               break;  // AND
         }
         cpu.regs[rd] = r;
         break;
     }
 
-    case 0x2F: {
-        trap_cause = 2; trap_tval = instr;      // A-extension removed — LR/SC/AMO all trap
-        break;
+    case 0x0F: break;                                                            // FENCE → NOP (single-hart)
+
+    case 0x73: return { EXC_SYSTEM,  instr };   // SYSTEM — belongs to the environment
+    default:   return { EXC_ILLEGAL, instr };   // not an RV32I encoding
     }
 
-    case 0x07: case 0x27:
-    case 0x43: case 0x47: case 0x4B: case 0x4F:
-    case 0x53:
-        trap_cause = 2; trap_tval = instr;      // F-extension removed
-        break;
+    cpu.regs[0] = 0;       // x0 is hardwired to zero
+    cpu.pc = nextpc;
+    return { EXC_NONE, 0 };
+}
 
-    case 0x0F: break;
+// ════════════════════════════════════════════════════════════════════
+// PART 2 — TRAP UNIT
+//
+// Separate hardware around the CPU. It owns privilege mode and the host
+// interrupt pins, and turns CPU exceptions and interrupt pins into
+// trap-frame context switches through the trap-frame page.
+// ════════════════════════════════════════════════════════════════════
 
-    case 0x73:
-        trap_cause = exec_system(cpu, instr, rd, f3, nextpc, trap_tval);
-        break;
+struct TrapUnit {
+    uint32_t priv;       // PRIV_M or PRIV_U
+    uint32_t pending;    // host interrupt pins (PIN_MTIP | PIN_MEIP)
+};
 
-    }
+static constexpr uint32_t PRIV_U = 0u, PRIV_M = 3u;
 
-    if (trap_cause) {
-        do_trap(cpu, trap_cause, trap_tval);
-        cpu.regs[0] = 0;
+// Status-word bit fields: interrupt enable, its saved copy, saved privilege.
+// Bit positions are fixed trap-frame ABI — the guest reads/writes them too.
+static constexpr uint32_t STATUS_IE = 1u<<3, STATUS_PIE = 1u<<7, STATUS_PP = 3u<<11;
+
+// Trap cause codes; host interrupt-pin bits.
+static constexpr uint32_t CAUSE_ILLEGAL = 2u, CAUSE_EBREAK = 3u, CAUSE_ECALL_U = 8u, CAUSE_ECALL_M = 11u;
+static constexpr uint32_t CAUSE_IRQ_MTIP = 0x80000007u, CAUSE_IRQ_MEIP = 0x8000000Bu;
+static constexpr uint32_t PIN_MTIP = 1u<<7, PIN_MEIP = 1u<<11;
+
+// Trap-frame page (TrapFrameDevice): four control words + the trap frame.
+static constexpr uint32_t TRAP_PAGE    = 0x0F000000u;
+static constexpr uint32_t IE_FLAG      = TRAP_PAGE + 0x000u;
+static constexpr uint32_t TRAP_VECTOR  = TRAP_PAGE + 0x004u;
+static constexpr uint32_t IE_MASK      = TRAP_PAGE + 0x008u;
+static constexpr uint32_t TRAP_SCRATCH = TRAP_PAGE + 0x00Cu;
+static constexpr uint32_t FRAME_BASE   = TRAP_PAGE + 0x100u;   // word[0] = epc
+static constexpr uint32_t FRAME_STATUS = FRAME_BASE + 32u*4u;
+static constexpr uint32_t FRAME_TVAL   = FRAME_BASE + 33u*4u;
+static constexpr uint32_t FRAME_CAUSE  = FRAME_BASE + 34u*4u;
+
+// Trap-return resume gateway. The base ISA has no MRET — a handler returns
+// from a trap by putting its private frame pointer in a0 and jumping to this
+// fixed PC. The step driver detects the fetch address and applies trap-return
+// semantics; no privileged instruction is ever decoded.
+static constexpr uint32_t PV_RESUME_GATEWAY = 0xFFFF0004u;
+
+// Trap entry: spill the integer file + cause to the trap frame, disable
+// interrupts, enter M-mode, vector to the guest handler.
+static void do_trap(CPU_State& cpu, TrapUnit& trap, uint32_t cause, uint32_t tval) {
+    // Swap tp (x4) with TRAP_SCRATCH so a U-mode handler gets a kernel tp.
+    uint32_t tp = cpu.regs[4];
+    cpu.regs[4] = mem_read<uint32_t>(cpu, TRAP_SCRATCH);
+    mem_write<uint32_t>(cpu, TRAP_SCRATCH, tp);
+
+    mem_write<uint32_t>(cpu, FRAME_BASE, cpu.pc);          // word[0] = epc
+    for (uint32_t i = 1; i < 32; i++)
+        mem_write<uint32_t>(cpu, FRAME_BASE + i * 4u, cpu.regs[i]);
+
+    // Saved status word: previous-IE <- IE, previous-priv <- priv, IE <- 0.
+    uint32_t pie = (mem_read<uint32_t>(cpu, IE_FLAG) & STATUS_IE) ? STATUS_PIE : 0u;
+    uint32_t pp  = (trap.priv == PRIV_M) ? STATUS_PP : 0u;
+    mem_write<uint32_t>(cpu, FRAME_STATUS, pie | pp);
+    mem_write<uint32_t>(cpu, FRAME_TVAL,  tval);
+    mem_write<uint32_t>(cpu, FRAME_CAUSE, cause);
+
+    mem_write<uint32_t>(cpu, IE_FLAG, 0u);
+    trap.priv = PRIV_M;
+    cpu.pc = mem_read<uint32_t>(cpu, TRAP_VECTOR);
+}
+
+// Trap return (the PV_RESUME_GATEWAY): reload x1..x31 from the handler's
+// private frame (pointed to by a0), restore IE/priv from its saved status
+// word, resume at the saved epc.
+static void trap_return(CPU_State& cpu, TrapUnit& trap) {
+    uint32_t fb     = cpu.regs[10];
+    uint32_t status = mem_read<uint32_t>(cpu, fb + FRAME_STATUS - FRAME_BASE);
+    for (uint32_t i = 1; i < 32; i++)
+        cpu.regs[i] = mem_read<uint32_t>(cpu, fb + i * 4u);
+    mem_write<uint32_t>(cpu, IE_FLAG, (status & STATUS_PIE) ? STATUS_IE : 0u);
+    trap.priv = (status & STATUS_PP) ? PRIV_M : PRIV_U;
+    cpu.pc = mem_read<uint32_t>(cpu, fb);                  // word[0] = epc
+}
+
+// Act on a SYSTEM instruction the CPU handed back. The base ISA has only
+// ECALL and EBREAK; every other SYSTEM encoding — MRET, SRET, WFI, all CSR
+// ops — is illegal. Trap return is the PV_RESUME_GATEWAY, not an instruction.
+static void trap_system(CPU_State& cpu, TrapUnit& trap, uint32_t instr) {
+    uint32_t f3 = (instr >> 12) & 0x7;
+    uint32_t fn = (instr >> 20) & 0xFFF;
+    if      (f3 == 0 && fn == 0x000) do_trap(cpu, trap,                            // ECALL
+                 trap.priv == PRIV_M ? CAUSE_ECALL_M : CAUSE_ECALL_U, 0);
+    else if (f3 == 0 && fn == 0x001) do_trap(cpu, trap, CAUSE_EBREAK, cpu.pc);     // EBREAK
+    else                             do_trap(cpu, trap, CAUSE_ILLEGAL, instr);    // illegal
+}
+
+// Sample the host interrupt pins. If one is enabled and pending, take the
+// trap and return true; the step driver then skips the CPU this step.
+static bool check_interrupts(CPU_State& cpu, TrapUnit& trap) {
+    if (!trap.pending) return false;   // no pin asserted — skip the trap-page reads
+    uint32_t pend = trap.pending & mem_read<uint32_t>(cpu, IE_MASK);
+    if (!pend || !(mem_read<uint32_t>(cpu, IE_FLAG) & STATUS_IE)) return false;
+
+    // External (MEIP) outranks timer (MTIP).
+    if (pend & PIN_MEIP) { do_trap(cpu, trap, CAUSE_IRQ_MEIP, 0); return true; }
+    if (pend & PIN_MTIP) { do_trap(cpu, trap, CAUSE_IRQ_MTIP, 0); return true; }
+    return false;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// PART 3 — step driver and public C ABI
+// ════════════════════════════════════════════════════════════════════
+
+static CPU_State cpu;
+static TrapUnit  trap;
+
+// One emulation step: the trap unit samples interrupts; otherwise the CPU
+// runs one instruction and the trap unit handles anything it raised.
+static void do_step() {
+    if (check_interrupts(cpu, trap)) return;
+
+    // Resume gateway: a handler returns from a trap by jumping here with a0
+    // pointing at its private frame. The base ISA has no MRET to decode.
+    if (__builtin_expect(cpu.pc == PV_RESUME_GATEWAY, 0)) {
+        trap_return(cpu, trap);
         return;
     }
 
-    cpu.regs[0] = 0;
-    cpu.pc = nextpc;
+    CpuException e = cpu_step(cpu);
+    if (e.kind == EXC_SYSTEM)       trap_system(cpu, trap, e.instr);
+    else if (e.kind == EXC_ILLEGAL) do_trap(cpu, trap, CAUSE_ILLEGAL, e.instr);
 }
 
-// ── Public C ABI ────────────────────────────────────────────────────
-
-// ── Wall-clock-derived mtime ──────────────────────────────────────────
-// mtime *used to* increment once per instruction, which means the guest
-// kernel's notion of time tracked CPU speed: at 300 MIPS (Release) the
-// clock raced 5x ahead of wall time, at 70 MIPS (Debug) ~20% fast.
-// Instead we refresh mtime from a host monotonic clock at the START of
-// every step_n batch, so the guest sees ticks advance at exactly
-// TIMEBASE_HZ (matching the value we patch into the DTB at boot)
-// regardless of how fast we actually emulate.
-//
-// The per-instruction `mtime++` calls are gone; the only place mtime
-// changes is here. CPU code that reads cpu.mtime sees a snapshot that's
-// fresh-at-batch-start — interrupt latency is bounded by the batch size
-// (small enough that timers fire within a frame's worth of wallclock).
-
-static constexpr uint64_t TIMEBASE_HZ = 60'000'000ULL;   // matches Linux/Program.cs DTB patch
-
-#ifdef _WIN32
-  #include <windows.h>
-  static LARGE_INTEGER s_qpc_epoch, s_qpc_freq;
-  static inline uint64_t wallclock_ticks() {
-      LARGE_INTEGER now;
-      QueryPerformanceCounter(&now);
-      // (now - epoch) * TIMEBASE_HZ / qpc_freq, done with 128-bit safe math.
-      uint64_t d = (uint64_t)(now.QuadPart - s_qpc_epoch.QuadPart);
-      return (d / s_qpc_freq.QuadPart) * TIMEBASE_HZ
-           + (d % s_qpc_freq.QuadPart) * TIMEBASE_HZ / s_qpc_freq.QuadPart;
-  }
-  static inline void wallclock_reset() {
-      QueryPerformanceFrequency(&s_qpc_freq);
-      QueryPerformanceCounter(&s_qpc_epoch);
-  }
-#else
-  #include <time.h>
-  static struct timespec s_epoch;
-  static inline uint64_t wallclock_ticks() {
-      struct timespec now;
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      uint64_t s  = (uint64_t)(now.tv_sec  - s_epoch.tv_sec);
-      int64_t  ns = (int64_t) (now.tv_nsec - s_epoch.tv_nsec);
-      return s * TIMEBASE_HZ + (uint64_t)(ns * (int64_t)TIMEBASE_HZ / 1'000'000'000LL);
-  }
-  static inline void wallclock_reset() { clock_gettime(CLOCK_MONOTONIC, &s_epoch); }
-#endif
-
 extern "C" int rv32i_step_n(int n) {
-    cpu.mtime = wallclock_ticks();
     for (int i = 0; i < n; i++) {
-        do_step(cpu);
+        do_step();
         if (__builtin_expect(cpu.halted, 0)) return -(i + 1);
     }
     return n;
 }
 
 extern "C" void rv32i_init(uint8_t* mem, uint32_t entry) {
-    cpu           = {};
-    cpu.pc        = entry;
-    cpu.mtimecmp  = ~0ULL;
-    cpu.mem       = mem;
-    cpu.priv_mode = 3;          // start in M-mode
-    wallclock_reset();
-    cpu.mtime = 0;
+    memset(&cpu, 0, sizeof(cpu));
+    memset(&trap, 0, sizeof(trap));
+    cpu.pc    = entry;
+    cpu.mem   = mem;
+    trap.priv = PRIV_M;
 }
 
 extern "C" void rv32i_destroy() { cpu.mem = nullptr; }
 
-extern "C" uint32_t rv32i_get_pc()                 { return cpu.pc; }
-extern "C" int      rv32i_is_halted()              { return cpu.halted; }
-// CLINT MMIO reads — return the LIVE wall-clock value, not the batch-snapshot
-// stored in cpu.mtime. The kernel reads CLINT in a tight loop while a WFI is
-// waiting for mtime ≥ mtimecmp; if we returned the cached value the kernel
-// would spin a whole batch worth of instructions before noticing the time
-// advanced.
-extern "C" uint32_t rv32i_get_mtime_lo()           { uint64_t t = wallclock_ticks(); return (uint32_t) t; }
-extern "C" uint32_t rv32i_get_mtime_hi()           { uint64_t t = wallclock_ticks(); return (uint32_t)(t >> 32); }
-extern "C" uint32_t rv32i_get_priv_mode()          { return cpu.priv_mode; }
+extern "C" uint32_t rv32i_get_pc()                   { return cpu.pc; }
+extern "C" int      rv32i_is_halted()                { return cpu.halted; }
+extern "C" void     rv32i_set_reg(int i, uint32_t v) { if (i) cpu.regs[i & 31] = v; }
+extern "C" void     rv32i_set_halted(int v)          { cpu.halted = v; }
 
-extern "C" uint64_t rv32i_get_mtime()              { return wallclock_ticks(); }
-extern "C" void     rv32i_set_mtime(uint64_t v)    { cpu.mtime = v; /* guest writes are advisory; epoch stays */ }
-extern "C" uint64_t rv32i_get_mtimecmp()           { return cpu.mtimecmp; }
-extern "C" void     rv32i_set_mtimecmp(uint64_t v) { cpu.mtimecmp = v; }
-
-extern "C" void rv32i_set_reg(int i, uint32_t v)   { if (i) cpu.regs[i & 31] = v; }
-extern "C" void rv32i_set_halted(int v)            { cpu.halted = v; }
-
-// External interrupt injection from the host (PLIC peripheral routes through here).
-// MEIP = bit 11 in mip → M-mode external IRQ. SEIP = bit 9 → S-mode external IRQ.
-// check_interrupts() already walks these in its priority array; once the bit is set,
-// the trap path takes over on the next do_step().
+// Host interrupt pins (trap unit) — PLIC drives external, CLINT drives timer.
 extern "C" void rv32i_set_meip(int level) {
-    if (level) cpu.csr_mip |=  (1u << 11);
-    else       cpu.csr_mip &= ~(1u << 11);
+    if (level) trap.pending |= PIN_MEIP; else trap.pending &= ~PIN_MEIP;
 }
-extern "C" void rv32i_set_seip(int level) {
-    if (level) cpu.csr_mip |=  (1u << 9);
-    else       cpu.csr_mip &= ~(1u << 9);
+extern "C" void rv32i_set_mtip(int level) {
+    if (level) trap.pending |= PIN_MTIP; else trap.pending &= ~PIN_MTIP;
 }
 
 int __stdcall DllMain(void*, unsigned int, void*) { return 1; }

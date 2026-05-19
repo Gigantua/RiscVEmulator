@@ -25,10 +25,22 @@
 //   4. libslirp 4.9.1 crashes on slirp_pollfds_poll with zero fds. We skip
 //      the call when count==0.
 //   5. libslirp is single-threaded. All slirp_* calls go through slirp_lock.
+//   6. ICMP echo (ping) does NOT survive libslirp on Windows. libslirp's
+//      icmp_input opens socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) — the
+//      Linux "ping socket". Winsock has no such socket type, so the open
+//      fails and libslirp falls back to a UDP emulation that can only
+//      relay ICMP *error* replies, never echo replies. msys2's libslirp-0
+//      .dll imports zero Icmp* symbols from IPHLPAPI, confirming it has no
+//      Windows ICMP path. We therefore intercept guest ICMP echo-request
+//      frames in sb_tx and service them with the Win32 IcmpSendEcho API
+//      (iphlpapi.dll) — which, unlike a raw socket, needs NO Administrator
+//      rights — then synthesize the echo-reply frame into the RX queue.
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <ipexport.h>
+#include <icmpapi.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -36,6 +48,7 @@
 #include <string.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 // winsock2.h defines s_addr/s6_addr as macros (-> S_un.S_addr etc), which
 // poison any struct field by that name. Use ip4 / ip6 in our local mirror
@@ -418,9 +431,188 @@ extern "C" __declspec(dllexport) int sb_init() {
     return 0;
 }
 
+// ── ICMP echo (ping) interception ───────────────────────────────────────
+//
+// libslirp on Windows cannot relay ICMP echo (see correctness note 6). We
+// pick guest ICMP echo-request frames out of the TX path and service them
+// with the Win32 IcmpSendEcho API, then build an echo-reply Ethernet frame
+// and push it back through the RX queue exactly as if libslirp had produced
+// it. Everything non-ICMP still goes straight to slirp_input.
+//
+// IcmpSendEcho blocks for up to its timeout, so each request runs on its own
+// short-lived worker thread; an in-flight counter caps concurrency so a ping
+// flood can't spawn unbounded threads.
+
+#pragma pack(push, 1)
+struct EthHdr  { uint8_t dst[6]; uint8_t src[6]; uint16_t ethertype; };
+struct Ip4Hdr  {
+    uint8_t  ver_ihl;     // high nibble = version, low nibble = IHL (words)
+    uint8_t  tos;
+    uint16_t total_len;
+    uint16_t id;
+    uint16_t frag;
+    uint8_t  ttl;
+    uint8_t  proto;
+    uint16_t checksum;
+    uint32_t src;
+    uint32_t dst;
+};
+struct IcmpHdr { uint8_t type; uint8_t code; uint16_t checksum; uint16_t id; uint16_t seq; };
+#pragma pack(pop)
+
+// Local names, prefixed to dodge the Windows SDK macros ICMP_ECHO_REQUEST /
+// ICMP_ECHO (ipexport.h) and the struct type ICMP_ECHO_REPLY (icmpapi.h).
+static const uint16_t SB_ETHERTYPE_IP   = 0x0800;
+static const uint8_t  SB_IPPROTO_ICMP   = 1;
+static const uint8_t  SB_ICMP_ECHO_REQ  = 8;
+static const uint8_t  SB_ICMP_ECHO_RPLY = 0;
+
+#define MAX_ICMP_INFLIGHT 32
+static volatile LONG g_icmp_inflight;
+
+static uint16_t ip_checksum(const void* data, int len) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint32_t sum = 0;
+    while (len > 1) { sum += (uint32_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
+    if (len) sum += (uint32_t)(p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFF);
+}
+
+// Arguments handed to the IcmpSendEcho worker. Holds the original request
+// frame so the reply can mirror MACs/IPs/identifiers/payload exactly.
+struct IcmpJob {
+    int      frame_len;
+    uint8_t  frame[1600];
+};
+
+static DWORD WINAPI icmp_worker(LPVOID arg) {
+    IcmpJob* job = (IcmpJob*)arg;
+
+    const EthHdr*  reqEth  = (const EthHdr*)job->frame;
+    const Ip4Hdr*  reqIp   = (const Ip4Hdr*)(job->frame + sizeof(EthHdr));
+    int            ipHdrLen = (reqIp->ver_ihl & 0x0F) * 4;
+    const IcmpHdr* reqIcmp = (const IcmpHdr*)(job->frame + sizeof(EthHdr) + ipHdrLen);
+
+    int icmpTotal = (int)ntohs(reqIp->total_len) - ipHdrLen;       // ICMP hdr + payload
+    if (icmpTotal < (int)sizeof(IcmpHdr)) icmpTotal = (int)sizeof(IcmpHdr);
+    int payloadLen = icmpTotal - (int)sizeof(IcmpHdr);
+    if (payloadLen < 0)   payloadLen = 0;
+    if (payloadLen > 1024) payloadLen = 1024;
+    const uint8_t* payload = (const uint8_t*)reqIcmp + sizeof(IcmpHdr);
+
+    HANDLE h = IcmpCreateFile();
+    if (h != INVALID_HANDLE_VALUE) {
+        // Reply buffer must hold ICMP_ECHO_REPLY + the echoed data + slack.
+        DWORD replyCap = (DWORD)(sizeof(ICMP_ECHO_REPLY) + payloadLen + 64);
+        uint8_t* replyBuf = (uint8_t*)malloc(replyCap);
+        if (replyBuf) {
+            DWORD n = IcmpSendEcho(h, reqIp->dst,
+                                   (LPVOID)payload, (WORD)payloadLen,
+                                   NULL, replyBuf, replyCap, 4000);
+            if (n > 0) {
+                ICMP_ECHO_REPLY* er = (ICMP_ECHO_REPLY*)replyBuf;
+                if (er->Status == IP_SUCCESS) {
+                    // Build the echo-reply Ethernet frame: swap MACs, swap
+                    // IPs, ICMP type 0, mirror id/seq/payload.
+                    int frameLen = (int)sizeof(EthHdr) + (int)sizeof(Ip4Hdr) +
+                                   (int)sizeof(IcmpHdr) + payloadLen;
+                    uint8_t out[1600];
+                    memset(out, 0, sizeof(out));
+
+                    EthHdr* eth = (EthHdr*)out;
+                    memcpy(eth->dst, reqEth->src, 6);   // back to the guest
+                    memcpy(eth->src, reqEth->dst, 6);   // from the gateway MAC
+                    eth->ethertype = htons(SB_ETHERTYPE_IP);
+
+                    Ip4Hdr* ip = (Ip4Hdr*)(out + sizeof(EthHdr));
+                    ip->ver_ihl   = 0x45;
+                    ip->tos       = 0;
+                    ip->total_len = htons((uint16_t)(sizeof(Ip4Hdr) +
+                                          sizeof(IcmpHdr) + payloadLen));
+                    ip->id        = 0;
+                    ip->frag      = 0;
+                    ip->ttl       = 64;
+                    ip->proto     = SB_IPPROTO_ICMP;
+                    ip->checksum  = 0;
+                    ip->src       = reqIp->dst;         // the pinged host
+                    ip->dst       = reqIp->src;         // the guest
+                    ip->checksum  = htons(ip_checksum(ip, sizeof(Ip4Hdr)));
+
+                    IcmpHdr* icmp = (IcmpHdr*)(out + sizeof(EthHdr) + sizeof(Ip4Hdr));
+                    icmp->type     = SB_ICMP_ECHO_RPLY;
+                    icmp->code     = 0;
+                    icmp->checksum = 0;
+                    icmp->id       = reqIcmp->id;
+                    icmp->seq      = reqIcmp->seq;
+                    if (payloadLen)
+                        memcpy((uint8_t*)icmp + sizeof(IcmpHdr), payload, payloadLen);
+                    icmp->checksum = htons(ip_checksum(icmp,
+                                          sizeof(IcmpHdr) + payloadLen));
+
+                    cb_send_packet(out, (size_t)frameLen, NULL);
+                }
+                // Non-success Status (timeout, unreachable, ...) → no frame;
+                // the guest's ping just times out, same as on real hardware.
+            }
+            free(replyBuf);
+        }
+        IcmpCloseHandle(h);
+    }
+
+    free(job);
+    InterlockedDecrement(&g_icmp_inflight);
+    return 0;
+}
+
+// Returns true if the frame was an ICMP echo-request and we have taken
+// ownership of servicing it (so the caller must NOT pass it to slirp_input).
+static bool try_intercept_icmp_echo(const uint8_t* buf, size_t len) {
+    if (len < sizeof(EthHdr) + sizeof(Ip4Hdr) + sizeof(IcmpHdr)) return false;
+
+    const EthHdr* eth = (const EthHdr*)buf;
+    if (ntohs(eth->ethertype) != SB_ETHERTYPE_IP) return false;
+
+    const Ip4Hdr* ip = (const Ip4Hdr*)(buf + sizeof(EthHdr));
+    if ((ip->ver_ihl >> 4) != 4) return false;
+    if (ip->proto != SB_IPPROTO_ICMP) return false;
+
+    int ipHdrLen = (ip->ver_ihl & 0x0F) * 4;
+    if (ipHdrLen < (int)sizeof(Ip4Hdr)) return false;
+    if (len < sizeof(EthHdr) + (size_t)ipHdrLen + sizeof(IcmpHdr)) return false;
+
+    const IcmpHdr* icmp = (const IcmpHdr*)(buf + sizeof(EthHdr) + ipHdrLen);
+    if (icmp->type != SB_ICMP_ECHO_REQ) return false;
+
+    // Leave pings to the slirp virtual subnet (10.0.2.0/24 — gateway 10.0.2.2,
+    // DNS 10.0.2.3) to libslirp: those targets are not real hosts, so
+    // IcmpSendEcho would just time out. libslirp answers gateway pings itself.
+    if ((ntohl(ip->dst) & 0xFFFFFF00u) == 0x0A000200u) return false;
+
+    // It's an echo request to an external host. Cap concurrency; if the
+    // worker pool is saturated, drop this request (the guest just sees a
+    // timed-out ping) rather than spawning unbounded threads.
+    if (InterlockedIncrement(&g_icmp_inflight) > MAX_ICMP_INFLIGHT) {
+        InterlockedDecrement(&g_icmp_inflight);
+        return true;  // claimed (dropped) — never hand a ping to libslirp
+    }
+
+    IcmpJob* job = (IcmpJob*)malloc(sizeof(IcmpJob));
+    if (!job) { InterlockedDecrement(&g_icmp_inflight); return true; }
+    job->frame_len = (int)(len > sizeof(job->frame) ? sizeof(job->frame) : len);
+    memcpy(job->frame, buf, job->frame_len);
+
+    HANDLE th = CreateThread(NULL, 0, icmp_worker, job, 0, NULL);
+    if (!th) { free(job); InterlockedDecrement(&g_icmp_inflight); return true; }
+    CloseHandle(th);
+    return true;
+}
+
 extern "C" __declspec(dllexport) void sb_tx(const uint8_t* buf, size_t len) {
     if (!g_slirp || !p_slirp_input) return;
     InterlockedIncrement(&s_tx_count);
+    // ICMP echo-request: service it ourselves (libslirp can't on Windows).
+    if (try_intercept_icmp_echo(buf, len)) return;
     EnterCriticalSection(&slirp_lock);
     p_slirp_input(g_slirp, buf, (int)len);
     LeaveCriticalSection(&slirp_lock);

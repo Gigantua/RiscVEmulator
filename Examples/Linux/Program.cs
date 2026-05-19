@@ -15,6 +15,9 @@ int     ramMB      = 96;        // 64 MB Linux + 32 MB headroom for Microwindows
 bool    doDownload = false;
 bool    enableNet  = false;
 bool    enableGui  = false;
+bool    disableGui = false;
+string? autoCommands = Environment.GetEnvironmentVariable("RVEMU_AUTO_COMMANDS");
+string? haltOnOutput = Environment.GetEnvironmentVariable("RVEMU_HALT_ON_OUTPUT");
 using var http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
 {
     Timeout = TimeSpan.FromMinutes(10),
@@ -31,6 +34,9 @@ for (int i = 0; i < args.Length; i++)
         case "--download": doDownload = true; break;
         case "--net":      enableNet  = true; break;
         case "--gui":      enableGui  = true; break;
+        case "--no-gui":   disableGui = true; break;
+        case "--auto-commands": autoCommands = args[++i]; break;
+        case "--halt-on-output": haltOnOutput = args[++i]; break;
         default:
             Console.Error.WriteLine($"Unknown option: {args[i]}");
             PrintUsage();
@@ -70,6 +76,9 @@ if (!userOverrodeKernel && !userOverrodeDtb &&
     enableNet  = true;          // prepared image always has virtio-net.
     enableGui  = true;          // ...and the rvemu-desktop overlay app.
 }
+
+if (disableGui)
+    enableGui = false;
 
 if (doDownload)
 {
@@ -163,6 +172,9 @@ const uint TimebaseHz = 60_000_000u;
 // pfn_valid, so the walk skips by pageblock and finishes fast.
 byte[] dtbPatch = (byte[])dtbBytes.Clone();
 {
+    if (disableGui)
+        ReplaceAscii(dtbPatch, "rvemu.nogui=0", "rvemu.nogui=1");
+
     uint validRam = (uint)ramSize - FbSize;
     for (int o = 0; o + 4 <= dtbPatch.Length; o++)
     {
@@ -199,10 +211,12 @@ var uart   = new UartDevice();
 // the Build_RV32i network-capable kernel): CLINT@0x11000000, SYSCON@0x11100000.
 var syscon = new SysconDevice(0x1110_0000u);
 var clint  = new ClintDevice (0x1100_0000u);
+var trapFrame = new TrapFrameDevice();  // hardware trap-frame page at 0x0F000000
 
 bus.RegisterPeripheral(uart);
 bus.RegisterPeripheral(syscon);
 bus.RegisterPeripheral(clint);
+bus.RegisterPeripheral(trapFrame);
 
 // Networking (opt-in via --net). Requires a kernel built with CONFIG_VIRTIO_NET.
 // Both PLIC and VirtioNet must be registered BEFORE the Emulator is constructed,
@@ -285,15 +299,43 @@ regs.Write(10, 0);                          // a0 = hart ID = 0
 regs.Write(11, RamBase + dtbRamOffset);     // a1 = physical DTB address
 
 var emu = new Emulator(bus, regs, RamBase);
-emu.RamOffset        = RamBase;
-emu.EnablePrivMode   = true;
 
 
 // Enable ANSI VT sequences on Windows (shell prompt, colours, cursor movement)
 ConsoleHelper.EnableVt();
 
 // UART output → console. AutoFlush is set at startup, so every char appears immediately.
-uart.OutputHandler = c => Console.Write(c);
+// In automation mode, detect the BusyBox prompt and inject commands immediately
+// instead of relying on fixed sleeps or interactive shell polling.
+var uartTail = new Queue<char>(16);
+var haltTail = new Queue<char>(Math.Max(1, haltOnOutput?.Length ?? 1));
+bool autoCommandsSent = false;
+bool haltTokenSeen = false;
+uart.OutputHandler = c =>
+{
+    Console.Write(c);
+    if (haltOnOutput != null && !haltTokenSeen)
+    {
+        haltTail.Enqueue(c);
+        while (haltTail.Count > haltOnOutput.Length) haltTail.Dequeue();
+        if (new string(haltTail.ToArray()).EndsWith(haltOnOutput, StringComparison.Ordinal))
+        {
+            haltTokenSeen = true;
+            emu.SetHalted(true);
+        }
+    }
+
+    if (autoCommands == null || autoCommandsSent) return;
+
+    uartTail.Enqueue(c);
+    while (uartTail.Count > 8) uartTail.Dequeue();
+    string tail = new(uartTail.ToArray());
+    if (!tail.EndsWith("~ #") && !tail.EndsWith("~#") && !tail.EndsWith("# "))
+        return;
+
+    autoCommandsSent = true;
+    ThreadPool.QueueUserWorkItem(_ => EnqueueGuestInput(uart, autoCommands));
+};
 
 // Halt when Linux powers off
 syscon.OnPowerOff = () => emu.SetHalted(true);
@@ -310,6 +352,14 @@ var cts = new System.Threading.CancellationTokenSource();
 // or close the host terminal window.
 try { Console.TreatControlCAsInput = true; } catch { /* not a console */ }
 
+// Put the Windows console *input* handle into raw pass-through mode: echo OFF
+// (the guest tty echoes — avoids double echo), line-input OFF (char-at-a-time),
+// processed-input OFF (Ctrl+C passes through as byte 0x03), virtual-terminal-input
+// ON (arrow/function keys arrive as ANSI escape bytes the StdinReader forwards).
+// Called AFTER TreatControlCAsInput so the raw SetConsoleMode is not overwritten.
+ConsoleHelper.EnableRawInput();
+AppDomain.CurrentDomain.ProcessExit += (_, _) => ConsoleHelper.RestoreInput();
+
 var stdinThread = new System.Threading.Thread(() =>
 {
     try
@@ -320,7 +370,7 @@ var stdinThread = new System.Threading.Thread(() =>
         while (!cts.IsCancellationRequested && (n = stdin.Read(buf, 0, buf.Length)) > 0)
         {
             for (int j = 0; j < n; j++)
-                uart.EnqueueInput(buf[j] == 13 ? (byte)10 : buf[j]); // CR→LF
+                uart.EnqueueInput(NormalizeGuestInputByte(buf[j]));
         }
     }
     catch { /* stdin closed */ }
@@ -378,6 +428,8 @@ cts.Cancel();
 viewer?.Stop();
 audio?.Stop();
 midi.Dispose();
+// Restore the console input mode so the user's terminal isn't left in raw mode.
+ConsoleHelper.RestoreInput();
 Console.Error.WriteLine($"\nEmulator stopped. Executed ~{emu.MTime:N0} instructions.");
 return 0;
 
@@ -392,6 +444,45 @@ static void PrintUsage()
     Console.Error.WriteLine("  --download        Download pre-built mini-rv32ima Linux image (~6 MB)");
     Console.Error.WriteLine("  --net             Enable virtio-net (requires kernel rebuilt with CONFIG_VIRTIO_NET");
     Console.Error.WriteLine("                    and a DTB compiled from Examples/Linux/rvemu-net.dts).");
+    Console.Error.WriteLine("  --gui             Start SDL framebuffer/input/audio frontend.");
+    Console.Error.WriteLine("  --no-gui          Disable auto GUI for prepared Build_RV32i images.");
+    Console.Error.WriteLine("  --auto-commands <commands>");
+    Console.Error.WriteLine("                    Send commands at the first BusyBox prompt; semicolons are OK.");
+    Console.Error.WriteLine("  --halt-on-output <token>");
+    Console.Error.WriteLine("                    Stop the emulator as soon as UART output contains token.");
+}
+
+static byte NormalizeGuestInputByte(byte b) => b == 13 ? (byte)10 : b; // CR -> LF
+
+static void ReplaceAscii(byte[] bytes, string oldValue, string newValue)
+{
+    if (oldValue.Length != newValue.Length)
+        throw new ArgumentException("DTB in-place replacements must keep the same length.");
+
+    byte[] oldBytes = System.Text.Encoding.ASCII.GetBytes(oldValue);
+    byte[] newBytes = System.Text.Encoding.ASCII.GetBytes(newValue);
+    for (int i = 0; i <= bytes.Length - oldBytes.Length; i++)
+    {
+        bool match = true;
+        for (int j = 0; j < oldBytes.Length; j++)
+        {
+            if (bytes[i + j] == oldBytes[j]) continue;
+            match = false;
+            break;
+        }
+        if (!match) continue;
+
+        Array.Copy(newBytes, 0, bytes, i, newBytes.Length);
+        return;
+    }
+}
+
+static void EnqueueGuestInput(UartDevice uart, string commands)
+{
+    foreach (char ch in commands)
+        uart.EnqueueInput(NormalizeGuestInputByte((byte)ch));
+    if (!commands.EndsWith('\n') && !commands.EndsWith('\r'))
+        uart.EnqueueInput(10);
 }
 
 async Task DownloadKernel(string targetPath)

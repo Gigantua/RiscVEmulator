@@ -4,10 +4,11 @@ namespace RiscVEmulator.Core.Peripherals
 {
     /// <summary>
     /// Platform-Level Interrupt Controller. SiFive-style layout at 0x0C000000.
-    /// Single hart, two contexts: 0 = M-mode (MEIP), 1 = S-mode (SEIP).
+    /// Single hart, two contexts in the MMIO layout: 0 = M-mode, 1 = legacy S-mode.
     /// Devices raise IRQ N via <see cref="RaiseIrq"/>; the PLIC recomputes the
-    /// highest pending+enabled IRQ per context and toggles the CPU's MEIP/SEIP
-    /// bit. The guest claims/completes via reads/writes to the claim register.
+    /// highest pending+enabled IRQ per context and toggles the CPU's MEIP bit
+    /// for context 0. S-mode delivery is removed from the CPU, but context 1
+    /// remains in the register layout for guest compatibility.
     ///
     /// Memory layout (per the SiFive PLIC spec):
     ///   0x000000 + 4*N        priority[N]
@@ -21,7 +22,11 @@ namespace RiscVEmulator.Core.Peripherals
         public const int NumContexts = 2;        // M-mode + S-mode
 
         public uint BaseAddress { get; }
-        public uint Size        => 0x0400_0000;  // standard PLIC window
+        // The architectural PLIC window is 64 MB, but the registers above only
+        // span ~0x202000. A 4 MB guarded window covers every register with room
+        // to spare and, crucially, leaves the trap-frame page (0x0F000000) clear
+        // — the full 64 MB window would swallow it and break the trap unit.
+        public uint Size        => 0x0040_0000;
         public bool IsGuarded   => true;
 
         private readonly uint[]   _priority = new uint[MaxSources];
@@ -154,11 +159,10 @@ namespace RiscVEmulator.Core.Peripherals
             return best;
         }
 
-        /// <summary>Toggle MEIP/SEIP based on whether each context has a deliverable IRQ.</summary>
+        /// <summary>Toggle MEIP based on whether the M-mode context has a deliverable IRQ.</summary>
         private void UpdateCpuLines()
         {
             Emulator.SetMachineExtIrq   (HighestPendingEnabled(0) != 0);
-            Emulator.SetSupervisorExtIrq(HighestPendingEnabled(1) != 0);
         }
     }
 }

@@ -25,21 +25,16 @@ namespace RiscVEmulator.Core
         [DllImport(Lib)] private static extern void rv32i_set_reg(int index, uint value);
         [DllImport(Lib)] private static extern int  rv32i_is_halted();
         [DllImport(Lib)] private static extern void rv32i_set_halted(int value);
-        [DllImport(Lib)] private static extern uint rv32i_get_priv_mode();
-        [DllImport(Lib)] private static extern uint rv32i_get_mtime_lo();
-        [DllImport(Lib)] private static extern uint rv32i_get_mtime_hi();
-        [DllImport(Lib)] private static extern ulong rv32i_get_mtimecmp();
         [DllImport(Lib)] private static extern void rv32i_set_meip(int level);
-        [DllImport(Lib)] private static extern void rv32i_set_seip(int level);
 
         // External-interrupt injection used by the PLIC peripheral.
         public static void SetMachineExtIrq(bool level)    => rv32i_set_meip(level ? 1 : 0);
-        public static void SetSupervisorExtIrq(bool level) => rv32i_set_seip(level ? 1 : 0);
 
         // ── State ────────────────────────────────────────────────────────────
 
         private readonly HostMemoryReservation _reservation;
         private readonly HostExitDevice _exitDevice = new();
+        private readonly ClintDevice? _clint;
         private bool _disposed;
         private bool _cachedHalted;
         private int  _cachedExitCode;
@@ -47,16 +42,8 @@ namespace RiscVEmulator.Core
         public bool IsHalted => _cachedHalted;
         public int  ExitCode => _cachedExitCode;
         public uint PC       => rv32i_get_pc();
-        public ulong MTime    => (ulong)rv32i_get_mtime_lo() | ((ulong)rv32i_get_mtime_hi() << 32);
-        public ulong MtimeCmp => rv32i_get_mtimecmp();
-        public uint PrivMode => rv32i_get_priv_mode();
+        public ulong MTime    => _clint?.Mtime ?? 0;
 
-        // Compatibility shims — old code set these but the CPU now handles all
-        // extensions and privilege levels unconditionally, so they're inert.
-        public bool EnableMExtension { get; set; }
-        public bool EnableAExtension { get; set; }
-        public bool EnablePrivMode   { get; set; }
-        public uint RamOffset        { get; set; }
         public Action<char>? OutputHandler { get; set; }
 
         // ── Constructor ──────────────────────────────────────────────────────
@@ -73,7 +60,11 @@ namespace RiscVEmulator.Core
                 rv32i_set_halted(1);
             };
 
-            foreach (var p in bus.Peripherals) CommitPeripheral(p);
+            foreach (var p in bus.Peripherals)
+            {
+                CommitPeripheral(p);
+                if (p is ClintDevice clint) _clint = clint;
+            }
             CommitPeripheral(_exitDevice);
 
             rv32i_init(_reservation.Base, entryPoint);
@@ -111,6 +102,7 @@ namespace RiscVEmulator.Core
         public bool Step()
         {
             if (_cachedHalted) return false;
+            _clint?.Tick();
             int r = rv32i_step_n(1);
             if (r <= 0) SyncHalted();
             return !_cachedHalted;
@@ -119,10 +111,19 @@ namespace RiscVEmulator.Core
         public int StepN(int n)
         {
             if (_cachedHalted) return 0;
-            int r = rv32i_step_n(n);
-            int executed = r < 0 ? -r : r;
-            if (r <= 0) SyncHalted();
-            return executed;
+            // Run in sub-batches so the CLINT timer is polled often enough to
+            // keep MTIP latency bounded regardless of the caller's batch size.
+            const int chunk = 100_000;
+            int total = 0;
+            while (total < n && !_cachedHalted)
+            {
+                _clint?.Tick();
+                int want = n - total < chunk ? n - total : chunk;
+                int r = rv32i_step_n(want);
+                total += r < 0 ? -r : r;
+                if (r <= 0) { SyncHalted(); break; }
+            }
+            return total;
         }
 
         public void Run(int maxSteps = 20_000_000)
