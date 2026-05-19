@@ -1,0 +1,8 @@
+[Desktop Entry]
+Encoding=UTF-8
+Type=Application
+Name=Web Browser
+Comment=NetSurf web browser
+Exec=netsurf-gtk2
+Icon=netsurf
+Categories=Network;

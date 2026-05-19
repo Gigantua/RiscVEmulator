@@ -1,0 +1,6 @@
+prog "Terminal" - xterm
+prog "Files" - pcmanfm
+prog "Web (badwolf/webkit)" - badwolf
+prog "Web (netsurf)" - netsurf
+prog "Packages (apk)" - xterm -e sh -c "apk list -I 2>/dev/null | sort | less; exec sh"
+prog "Music test (sine)" - xterm -e sh -c "speaker-test -t sine -f 440 -c 2 -l 1; exec sh"

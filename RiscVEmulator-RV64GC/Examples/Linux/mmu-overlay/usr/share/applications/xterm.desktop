@@ -1,0 +1,8 @@
+[Desktop Entry]
+Encoding=UTF-8
+Type=Application
+Name=Terminal
+Comment=xterm terminal emulator
+Exec=xterm
+Icon=xterm
+Categories=System;

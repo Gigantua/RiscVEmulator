@@ -1,0 +1,123 @@
+/dts-v1/;
+
+/*
+ * Device tree for the RV64GC Linux build (Alpine riscv64).
+ *
+ * Paired with `Examples.Linux --rv64`, which boots a buildroot
+ * qemu_riscv64_virt kernel in S-mode with the emulator acting as SBI
+ * firmware (see Native/rv64gc_core.cpp, rv64_set_sbi_mode).
+ *
+ * One hart, one RAM bank, a polled ns16550 UART, a PLIC, a virtio-net
+ * transport and a simple-framebuffer. RAM is a fixed 1 GiB; the last
+ * 4 MiB is the framebuffer — /memory stops at FbBase so the kernel never
+ * allocates it, and the FB sits contiguous with RAM (no PFN gap) so the
+ * simple-framebuffer node neither perturbs memblock nor triggers an
+ * init_unavailable_range walk. `--gui` opens an SDL window and runs the
+ * desktop; console mode just leaves the FB/net devices idle.
+ *
+ * Three little-endian u32 guard words are patched by the boot harness:
+ *   0xC0FFEE00 → /memory size, 0xC0FFEE01/02 → initrd start/end.
+ */
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "rvemu,rv64";
+	model = "rvemu RV64 Sv39";
+
+	chosen {
+		/* earlycon=sbi → first printk via the emulator's SBI DBCN
+		 * console. `--gui` overwrites "earlycon=sbi" with "rvemu_gui"
+		 * so the guest /init launches the desktop. */
+		bootargs = "console=ttyS0 earlycon=sbi";
+		stdout-path = "serial0:115200n8";
+		linux,initrd-start = <0xC0FFEE01>;
+		linux,initrd-end   = <0xC0FFEE02>;
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* Matches TIMEBASE_HZ in rv64gc_core.cpp and the mtime tick rate. */
+		timebase-frequency = <10000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv64imafdc";
+			mmu-type = "riscv,sv39";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	/* RAM at the conventional RISC-V base. The size word (0xC0FFEE00) is
+	 * patched at boot; it stops at the framebuffer (FbBase 0xBFC00000). */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x00 0x80000000 0x00 0xC0FFEE00>;
+	};
+
+	/* simple-framebuffer: 1024x768x32, the last 4 MiB of the 1 GiB bank.
+	 * Outside /memory, contiguous with RAM. Pixels are byte order R,G,B,A
+	 * in memory → "a8b8g8r8". */
+	framebuffer@bfc00000 {
+		compatible = "simple-framebuffer";
+		reg = <0x00 0xBFC00000 0x00 0x300000>;
+		width  = <1024>;
+		height = <768>;
+		stride = <4096>;
+		format = "a8b8g8r8";
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		plic: interrupt-controller@c000000 {
+			compatible = "sifive,plic-1.0.0", "riscv,plic0";
+			reg = <0x00 0x0C000000 0x00 0x4000000>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			#address-cells = <0>;
+			/* hart 0: context 0 = M-mode (IRQ 11), context 1 = S-mode (IRQ 9) */
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+			riscv,ndev = <31>;
+		};
+
+		uart0: serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x00 0x10000000 0x00 0x100>;
+			clock-frequency = <3686400>;
+			reg-shift = <0>;
+		};
+
+		/* virtio-net — host VirtioNetDevice; PLIC source 1. */
+		virtio_net@10008000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x10008000 0x00 0x1000>;
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+		};
+
+		/* virtio-blk — host VirtioBlkDevice (persistent disk); PLIC source 2. */
+		virtio_blk@10009000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x10009000 0x00 0x1000>;
+			interrupt-parent = <&plic>;
+			interrupts = <2>;
+		};
+	};
+};
