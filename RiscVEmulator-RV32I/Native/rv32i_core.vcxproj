@@ -75,6 +75,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="rv32i_core.cpp" />
+    <ClInclude Include="rv32i_jit.h" />
     <None Include="rv32i_core.def" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

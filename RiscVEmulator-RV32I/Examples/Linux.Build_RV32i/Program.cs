@@ -24,6 +24,7 @@ string  wslDir        = DefaultWslDir;
 string  distro        = "";
 string? sudoPassword  = null;     // --sudo-password skips the interactive prompt
 int     jobs          = 32;
+string  toolchain     = "clang";  // default: clang (LLVM-unified); pass --toolchain=gcc for legacy buildroot GCC
 var     extraApt      = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
@@ -36,6 +37,7 @@ for (int i = 0; i < args.Length; i++)
         case "--distro":         distro       = args[++i]; break;
         case "--apt":            extraApt.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries)); break;
         case "--sudo-password":  sudoPassword = args[++i]; break;
+        case "--toolchain":      toolchain    = args[++i]; break;  // gcc | clang
         case "-j":
         case "--jobs":           jobs         = int.Parse(args[++i]); break;
         case "-h": case "--help": PrintUsage(); return 0;
@@ -45,6 +47,21 @@ for (int i = 0; i < args.Length; i++)
             return 1;
     }
 }
+
+if (toolchain != "gcc" && toolchain != "clang")
+{
+    Console.Error.WriteLine($"--toolchain must be 'gcc' (default) or 'clang'; got '{toolchain}'.");
+    return 1;
+}
+// clang unification: see CLANG_UNIFICATION_PLAN.md. We always let buildroot
+// build its own GCC cross toolchain first (binutils + uClibc-ng + libgcc.a
+// + crt objects — clang reuses all of those). After that build completes,
+// the wrapper-staging step below swaps the gcc wrappers for the clang shim,
+// then any subsequent `make ...` (uclibc/busybox/kernel/package rebuilds)
+// runs through clang transparently. The kernel additionally needs LLVM=1
+// LLVM_SUFFIX=-18 in LINUX_MAKE_FLAGS so the kernel Makefile uses lld /
+// llvm-objcopy / llvm-* for its own internal tooling.
+bool useClang = toolchain == "clang";
 
 // ── 1. Verify WSL is installed ───────────────────────────────────────────
 
@@ -66,6 +83,9 @@ var aptPkgs = new List<string>
     // For unpacking msys2 .pkg.tar.zst archives (libslirp Windows DLLs).
     "zstd",
 };
+// --toolchain=clang needs clang + lld on the host so the shim can exec them.
+if (useClang) aptPkgs.AddRange(new[] { "clang-18", "lld-18", "llvm-18" });
+
 aptPkgs.AddRange(extraApt);
 
 if (!skipApt)
@@ -1520,11 +1540,65 @@ RunWsl(
 // kernel through an architectural ECALL, which the CPU turns into an
 // environment-call trap (cause 8 from U-mode). No syscall-stub rewrite.
 
+// ── 6f. Clang toolchain unification (--toolchain=clang) ─────────────────
+//
+// See CLANG_UNIFICATION_PLAN.md. Buildroot has no LLVM toolchain backend,
+// so we build buildroot's GCC cross toolchain first (binutils + uClibc-ng +
+// libgcc + crt objects → sysroot), then *swap the compiler wrapper* for a
+// clang shim. Everything that buildroot's `make` invokes downstream
+// (uClibc/busybox/kernel/packages) transparently compiles via clang. The
+// kernel additionally needs `LLVM=1 LLVM_SUFFIX=-18` in its make flags so
+// its internal tooling (objcopy/strip/ld) uses llvm-* / lld.
+//
+// One-shot marker `.clang-toolchain-applied` mirrors the
+// `.rv32i-trapframe-v1-applied` pattern: the swap+dirclean fires exactly
+// once per buildroot tree.
+string clangMarker = $"{wslDir}/board/rvemu/.clang-toolchain-applied";
+if (useClang)
+{
+    Console.WriteLine();
+    Console.WriteLine("================================================================");
+    Console.WriteLine(" --toolchain=clang : building GCC toolchain first, then swapping in clang shim");
+    Console.WriteLine("================================================================");
+
+    // a) Build only the cross toolchain (binutils + uClibc-ng + libgcc).
+    int rc = RunWsl($"cd {wslDir} && make -j{jobs} toolchain");
+    if (rc != 0) return rc;
+
+    // b) Stage the shim over riscv32-buildroot-linux-uclibc-{gcc,cc} once.
+    string shimSrc;
+    {
+        var d = new DirectoryInfo(AppContext.BaseDirectory);
+        while (d != null && !File.Exists(Path.Combine(d.FullName, "clang-toolchain", "riscv32-clang-shim.sh")))
+            d = d.Parent;
+        if (d == null) throw new FileNotFoundException("riscv32-clang-shim.sh not found above " + AppContext.BaseDirectory);
+        shimSrc = Path.Combine(d.FullName, "clang-toolchain", "riscv32-clang-shim.sh").Replace("\\", "/");
+    }
+    string T = "riscv32-buildroot-linux-uclibc";
+    RunWsl($"install -m 0755 \"$(wslpath -u '{shimSrc}')\" {wslDir}/output/host/bin/{T}-clang-shim");
+    foreach (var n in new[] { "gcc", "cc" })
+        RunWsl($"ln -sf {T}-clang-shim {wslDir}/output/host/bin/{T}-{n}");
+
+    // c) Patch linux.mk to pass LLVM=1 LLVM_SUFFIX=-18 to the kernel build.
+    RunWsl($"grep -q 'LLVM=1' {wslDir}/linux/linux.mk || " +
+           $"sed -i 's|^LINUX_MAKE_FLAGS = \\\\$|LINUX_MAKE_FLAGS = LLVM=1 LLVM_SUFFIX=-18 \\\\|' " +
+           $"{wslDir}/linux/linux.mk");
+
+    // d) One-shot dirclean of the three big packages so they rebuild with clang.
+    int needSwap = RunWslSilent($"test -f {clangMarker}");
+    if (needSwap != 0)
+    {
+        Console.WriteLine("  first --toolchain=clang run — forcing uclibc/busybox/linux dirclean");
+        RunWsl($"cd {wslDir} && make uclibc-dirclean busybox-dirclean linux-dirclean");
+        RunWsl($"touch {clangMarker}");
+    }
+}
+
 // ── 7. Build ─────────────────────────────────────────────────────────────
 
 Console.WriteLine();
 Console.WriteLine("================================================================");
-Console.WriteLine(" Building (cnlohr's kernel config + mainline buildroot).");
+Console.WriteLine($" Building with toolchain={toolchain} (cnlohr's kernel config + mainline buildroot).");
 Console.WriteLine(" First-time: 20-40 minutes (kernel re-fetched at version 6.8).");
 Console.WriteLine("================================================================");
 Console.WriteLine();

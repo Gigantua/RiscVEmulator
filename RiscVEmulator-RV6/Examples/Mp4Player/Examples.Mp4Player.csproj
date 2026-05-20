@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Core\RiscVEmulator.Core.csproj" />
+    <ProjectReference Include="..\..\Frontend\RiscVEmulator.Frontend.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Examples.Mp4Player</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="Programs\mp4_player.c" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Programs\pl_mpeg.h" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

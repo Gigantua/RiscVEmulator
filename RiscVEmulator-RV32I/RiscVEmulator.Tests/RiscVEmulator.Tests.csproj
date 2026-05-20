@@ -21,6 +21,10 @@
   <ItemGroup>
     <None Include="..\Runtime\linker.ld"    CopyToOutputDirectory="Always" Link="Runtime\linker.ld" />
     <None Update="Programs\primes.c"        CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench.c"          CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_matmul.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_crc.c"      CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_softfp.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\fibonacci.c"     CopyToOutputDirectory="Always" />
     <None Update="Programs\bubblesort.c"    CopyToOutputDirectory="Always" />
     <None Update="Programs\bitops.c"        CopyToOutputDirectory="Always" />

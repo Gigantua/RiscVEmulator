@@ -1,0 +1,14 @@
+config BR2_PACKAGE_DOOMGENERIC
+	bool "doomgeneric"
+	select BR2_PACKAGE_DOOM_WAD
+	help
+	  Pure-C portable Doom port. Renders into a generic
+	  callback-based frontend — we ship an rvemu backend that
+	  draws directly to /dev/mem at 0x85C00000 (3x upscaled,
+	  centered on the 1024x768 framebuffer) and reads input from
+	  /dev/input/event0.
+
+	  Selects doom-wad which installs the shareware WAD at
+	  /usr/share/games/doom/doom1.wad.
+
+	  https://github.com/ozkl/doomgeneric

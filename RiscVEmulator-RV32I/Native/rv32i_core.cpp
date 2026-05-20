@@ -50,10 +50,11 @@ extern "C" void* memset(void* dst, int c, unsigned long long n) {
 // ════════════════════════════════════════════════════════════════════
 
 struct CPU_State {
-    uint32_t regs[32];
-    uint32_t pc;
-    int      halted;     // run/stop bit driven by the host
-    uint8_t* mem;        // host base; guest access = *(mem + addr)
+    uint32_t regs[32];   // 0
+    uint32_t pc;         // 128
+    int32_t  budget;     // 132 — JIT-only: instructions left in this run
+    int      halted;     // 136 — run/stop bit driven by the host
+    uint8_t* mem;        // 144 — host base; guest access = *(mem + addr)
 };
 
 // What cpu_step hands back. EXC_NONE: instruction retired. EXC_ILLEGAL: the
@@ -303,6 +304,38 @@ static bool check_interrupts(CPU_State& cpu, TrapUnit& trap) {
 static CPU_State cpu;
 static TrapUnit  trap;
 
+// ────────────────────────────────────────────────────────────────────
+// JIT store helpers. The JIT emits a `call` into one of these instead of
+// inlining the store, so the actual `mov [base], reg` ends up in this DLL's
+// .text section. That matters because VEH-mediated MMIO dispatch from
+// stores inside our RWX arena hangs in some host processes (Mp4Player /
+// TinyCC / DOOM), while VEH dispatch from stores in DLL .text works.
+// ────────────────────────────────────────────────────────────────────
+extern "C" __declspec(noinline) void jit_helper_sb(uint32_t addr, uint32_t val) {
+    *(volatile uint8_t*)(cpu.mem + addr) = (uint8_t)val;
+}
+extern "C" __declspec(noinline) void jit_helper_sh(uint32_t addr, uint32_t val) {
+    *(volatile uint16_t*)(cpu.mem + addr) = (uint16_t)val;
+}
+extern "C" __declspec(noinline) void jit_helper_sw(uint32_t addr, uint32_t val) {
+    *(volatile uint32_t*)(cpu.mem + addr) = val;
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lb(uint32_t addr) {
+    return (uint32_t)(int32_t)(int8_t)*(volatile uint8_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lh(uint32_t addr) {
+    return (uint32_t)(int32_t)(int16_t)*(volatile uint16_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lw(uint32_t addr) {
+    return *(volatile uint32_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lbu(uint32_t addr) {
+    return *(volatile uint8_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lhu(uint32_t addr) {
+    return *(volatile uint16_t*)(cpu.mem + addr);
+}
+
 // One emulation step: the trap unit samples interrupts; otherwise the CPU
 // runs one instruction and the trap unit handles anything it raised.
 static void do_step() {
@@ -320,7 +353,13 @@ static void do_step() {
     else if (e.kind == EXC_ILLEGAL) do_trap(cpu, trap, CAUSE_ILLEGAL, e.instr);
 }
 
+// x86-64 JIT — translated-block fast path. Included here so it can see the
+// CPU state, the trap unit and cpu_step(); falls back to the interpreter.
+#include "rv32i_jit.h"
+static bool g_use_jit = false;
+
 extern "C" int rv32i_step_n(int n) {
+    if (g_use_jit) return jit_run(n);
     for (int i = 0; i < n; i++) {
         do_step();
         if (__builtin_expect(cpu.halted, 0)) return -(i + 1);
@@ -334,6 +373,15 @@ extern "C" void rv32i_init(uint8_t* mem, uint32_t entry) {
     cpu.pc    = entry;
     cpu.mem   = mem;
     trap.priv = PRIV_M;
+
+    // JIT on unless RVEMU_JIT=0. A fresh program means a fresh memory base,
+    // so discard any blocks translated for a previous run.
+    char buf[8] = {};
+    unsigned long got = GetEnvironmentVariableA("RVEMU_JIT", buf, sizeof(buf));
+    bool want_jit = !(got == 1 && buf[0] == '0');
+
+    g_use_jit = want_jit && jit_alloc();
+    if (g_use_jit) jit_flush();
 }
 
 extern "C" void rv32i_destroy() { cpu.mem = nullptr; }
@@ -341,7 +389,12 @@ extern "C" void rv32i_destroy() { cpu.mem = nullptr; }
 extern "C" uint32_t rv32i_get_pc()                   { return cpu.pc; }
 extern "C" int      rv32i_is_halted()                { return cpu.halted; }
 extern "C" void     rv32i_set_reg(int i, uint32_t v) { if (i) cpu.regs[i & 31] = v; }
-extern "C" void     rv32i_set_halted(int v)          { cpu.halted = v; }
+extern "C" void     rv32i_set_halted(int v) {
+    cpu.halted = v;
+    // Force the JIT's next per-block budget check (sub/js) to exit to C so
+    // chained execution doesn't keep running after a halt MMIO write.
+    if (v) cpu.budget = -1;
+}
 
 // Host interrupt pins (trap unit) — PLIC drives external, CLINT drives timer.
 extern "C" void rv32i_set_meip(int level) {
