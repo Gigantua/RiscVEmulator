@@ -1,0 +1,58 @@
+# Makefile.rvemu — flat build of TyrQuake NQ (single-player) software
+# renderer against uClibc-ng on the rvemu nommu RV32 Linux guest.
+#
+# Buildroot stages this file into the extracted TyrQuake source root, then
+# invokes `make -f Makefile.rvemu` with CC/CFLAGS/LDFLAGS overrides.
+#
+# The vid_rvemu.c that talks to /dev/mem at 0x85C00000 is also staged into
+# common/ before we run — see tyrquake.mk's POST_EXTRACT hook. We list it
+# below in COMMON_SRCS while excluding the upstream vid_null.c that would
+# otherwise multiply-define VID_Init.
+
+CC      ?= cc
+CFLAGS  ?= -O2 -fsigned-char -fno-strict-aliasing
+LDFLAGS ?= -static
+NAME     = tyrquake
+
+# Subdirectory layout matches upstream
+COMMON_DIR = common
+NQ_DIR     = NQ
+
+# Curated source list — software renderer, single-player, no GL/X11/SDL.
+COMMON_SRCS = \
+	alias_model.c buildinfo.c cd_null.c cl_input.c cmd.c common.c \
+	console.c crc.c cvar.c developer.c draw.c \
+	d_edge.c d_fill.c d_init.c d_modech.c d_part.c d_polyse.c \
+	d_scan.c d_sky.c d_sprite.c d_surf.c d_vars.c \
+	keys.c mathlib.c menu.c model.c pcx.c pr_cmds.c pr_edict.c \
+	pr_exec.c qpic.c rb_tree.c r_aclip.c r_alias.c r_bsp.c r_draw.c \
+	r_edge.c r_efrag.c r_lerp.c r_light.c r_main.c r_misc.c \
+	r_model.c r_part.c r_sky.c r_sprite.c r_surf.c r_vars.c \
+	screen.c shell.c snd_dma.c snd_mem.c snd_mix.c \
+	sprite_model.c sv_move.c sv_phys.c tga.c \
+	vid_rvemu.c wad.c world.c zone.c \
+	in_null.c sys_null.c
+
+NQ_SRCS = \
+	chase.c cl_demo.c cl_main.c cl_parse.c cl_tent.c \
+	host.c host_cmd.c net_loop.c net_main.c net_common.c net_none.c \
+	sbar.c sv_main.c sv_user.c view.c
+
+COMMON_OBJS = $(addprefix $(COMMON_DIR)/, $(COMMON_SRCS:.c=.o))
+NQ_OBJS     = $(addprefix $(NQ_DIR)/,     $(NQ_SRCS:.c=.o))
+OBJS        = $(COMMON_OBJS) $(NQ_OBJS)
+
+CPPFLAGS = -DNQ_HACK -DTYR_VERSION=0.71 -DTYR_VERSION_NUM=0.71 \
+	-DTYR_VERSION_TIME=1700000000LL \
+	-Iinclude -INQ -Icommon
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+$(NAME): $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) -lm
+
+clean:
+	rm -f $(OBJS) $(NAME)
+
+.PHONY: clean

@@ -1,0 +1,7 @@
+LIBRARY slirp_bridge
+EXPORTS
+    sb_init
+    sb_tx
+    sb_rx
+    sb_get_mac
+    sb_cleanup

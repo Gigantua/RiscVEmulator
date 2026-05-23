@@ -1,0 +1,16 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -xc++
+    - --target=x86_64-pc-windows-msvc
+    - -fms-extensions
+    - -fms-compatibility
+    - -fdelayed-template-parsing
+    - -D_WIN32
+    - -D_MSC_VER=1940
+  Compiler: clang-cl
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress:
+    - unused-includes

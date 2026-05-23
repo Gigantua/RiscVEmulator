@@ -1,0 +1,92 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Produces a self-contained test exe using the new Microsoft Testing Platform -->
+    <EnableMSTestRunner>true</EnableMSTestRunner>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- All-in-one MSTest 3.x package (framework + adapter + MTP runner) -->
+    <PackageReference Include="MSTest" Version="3.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Core\RiscVEmulator.Core.csproj" />
+  </ItemGroup>
+
+  <!-- Copy C sources, linker script and runtime to the test output directory -->
+  <ItemGroup>
+    <None Include="..\Runtime\linker.ld"    CopyToOutputDirectory="Always" Link="Runtime\linker.ld" />
+    <None Update="Programs\primes.c"        CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench.c"          CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_matmul.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_crc.c"      CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_softfp.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\fibonacci.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\bubblesort.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\bitops.c"        CopyToOutputDirectory="Always" />
+    <None Update="Programs\mem_widths.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\signed_ops.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\uint64_ops.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\factorial.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\float_basics.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\float_matmul.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\double_basics.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\double_matmul.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\timer_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\fb_test.c"      CopyToOutputDirectory="Always" />
+    <None Update="Programs\input_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\audio_test.c"   CopyToOutputDirectory="Always" />
+    <None Include="Programs\atomic_trap.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\f_trap.c"      CopyToOutputDirectory="Always" />
+    <None Include="Programs\s_mode_removed.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\paravirt_syscall_gateway.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\direct_user_ecall.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\nested_trap.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\timer_irq.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\softfloat_microbench.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\int_libcalls.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\runtime_ops.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\malloc_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\vfs_test.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\syscalls_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\mmio_devices_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\printf_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\string_test.c" CopyToOutputDirectory="Always" />
+    <None Update="Programs\ctype_test.c"  CopyToOutputDirectory="Always" />
+    <None Include="..\Runtime\softfloat.c"   CopyToOutputDirectory="Always" Link="Runtime\softfloat.c" />
+    <None Include="..\Runtime\softfp\softfp.c"        CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp.c" />
+    <None Include="..\Runtime\softfp\softfp.h"        CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp.h" />
+    <None Include="..\Runtime\softfp\softfp_template.h"      CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp_template.h" />
+    <None Include="..\Runtime\softfp\softfp_template_icvt.h" CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp_template_icvt.h" />
+    <None Include="..\Runtime\softfp\softfp_shim.c"   CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp_shim.c" />
+    <None Include="..\Runtime\softfp\cutils.h"        CopyToOutputDirectory="Always" Link="Runtime\softfp\cutils.h" />
+    <None Include="..\Runtime\softfp\rvemu_softfp_force.h" CopyToOutputDirectory="Always" Link="Runtime\softfp\rvemu_softfp_force.h" />
+    <None Include="..\Runtime\crt0.c"        CopyToOutputDirectory="Always" Link="Runtime\crt0.c" />
+    <None Include="..\Runtime\runtime.c"     CopyToOutputDirectory="Always" Link="Runtime\runtime.c" />
+    <None Include="..\Runtime\malloc.c"      CopyToOutputDirectory="Always" Link="Runtime\malloc.c" />
+    <None Include="..\Runtime\vfs.c"         CopyToOutputDirectory="Always" Link="Runtime\vfs.c" />
+    <None Include="..\Runtime\syscalls.c"    CopyToOutputDirectory="Always" Link="Runtime\syscalls.c" />
+    <None Include="..\Runtime\libc.c"        CopyToOutputDirectory="Always" Link="Runtime\libc.c" />
+    <None Include="..\Runtime\libc.h"        CopyToOutputDirectory="Always" Link="Runtime\libc.h" />
+    <None Include="..\Runtime\math.c"        CopyToOutputDirectory="Always" Link="Runtime\math.c" />
+    <None Include="..\Runtime\setjmp.c"      CopyToOutputDirectory="Always" Link="Runtime\setjmp.c" />
+    <None Include="..\Runtime\string.h"      CopyToOutputDirectory="Always" Link="Runtime\string.h" />
+    <None Include="..\Runtime\stdlib.h"      CopyToOutputDirectory="Always" Link="Runtime\stdlib.h" />
+    <None Include="..\Runtime\stdio.h"       CopyToOutputDirectory="Always" Link="Runtime\stdio.h" />
+    <None Include="..\Runtime\ctype.h"       CopyToOutputDirectory="Always" Link="Runtime\ctype.h" />
+    <None Include="..\Runtime\errno.h"       CopyToOutputDirectory="Always" Link="Runtime\errno.h" />
+    <None Include="..\Runtime\math.h"        CopyToOutputDirectory="Always" Link="Runtime\math.h" />
+    <None Include="..\Runtime\assert.h"      CopyToOutputDirectory="Always" Link="Runtime\assert.h" />
+    <None Include="..\Runtime\time.h"        CopyToOutputDirectory="Always" Link="Runtime\time.h" />
+    <None Update="Programs\stdlib_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\math_test.c"     CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_mkrgba_test.c"    CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_worldgen_test.c"  CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_physics_test.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\voxel_midi_test.c"      CopyToOutputDirectory="Always" />
+  </ItemGroup>
+</Project>

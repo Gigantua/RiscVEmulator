@@ -1,0 +1,158 @@
+using RiscVEmulator.Core;
+using RiscVEmulator.Core.Peripherals;
+using RiscVEmulator.Frontend;
+
+// ── Configuration ─────────────────────────────────────────────────
+const uint StackPointer = 0x00EFFF00;
+const int  RamMB        = 16;
+
+string exeDir      = AppContext.BaseDirectory;
+string programsDir = Path.Combine(exeDir, "Programs");
+
+// Walk up from the output dir until we find the solution root (contains RiscVEmulator.sln)
+string? solutionRoot = exeDir;
+while (solutionRoot != null && !File.Exists(Path.Combine(solutionRoot, "RiscVEmulator.sln")))
+    solutionRoot = Path.GetDirectoryName(solutionRoot);
+if (solutionRoot == null)
+    throw new DirectoryNotFoundException($"Cannot find RiscVEmulator.sln starting from {exeDir}");
+
+string runtimeDir   = Path.Combine(solutionRoot, "Runtime");
+string linkerLd     = Path.Combine(runtimeDir, "linker.ld");
+
+// ── Parse CLI args ─────────────────────────────────────────────────
+var opts = new SdlWindowOptions { Title = "Voxel — RV32I Emulator", GrabMouse = true };
+bool enableMExt = true;
+
+for (int i = 0; i < args.Length; i++)
+{
+    switch (args[i])
+    {
+        case "--scale":    opts.Scale     = int.Parse(args[++i]); break;
+        case "--fps":      opts.TargetFps = int.Parse(args[++i]); break;
+        case "--no-grab":  opts.GrabMouse = false; break;
+        case "--no-m-ext": enableMExt = false; break;
+    }
+}
+
+string buildDir = Path.Combine(exeDir, "build");
+Directory.CreateDirectory(buildDir);
+string elfPath = Path.Combine(buildDir, "voxel.elf");
+
+// ── Sources ────────────────────────────────────────────────────────
+// voxel_main.c is self-contained: no OpenGL, no GLFW, no networking.
+// It writes directly to the MMIO framebuffer at 0x20000000.
+string voxelMain = Path.Combine(programsDir, "voxel_main.c");
+
+string[] allSources =
+{
+    Path.Combine(runtimeDir, "crt0.c"),
+    Path.Combine(runtimeDir, "runtime.c"),
+    Path.Combine(runtimeDir, "softfloat.c"),
+    Path.Combine(runtimeDir, "math.c"),
+    Path.Combine(runtimeDir, "libc.c"),
+    Path.Combine(runtimeDir, "syscalls.c"),
+    Path.Combine(runtimeDir, "malloc.c"),
+    Path.Combine(runtimeDir, "vfs.c"),
+    voxelMain,
+};
+
+string[] includeDirs = { runtimeDir, programsDir };
+
+// ── Compile ────────────────────────────────────────────────────────
+Console.WriteLine("Compiling Voxel for RV32I...");
+var objFiles = new List<string>();
+
+foreach (string src in allSources)
+{
+    if (!File.Exists(src))
+    {
+        Console.Error.WriteLine($"Source not found: {src}");
+        return 1;
+    }
+    string objName = Path.GetFileNameWithoutExtension(src) + ".o";
+    string objPath = Path.Combine(buildDir, objName);
+    string[] extra = includeDirs.Select(d => $"-I{d}").ToArray();
+    if (!Compile(src, objPath, extra, enableMExt))
+        return 1;
+    objFiles.Add(objPath);
+}
+
+// ── Link ───────────────────────────────────────────────────────────
+{
+    var linkArgs = new List<string>
+    {
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
+        "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char",
+        "-fuse-ld=lld", $"-Wl,-T,{linkerLd}",
+    };
+    linkArgs.AddRange(objFiles);
+    linkArgs.Add("-o");
+    linkArgs.Add(elfPath);
+
+    Console.Write("  Linking... ");
+    if (!RunClang(linkArgs.ToArray()))
+        return 1;
+    Console.WriteLine("OK");
+}
+
+Console.WriteLine($"  voxel.elf: {new FileInfo(elfPath).Length:N0} bytes");
+
+// ── Build SoC ──────────────────────────────────────────────────────
+Console.WriteLine("Building SoC...");
+byte[] elfData = File.ReadAllBytes(elfPath);
+var memory  = new Memory(RamMB * 1024 * 1024);
+var bus     = new MemoryBus(memory);
+var uart    = new UartDevice();
+var fb      = new FramebufferDevice();
+var display = new DisplayControlDevice(fb);
+display.SetMemory(memory);
+var kbd     = new KeyboardDevice();
+var mouse   = new MouseDevice();
+var rtc     = new RealTimeClockDevice();
+var audioBuf  = new AudioBufferDevice();
+var audioCtrl = new AudioControlDevice();
+var midi      = new MidiDevice();
+
+bus.RegisterPeripheral(uart);
+bus.RegisterPeripheral(fb);
+bus.RegisterPeripheral(display);
+bus.RegisterPeripheral(kbd);
+bus.RegisterPeripheral(mouse);
+bus.RegisterPeripheral(rtc);
+bus.RegisterPeripheral(audioBuf);
+bus.RegisterPeripheral(audioCtrl);
+bus.RegisterPeripheral(midi);
+
+uart.OutputHandler = c => Console.Write(c);
+
+var regs   = new RegisterFile();
+uint entry = ElfLoader.Load(elfData, bus);
+regs.Write(2, StackPointer);
+
+var emu = new Emulator(bus, regs, entry);
+emu.OutputHandler = c => Console.Write(c);
+
+Console.WriteLine("Starting Voxel...");
+var window = new SdlWindow(fb, display, kbd, mouse, audioBuf, audioCtrl, emu, opts, midi);
+return window.Run();
+
+// ── Helpers ────────────────────────────────────────────────────────
+bool Compile(string src, string obj, string[] extraFlags, bool mExt)
+{
+    Console.Write($"  {Path.GetFileName(src)}... ");
+    var compileArgs = new List<string>
+    {
+        "--target=riscv32-unknown-elf", "-march=rv32i", "-mabi=ilp32",
+        "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char", "-c",
+    };
+    compileArgs.AddRange(extraFlags);
+    compileArgs.Add(src);
+    compileArgs.Add("-o");
+    compileArgs.Add(obj);
+    if (!RunClang(compileArgs.ToArray()))
+        return false;
+    Console.WriteLine("OK");
+    return true;
+}
+
+bool RunClang(string[] clangArgs) => WslClang.Run(clangArgs);
