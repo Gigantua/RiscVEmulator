@@ -45,7 +45,7 @@ if (args.Length > 0)
 }
 
 // No args → interactive REPL.
-Console.WriteLine("rvemu package server. Commands: search <q>, add <name>, remove <name>, list, build, rebuild <name>, serve, run, quit");
+Console.WriteLine("rvemu package server. Commands: search <q>, add <name>, remove <name>, list, build, rebuild [<name>...], serve, run, quit");
 while (true)
 {
     Console.Write("> ");
@@ -94,8 +94,8 @@ async Task<int> ExecuteAsync(string[] argv)
             return await DoBuildAsync();
 
         case "rebuild":
-            if (argv.Length < 2) { Console.Error.WriteLine("usage: rebuild <name> [<name>...]"); return 1; }
-            DoRebuild(argv.Skip(1));
+            // No args → rebuild every package in the catalog.
+            DoRebuild(argv.Length < 2 ? LoadCatalog().Packages.Select(p => p.Name) : argv.Skip(1));
             return await DoBuildAsync();
 
         case "serve":
@@ -107,7 +107,7 @@ async Task<int> ExecuteAsync(string[] argv)
         case "help":
         case "-h":
         case "--help":
-            Console.WriteLine("commands: search <q>, add <name>, remove <name>, list, build, rebuild <name>, serve, run");
+            Console.WriteLine("commands: search <q>, add <name>, remove <name>, list, build, rebuild [<name>...] (no name = all), serve, run");
             return 0;
 
         default:
@@ -275,35 +275,40 @@ async Task<int> DoBuildAsync()
     if (cat.Packages.Count == 0) { Console.WriteLine("nothing to build (catalog empty)"); return 0; }
     Directory.CreateDirectory(FeedCacheDir);
 
-    int skipped = 0, built = 0, failed = 0;
+    // Plain-text mode for non-TTY / scripted / RVEMU_PLAIN=1 — old behavior.
+    bool plain = Environment.GetEnvironmentVariable("RVEMU_PLAIN") == "1" ||
+                 Console.IsOutputRedirected || Console.IsInputRedirected;
+
+    var dash = new BuildDashboard(cat.Packages, plain);
     foreach (var entry in cat.Packages)
     {
-        // Skip packages whose previously-built .ipk is still cached. The
-        // catalog tracks IpkFile + BuiltVersion; if both are set and the
-        // file is still on disk, there's nothing to do.
+        // Skip packages whose previously-built .ipk is still cached.
         if (!string.IsNullOrEmpty(entry.IpkFile) && !string.IsNullOrEmpty(entry.BuiltVersion))
         {
             string cached = Path.Combine(FeedCacheDir, entry.IpkFile);
             if (File.Exists(cached))
             {
-                Console.WriteLine($"=== {entry.Name} ({entry.BrSymbol}) — cached {entry.BuiltVersion} ===");
-                skipped++;
+                dash.SetCached(entry.Name, entry.BuiltVersion!);
                 continue;
             }
         }
 
-        Console.WriteLine($"=== {entry.Name} ({entry.BrSymbol}) ===");
-        var (ok, ipkPath, version) = await BuildAndPackAsync(entry);
-        if (!ok) { Console.Error.WriteLine($"  ! build failed"); failed++; continue; }
-        entry.BuiltVersion = version;
-        entry.IpkFile      = Path.GetFileName(ipkPath);
-        Console.WriteLine($"  → {entry.IpkFile}");
-        built++;
+        dash.SetRunning(entry.Name);
+        var (ok, ipkPath, version, log) = await BuildAndPackAsync(entry);
+        if (ok)
+        {
+            entry.BuiltVersion = version;
+            entry.IpkFile      = Path.GetFileName(ipkPath);
+            dash.SetOk(entry.Name, version, log);
+        }
+        else
+        {
+            dash.SetFailed(entry.Name, log);
+        }
     }
-    Console.WriteLine($"Build summary: {built} built, {skipped} cached, {failed} failed.");
-    if (skipped > 0)
-        Console.WriteLine("  (use 'rebuild <name>' to force-rebuild a cached package)");
+    dash.Done();
     SaveCatalog(cat);
+    if (!plain) dash.Review();    // arrow-key log viewer
 
     // Regenerate Packages.gz from whatever .ipk's are in feed-cache.
     Console.WriteLine("Indexing feed...");
@@ -328,8 +333,17 @@ async Task<int> DoBuildAsync()
     return 0;
 }
 
-async Task<(bool ok, string ipkPath, string version)> BuildAndPackAsync(CatalogEntry entry)
+async Task<(bool ok, string ipkPath, string version, string log)> BuildAndPackAsync(CatalogEntry entry)
 {
+    var logSb = new StringBuilder();
+    void Log(string s) => logSb.AppendLine(s);
+    (int rc, string so, string se) Cap(string cmd)
+    {
+        var r = RunWsl(cmd);
+        if (!string.IsNullOrWhiteSpace(r.stdout)) logSb.Append(r.stdout);
+        if (!string.IsNullOrWhiteSpace(r.stderr)) logSb.Append(r.stderr);
+        return r;
+    }
     // 1. Ensure the symbol is enabled in buildroot's .config, then ALWAYS
     //    re-sync. olddefconfig must run unconditionally: a previous `add`
     //    may have written {BrSymbol}=y without ever resolving the symbols
@@ -344,7 +358,7 @@ async Task<(bool ok, string ipkPath, string version)> BuildAndPackAsync(CatalogE
         echo '{entry.BrSymbol}=y' >> .config
         yes '' | make olddefconfig
     ";
-    if (RunWsl(ensure).rc != 0) return (false, "", "");
+    if (Cap(ensure).rc != 0) return (false, "", "", logSb.ToString());
 
     // 2. Drop a timestamp marker. Anything in target/ whose mtime is newer
     //    than this after the rebuild belongs to this package (or its deps,
@@ -360,8 +374,9 @@ async Task<(bool ok, string ipkPath, string version)> BuildAndPackAsync(CatalogE
     //    stdin from /dev/null: belt-and-suspenders so that even if buildroot
     //    re-triggers kconfig here it sees EOF and takes defaults instead of
     //    blocking on a console prompt.
-    var (rc, _, _) = RunWsl($"cd {WslBuildroot} && make {pkgLower}-rebuild </dev/null", echo: true);
-    if (rc != 0) return (false, "", "");
+    Log($"$ make {pkgLower}-rebuild");
+    var (rc, _, _) = Cap($"cd {WslBuildroot} && make {pkgLower}-rebuild </dev/null");
+    if (rc != 0) return (false, "", "", logSb.ToString());
 
     // 4. Find everything newer than the marker. Buildroot per-package
     //    directories (BR2_PER_PACKAGE_DIRECTORIES=y) make `<pkg>-rebuild`
@@ -380,10 +395,10 @@ async Task<(bool ok, string ipkPath, string version)> BuildAndPackAsync(CatalogE
     var newFiles = newFilesStdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).ToList();
     if (newFiles.Count == 0)
     {
-        Console.Error.WriteLine($"  (no new files — package may have no targetinstalled artifacts)");
-        return (false, "", "");
+        Log("(no new files — package may have no targetinstalled artifacts)");
+        return (false, "", "", logSb.ToString());
     }
-    Console.WriteLine($"  captured {newFiles.Count} files");
+    Log($"captured {newFiles.Count} files");
 
     // 5. Discover version from buildroot's per-package staging metadata.
     var (_, verStdout, _) = RunWsl($"make -s -C {WslBuildroot} {pkgLower}-show-version 2>/dev/null || true");
@@ -453,13 +468,13 @@ print(out_ipk)
         $"\"$(cat {controlPath})\" {ipkWsl}");
     if (prc != 0)
     {
-        Console.Error.WriteLine($"  ! pack failed:\n{perr}");
-        return (false, "", "");
+        Log($"! pack failed:\n{perr}");
+        return (false, "", "", logSb.ToString());
     }
     // Copy the finished single-file .ipk to the host via /mnt/c.
     var (_, wslDst, _) = RunWsl($"wslpath -u \"{ipkPath.Replace("\\", "/")}\"");
     RunWsl($"mkdir -p '$(dirname \"{wslDst.Trim()}\")' && cp {ipkWsl} \"{wslDst.Trim()}\"");
-    return (true, ipkPath, version);
+    return (true, ipkPath, version, logSb.ToString());
 }
 
 string ExtractControlStanza(string ipkPath)
@@ -693,5 +708,210 @@ static class IpkBuilder
             }
         }
         return outMs.ToArray();
+    }
+}
+
+// ── Build dashboard (TUI) ───────────────────────────────────────────────────
+//
+// Shows one row per package with a status icon (✓ ok, ✗ failed, ⋯ running,
+// = cached, · pending). The build loop replaces rows in-place as each
+// package finishes (no scrollback spam). After the build, Review() enters an
+// interactive log viewer — arrow keys move the selection, Enter opens the
+// captured stdout/stderr of that package in a pager, Esc/q returns.
+//
+// Falls back to plain stdout when output is redirected or RVEMU_PLAIN=1.
+
+enum BuildState { Pending, Running, Ok, Failed, Cached }
+
+sealed class BuildDashboard
+{
+    record Row(string Name, string BrSymbol)
+    {
+        public BuildState State = BuildState.Pending;
+        public string?    Detail;
+        public string     Log = "";
+    }
+
+    readonly List<Row> rows;
+    readonly bool plain;
+    int top;             // console row where the table starts
+    bool laidOut;
+
+    public BuildDashboard(IEnumerable<CatalogEntry> entries, bool plain)
+    {
+        rows = entries.Select(e => new Row(e.Name, e.BrSymbol)).ToList();
+        this.plain = plain;
+    }
+
+    void Layout()
+    {
+        if (laidOut) return;
+        laidOut = true;
+        if (plain) return;
+        Console.WriteLine($"Building {rows.Count} package{(rows.Count == 1 ? "" : "s")} (clang via shim)…");
+        try { top = Console.CursorTop; } catch { top = 0; }
+        for (int i = 0; i < rows.Count; i++) Console.WriteLine();
+        Render();
+    }
+
+    void Render()
+    {
+        if (plain) return;
+        for (int i = 0; i < rows.Count; i++) RenderRow(i);
+        try { Console.SetCursorPosition(0, top + rows.Count); } catch { }
+    }
+
+    void RenderRow(int i)
+    {
+        if (plain) return;
+        var r = rows[i];
+        string icon, colour;
+        switch (r.State)
+        {
+            case BuildState.Pending: icon = "·";  colour = "\x1b[2m";       break;  // dim
+            case BuildState.Running: icon = "⋯";  colour = "\x1b[33m";      break;  // yellow
+            case BuildState.Ok:      icon = "✓";  colour = "\x1b[32m";      break;  // green
+            case BuildState.Failed:  icon = "✗";  colour = "\x1b[31;1m";    break;  // bold red
+            case BuildState.Cached:  icon = "=";  colour = "\x1b[36m";      break;  // cyan
+            default: icon = " "; colour = "";                                break;
+        }
+        string detail = r.Detail ?? "";
+        string line   = $"  {icon}  {r.Name,-28} {detail}";
+        try
+        {
+            Console.SetCursorPosition(0, top + i);
+            Console.Write($"{colour}{line}\x1b[0m\x1b[K");
+        }
+        catch { Console.WriteLine(line); }
+    }
+
+    int Find(string name) => rows.FindIndex(r => r.Name == name);
+
+    public void SetRunning(string name)
+    {
+        Layout();
+        int i = Find(name); if (i < 0) return;
+        rows[i].State = BuildState.Running;
+        rows[i].Detail = "building…";
+        if (plain) Console.WriteLine($"  … {name}");
+        else RenderRow(i);
+    }
+
+    public void SetOk(string name, string version, string log)
+    {
+        int i = Find(name); if (i < 0) return;
+        rows[i].State = BuildState.Ok;
+        rows[i].Detail = version;
+        rows[i].Log = log;
+        if (plain) Console.WriteLine($"  OK  {name}  {version}");
+        else RenderRow(i);
+    }
+
+    public void SetFailed(string name, string log)
+    {
+        int i = Find(name); if (i < 0) return;
+        rows[i].State = BuildState.Failed;
+        rows[i].Detail = "FAILED — press Enter on this row to inspect";
+        rows[i].Log = log;
+        if (plain) { Console.Error.WriteLine($"  !! {name} failed"); Console.Error.WriteLine(log); }
+        else RenderRow(i);
+    }
+
+    public void SetCached(string name, string version)
+    {
+        Layout();
+        int i = Find(name); if (i < 0) return;
+        rows[i].State = BuildState.Cached;
+        rows[i].Detail = $"cached {version}";
+        if (plain) Console.WriteLine($"  =   {name}  {version}");
+        else RenderRow(i);
+    }
+
+    public void Done()
+    {
+        if (plain)
+        {
+            int ok = rows.Count(r => r.State == BuildState.Ok);
+            int sk = rows.Count(r => r.State == BuildState.Cached);
+            int fa = rows.Count(r => r.State == BuildState.Failed);
+            Console.WriteLine($"Build summary: {ok} built, {sk} cached, {fa} failed.");
+            return;
+        }
+        try { Console.SetCursorPosition(0, top + rows.Count); } catch { }
+        int built  = rows.Count(r => r.State == BuildState.Ok);
+        int cached = rows.Count(r => r.State == BuildState.Cached);
+        int failed = rows.Count(r => r.State == BuildState.Failed);
+        Console.WriteLine($"  {built} built · {cached} cached · {failed} failed     " +
+                          (failed > 0 ? "(↑/↓ + Enter to inspect a log, q to quit)" : "(↑/↓ + Enter to view a log, q to quit)"));
+    }
+
+    public void Review()
+    {
+        if (plain || rows.Count == 0) return;
+        int sel = Math.Max(0, rows.FindIndex(r => r.State == BuildState.Failed));
+        if (sel < 0) sel = 0;
+        try { Console.CursorVisible = false; } catch { }
+        try
+        {
+            while (true)
+            {
+                for (int i = 0; i < rows.Count; i++) RenderRowWithCursor(i, i == sel);
+                try { Console.SetCursorPosition(0, top + rows.Count + 1); } catch { }
+                var k = Console.ReadKey(intercept: true);
+                if (k.Key == ConsoleKey.UpArrow   && sel > 0)              sel--;
+                else if (k.Key == ConsoleKey.DownArrow && sel < rows.Count - 1) sel++;
+                else if (k.Key == ConsoleKey.Home) sel = 0;
+                else if (k.Key == ConsoleKey.End)  sel = rows.Count - 1;
+                else if (k.Key == ConsoleKey.Enter || k.Key == ConsoleKey.Spacebar) ShowLog(rows[sel]);
+                else if (k.Key == ConsoleKey.Q || k.Key == ConsoleKey.Escape) break;
+            }
+        }
+        finally
+        {
+            try { Console.CursorVisible = true; } catch { }
+            try { Console.SetCursorPosition(0, top + rows.Count + 1); } catch { }
+            Console.WriteLine();
+        }
+    }
+
+    void RenderRowWithCursor(int i, bool selected)
+    {
+        var r = rows[i];
+        string icon, colour;
+        switch (r.State)
+        {
+            case BuildState.Pending: icon = "·";  colour = "\x1b[2m";    break;
+            case BuildState.Running: icon = "⋯";  colour = "\x1b[33m";   break;
+            case BuildState.Ok:      icon = "✓";  colour = "\x1b[32m";   break;
+            case BuildState.Failed:  icon = "✗";  colour = "\x1b[31;1m"; break;
+            case BuildState.Cached:  icon = "=";  colour = "\x1b[36m";   break;
+            default: icon = " "; colour = "";                            break;
+        }
+        string cursor = selected ? "▸" : " ";
+        string reverse = selected ? "\x1b[7m" : "";
+        string detail = r.Detail ?? "";
+        string line = $" {cursor} {icon}  {r.Name,-28} {detail}";
+        try
+        {
+            Console.SetCursorPosition(0, top + i);
+            Console.Write($"{reverse}{colour}{line}\x1b[0m\x1b[K");
+        }
+        catch { Console.WriteLine(line); }
+    }
+
+    static void ShowLog(Row r)
+    {
+        Console.Clear();
+        Console.WriteLine($"── {r.Name}  [{r.State}]  {r.Detail ?? ""}  ─────────────────────");
+        Console.WriteLine();
+        var log = string.IsNullOrEmpty(r.Log) ? "(no captured output)" : r.Log;
+        // Tail: show last ~2000 lines so the failure is visible without scrolling.
+        var lines = log.Split('\n');
+        int from = Math.Max(0, lines.Length - 2000);
+        for (int i = from; i < lines.Length; i++) Console.WriteLine(lines[i]);
+        Console.WriteLine();
+        Console.WriteLine("── press any key to return ─────────────────────");
+        Console.ReadKey(intercept: true);
+        Console.Clear();
     }
 }

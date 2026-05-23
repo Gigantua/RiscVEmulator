@@ -8,6 +8,21 @@
     <PackageReference Include="Silk.NET.SDL" Version="2.22.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Snapshot of the working Ubuntu-22.04 buildroot kernel + DTB.
+         BOTH embedded resource (always-available regardless of working
+         dir / launch path / parallel WSL session) AND copied next to
+         the .exe (so manual file edits / debugging work). -->
+    <EmbeddedResource Include="kernel\Image-net">
+      <LogicalName>Examples.Linux.kernel.Image-net</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="kernel\rvemu-net.dtb">
+      <LogicalName>Examples.Linux.kernel.rvemu-net.dtb</LogicalName>
+    </EmbeddedResource>
+    <None Include="kernel\Image-net"     CopyToOutputDirectory="PreserveNewest" />
+    <None Include="kernel\rvemu-net.dtb" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
@@ -15,6 +30,8 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Examples.Linux</RootNamespace>
+    <Platforms>AnyCPU;x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
 
 </Project>

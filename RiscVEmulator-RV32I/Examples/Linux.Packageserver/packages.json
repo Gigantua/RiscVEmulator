@@ -23,12 +23,6 @@
       "BrSymbol": "BR2_PACKAGE_FROTZ",
       "BuiltVersion": "2.54",
       "IpkFile": "frotz_2.54_rv32inommu_uclibc.ipk"
-    },
-    {
-      "Name": "netsurf",
-      "BrSymbol": "BR2_PACKAGE_NETSURF_ARCH_SUPPORTS",
-      "BuiltVersion": null,
-      "IpkFile": null
     }
   ]
 }

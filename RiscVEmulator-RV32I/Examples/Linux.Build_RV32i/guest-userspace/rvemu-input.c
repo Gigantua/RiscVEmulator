@@ -54,6 +54,73 @@
 #define MOUSE_DY      (0x08 / 4)
 #define MOUSE_BUTTONS (0x0C / 4)
 
+/* SdlWindow.MapKeysym sends ASCII codes for printable keys (0x20..0x7E),
+ * plus a small set of Windows-VK-style scancodes for non-printable keys
+ * (ESC=0x1B, arrows=0x25..0x28, modifiers=0x10..0x12, etc.). Linux
+ * `<linux/input-event-codes.h>` uses a totally different keycode space
+ * (KEY_A=30, KEY_W=17, …). Without this translation, every keystroke
+ * arrived as the wrong Linux key — e.g. 'w' (0x77) hit KEY_KBDILLUMTOGGLE
+ * and only mouse worked in apps. */
+static int ascii_to_linux_keycode(uint8_t s)
+{
+    /* Non-printable / Win-VK-style codes from the host */
+    switch (s) {
+        case 0x00: return 0;
+        case 0x08: return KEY_BACKSPACE;
+        case 0x09: return KEY_TAB;
+        case 0x0D: return KEY_ENTER;
+        case 0x10: return KEY_LEFTSHIFT;
+        case 0x11: return KEY_LEFTCTRL;
+        case 0x12: return KEY_LEFTALT;
+        case 0x14: return KEY_CAPSLOCK;
+        case 0x1B: return KEY_ESC;
+        case 0x21: /* PGUP */ return KEY_PAGEUP;   /* collides with '!' — host
+                                                     never sends '!' via this code */
+        case 0x22: return KEY_PAGEDOWN;
+        case 0x23: return KEY_END;
+        case 0x24: return KEY_HOME;
+        case 0x25: return KEY_LEFT;
+        case 0x26: return KEY_UP;
+        case 0x27: return KEY_RIGHT;
+        case 0x28: return KEY_DOWN;
+        case 0x2D: return KEY_INSERT;
+        case 0xE0: return KEY_VOLUMEUP;   /* mousewheel up — Quake-only, harmless here */
+        case 0xE1: return KEY_VOLUMEDOWN;
+    }
+    /* Printable ASCII */
+    switch (s) {
+        case ' ': return KEY_SPACE;
+        case '\'': return KEY_APOSTROPHE;
+        case ',':  return KEY_COMMA;
+        case '-':  return KEY_MINUS;
+        case '.':  return KEY_DOT;
+        case '/':  return KEY_SLASH;
+        case ';':  return KEY_SEMICOLON;
+        case '=':  return KEY_EQUAL;
+        case '[':  return KEY_LEFTBRACE;
+        case '\\': return KEY_BACKSLASH;
+        case ']':  return KEY_RIGHTBRACE;
+        case '`':  return KEY_GRAVE;
+    }
+    if (s >= '0' && s <= '9') {
+        static const int row[] = {
+            KEY_0, KEY_1, KEY_2, KEY_3, KEY_4,
+            KEY_5, KEY_6, KEY_7, KEY_8, KEY_9
+        };
+        return row[s - '0'];
+    }
+    if (s >= 'a' && s <= 'z') {
+        static const int row[] = {
+            KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G,
+            KEY_H, KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N,
+            KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U,
+            KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z
+        };
+        return row[s - 'a'];
+    }
+    return 0;
+}
+
 static void emit(int fd, uint16_t type, uint16_t code, int32_t value)
 {
     struct input_event ie;
@@ -155,8 +222,11 @@ int main(void)
             uint32_t e        = kbd[KBD_DATA];
             uint8_t  scancode = (uint8_t)(e & 0xFF);
             int      pressed  = (e >> 8) & 1;
-            emit(kbd_fd, EV_KEY, scancode, pressed ? 1 : 0);
-            emit(kbd_fd, EV_SYN, SYN_REPORT, 0);
+            int kc = ascii_to_linux_keycode(scancode);
+            if (kc) {
+                emit(kbd_fd, EV_KEY, kc, pressed ? 1 : 0);
+                emit(kbd_fd, EV_SYN, SYN_REPORT, 0);
+            }
         }
 
         /* Drain mouse state. */

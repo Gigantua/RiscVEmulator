@@ -2,9 +2,15 @@
 #pragma once
 
 /* ── Special-value macros ─────────────────────────────────────────── */
+#ifndef HUGE_VAL
 #define HUGE_VAL  __builtin_huge_val()
+#endif
+#ifndef INFINITY
 #define INFINITY  __builtin_inff()
+#endif
+#ifndef NAN
 #define NAN       __builtin_nanf("")
+#endif
 
 /* ── Classification macros ────────────────────────────────────────── */
 #define isnan(x)      __builtin_isnan(x)
@@ -68,3 +74,11 @@ double pow(double base, double exponent);
 float  expf(float x);
 float  logf(float x);
 float  powf(float base, float exponent);
+
+/* ── Decomposition ────────────────────────────────────────────────── */
+double modf(double x, double *iptr);
+float  modff(float x, float *iptr);
+double frexp(double x, int *exp);
+float  frexpf(float x, int *exp);
+double ldexp(double x, int exp);
+float  ldexpf(float x, int exp);

@@ -296,6 +296,23 @@ public unsafe class SdlWindow
                         _mouse.MoveMouse(evt.Motion.Xrel, evt.Motion.Yrel);
                         break;
 
+                    case EventType.Mousewheel:
+                    {
+                        // Push wheel ticks as keyboard events with reserved
+                        // scancodes 0xE0/0xE1; in_rvemu.c::vk_to_quake maps
+                        // those to K_MWHEELUP / K_MWHEELDOWN. Send a press +
+                        // immediate release so Quake's edge detection fires.
+                        int ticks = evt.Wheel.Y;
+                        byte code = ticks > 0 ? (byte)0xE0 : (byte)0xE1;
+                        int n = ticks > 0 ? ticks : -ticks;
+                        for (int i = 0; i < n; i++)
+                        {
+                            _kbd.EnqueueKey(code, true);
+                            _kbd.EnqueueKey(code, false);
+                        }
+                        break;
+                    }
+
                     case EventType.Mousebuttondown:
                     case EventType.Mousebuttonup:
                     {

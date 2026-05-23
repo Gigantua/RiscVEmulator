@@ -4,8 +4,8 @@ Architecture: rv32inommu_uclibc
 Maintainer: rvemu-feed
 Description: bc (cross-built via buildroot)
 Filename: bc_1.07.1_rv32inommu_uclibc.ipk
-Size: 201736
-SHA256sum: e797aeefc14386b311aebfad95762d4b70393e4d09351f42e62b43f0b0a2715b
+Size: 201352
+SHA256sum: cd0b09146eaf55c71475584a1e6a62c7513c53dbbab4e2f081379b4dbf591790
 
 Package: doomgeneric
 Version: dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284
@@ -22,8 +22,8 @@ Architecture: rv32inommu_uclibc
 Maintainer: rvemu-feed
 Description: frotz (cross-built via buildroot)
 Filename: frotz_2.54_rv32inommu_uclibc.ipk
-Size: 247364
-SHA256sum: 9435a4976b43698130ab1f34f994e8b6a32b5d296814dce14735aa30542ba731
+Size: 247318
+SHA256sum: af5e868cb405f2a004ddba585b0e123eec8ec40a14f02f55a640bc392545eab2
 
 Package: nano
 Version: 7.2
@@ -31,8 +31,8 @@ Architecture: rv32inommu_uclibc
 Maintainer: rvemu-feed
 Description: nano (cross-built via buildroot)
 Filename: nano_7.2_rv32inommu_uclibc.ipk
-Size: 301778
-SHA256sum: dae77414fcefc152a50a744a99aacab7aaa2fb6200543e323927efed8f0bea78
+Size: 301704
+SHA256sum: f77ead1f0c6255adc3fea565854c117053263e987655ad1e06aa36a7bc69b65d
 
 Package: sl
 Version: 5.02
@@ -40,6 +40,6 @@ Architecture: rv32inommu_uclibc
 Maintainer: rvemu-feed
 Description: sl (cross-built via buildroot)
 Filename: sl_5.02_rv32inommu_uclibc.ipk
-Size: 188020
-SHA256sum: 28097cdb09afdb1cd25d65849a01d34d022157aacf62bc6141cb4020cfbaf451
+Size: 187964
+SHA256sum: ebf7788a4c6eefbbc9762428f9788fe3490d431d105de2e207bbbe4141cd3487
 

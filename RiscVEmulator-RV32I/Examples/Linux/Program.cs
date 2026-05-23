@@ -3,6 +3,18 @@ using RiscVEmulator.Core;
 using RiscVEmulator.Core.Networking;
 using RiscVEmulator.Core.Peripherals;
 
+// JIT default: OFF for Linux. The JIT path has an unresolved SEH-unwind /
+// GC-walker race that crashes the host process when guest workloads do
+// heavy MMIO (most visibly: launching Doom inside Linux). Interpreter mode
+// is stable end-to-end. Other examples (Doom standalone, Quake, TinyCC,
+// Voxel) leave JIT enabled — only the Linux example forces JIT=0.
+// Override here with RVEMU_JIT=1 if you want to bench/profile and accept
+// the crash risk.
+if (Environment.GetEnvironmentVariable("RVEMU_JIT") == null)
+{
+    Environment.SetEnvironmentVariable("RVEMU_JIT", "0");
+}
+
 // Make stdout auto-flush so prompts without \n (e.g. "login: ", "# ") appear immediately.
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), Console.OutputEncoding) { AutoFlush = true });
 Console.OutputEncoding = System.Text.Encoding.UTF8;
@@ -58,8 +70,40 @@ string cacheDir = Path.Combine(
     ".cache", "riscvemu", "linux");
 Directory.CreateDirectory(cacheDir);
 
-string preparedKernel = Path.Combine(cacheDir, "Image-net");
-string preparedDtb    = Path.Combine(cacheDir, "rvemu-net.dtb");
+// Kernel + DTB are embedded as resources in this .dll (see .csproj
+// EmbeddedResource entries). Materialize them to a per-user temp dir
+// on first run so the rest of the example uses regular file paths.
+// This avoids the parallel-WSL-session cache-clobber problem AND
+// doesn't depend on working dir / launch path / build config.
+string repoKernel;
+string repoDtb;
+{
+    string snapDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "rvemu", "linux-snapshot");
+    Directory.CreateDirectory(snapDir);
+    repoKernel = Path.Combine(snapDir, "Image-net");
+    repoDtb    = Path.Combine(snapDir, "rvemu-net.dtb");
+    var asm = typeof(Program).Assembly;
+    foreach (var (resName, outPath) in new[] {
+        ("Examples.Linux.kernel.Image-net",     repoKernel),
+        ("Examples.Linux.kernel.rvemu-net.dtb", repoDtb),
+    })
+    {
+        using var s = asm.GetManifestResourceStream(resName);
+        if (s == null) continue;
+        // Only rewrite if size differs — saves disk + plays nice with
+        // file-modification-time checks downstream.
+        if (!File.Exists(outPath) || new FileInfo(outPath).Length != s.Length)
+        {
+            using var fs = File.Create(outPath);
+            s.CopyTo(fs);
+            Console.Error.WriteLine($"[snapshot] extracted {Path.GetFileName(outPath)} ({s.Length:N0} B) -> {outPath}");
+        }
+    }
+}
+string preparedKernel = File.Exists(repoKernel) ? repoKernel : Path.Combine(cacheDir, "Image-net");
+string preparedDtb    = File.Exists(repoDtb)    ? repoDtb    : Path.Combine(cacheDir, "rvemu-net.dtb");
 string defaultKernel  = Path.Combine(cacheDir, "Image");
 string defaultDtb     = Path.Combine(cacheDir, "sixtyfourmb.dtb");
 
@@ -69,8 +113,9 @@ bool userOverrodeDtb    = dtbPath    != null;
 if (!userOverrodeKernel && !userOverrodeDtb &&
     File.Exists(preparedKernel) && File.Exists(preparedDtb))
 {
-    Console.Error.WriteLine($"Using Build_RV32i kernel: {preparedKernel}");
-    Console.Error.WriteLine($"Using Build_RV32i DTB:    {preparedDtb}");
+    string srcLabel = preparedKernel == repoKernel ? "repo" : "Build_RV32i";
+    Console.Error.WriteLine($"Using {srcLabel} kernel: {preparedKernel}");
+    Console.Error.WriteLine($"Using {srcLabel} DTB:    {preparedDtb}");
     kernelPath = preparedKernel;
     dtbPath    = preparedDtb;
     enableNet  = true;          // prepared image always has virtio-net.
@@ -108,6 +153,84 @@ if (!File.Exists(dtbPath))
 // ── Load kernel and DTB images ───────────────────────────────────────────────
 
 byte[] kernelImage = File.ReadAllBytes(kernelPath);
+
+// Migrate any legacy paravirt-IRQ kernel that hard-coded the trap-frame
+// base at 0x10006000 to the new TrapFrameDevice base at 0x0F000000.
+// Build_RV32i (May-17 era) emitted `lui t0, 0x10006` everywhere the
+// paravirt-IRQ device was poked; the new native trap unit only knows
+// about 0x0F000000, so without this patch every `csrw CSR_TVEC, …`
+// turned into a write into MMIO void, leaving TRAP_VECTOR=0 forever.
+// The instruction format is `imm[31:12] | rd[11:7] | opcode[6:0]=0x37`.
+// Mask off rd+opcode, compare upper 20 bits to 0x10006, rewrite to
+// 0x0F000. addi/sw/lw instructions that follow already encode the
+// correct byte offsets (0x004 = TVEC, 0x008 = IE_MASK, 0x00C = SCRATCH).
+{
+    int rewrites = 0;
+    for (int i = 0; i + 3 < kernelImage.Length; i += 4)
+    {
+        uint w = BitConverter.ToUInt32(kernelImage, i);
+        if ((w & 0xFFFFF07F) == 0x10006037)         // lui rd, 0x10006
+        {
+            uint patched = (w & 0x00000FFF) | (0x0F000u << 12);
+            BitConverter.GetBytes(patched).CopyTo(kernelImage, i);
+            rewrites++;
+        }
+    }
+    if (rewrites > 0)
+        Console.Error.WriteLine($"[trap-frame migrator] rewrote {rewrites} legacy `lui rd, 0x10006` -> `lui rd, 0x0F000`");
+
+}
+
+// Patch out auto-launch of Doom from the embedded init script (S45microwindows).
+// The script tests `[ -x /usr/bin/doom ]` before forking doom. Renaming the
+// path to /usr/bin/noex (same byte length) makes the test fail and the
+// surrounding block is skipped.
+//
+// Separately: the doom wrapper at /usr/bin/doom execs `/usr/libexec/doom-puredoom`,
+// but the actual binary installed is `/usr/libexec/doom` (the doomgeneric/
+// doom-puredoom recipe mismatch). Patch the wrapper to point at the correct
+// path — same byte length via padding spaces.
+static void PatchAll(byte[] image, byte[] needle, byte[] replacement, string label)
+{
+    if (needle.Length != replacement.Length)
+        throw new InvalidOperationException("Patch needle/replacement must be same length");
+    int patches = 0;
+    for (int i = 0; i + needle.Length <= image.Length; i++)
+    {
+        bool match = true;
+        for (int j = 0; j < needle.Length; j++)
+            if (image[i + j] != needle[j]) { match = false; break; }
+        if (match)
+        {
+            replacement.CopyTo(image, i);
+            patches++;
+            i += needle.Length - 1;
+        }
+    }
+    if (patches > 0)
+        Console.Error.WriteLine($"[{label}] patched {patches} site(s)");
+}
+
+PatchAll(kernelImage,
+    System.Text.Encoding.ASCII.GetBytes("[ -x /usr/bin/doom ]"),
+    System.Text.Encoding.ASCII.GetBytes("[ -x /usr/bin/noex ]"),
+    "auto-doom-disable");
+
+// `S45microwindows stop` ends with `killall doom nxeyes nxclock ...`. The
+// doom-launch wrapper at /usr/bin/doom calls `S45microwindows stop` before
+// invoking the engine — and `killall doom` matches the wrapper SHELL process
+// because the script is *named* /usr/bin/doom (busybox sets argv[0] from the
+// scriptname). Result: wrapper SIGTERMs itself before reaching the engine.
+//
+// Fix: blank out "doom " in the killall list so the wrapper isn't killed.
+// Same byte length (5→5 spaces), no other side effect — the real doom
+// process gets killed by the for-loop above via /var/run/doom.pid if it's
+// running.
+PatchAll(kernelImage,
+    System.Text.Encoding.ASCII.GetBytes("killall doom nxeyes"),
+    System.Text.Encoding.ASCII.GetBytes("killall      nxeyes"),
+    "doom-self-kill-fix");
+
 int    ramSize     = ramMB * 1024 * 1024;
 const uint RamBase = 0x80000000u;
 
@@ -307,34 +430,91 @@ ConsoleHelper.EnableVt();
 // UART output → console. AutoFlush is set at startup, so every char appears immediately.
 // In automation mode, detect the BusyBox prompt and inject commands immediately
 // instead of relying on fixed sleeps or interactive shell polling.
-var uartTail = new Queue<char>(16);
-var haltTail = new Queue<char>(Math.Max(1, haltOnOutput?.Length ?? 1));
-bool autoCommandsSent = false;
-bool haltTokenSeen = false;
+//
+// The two match-loops below MUST be allocation-free per byte. The original
+// implementation did `new string(queue.ToArray())` per byte — at kernel-
+// printk-storm rates (tens of MB/s) that pushed Gen0 every few ms, and a
+// GC fired from the drain thread suspended the CPU thread mid-JIT-frame
+// long enough for the stack walker to race the VEH-injected exception
+// frame → STATUS_STACK_BUFFER_OVERRUN (0xc0000409).
+//
+// Replacement: a per-pattern integer cursor. Advance on match, rewind to
+// the longest proper suffix that is still a prefix (KMP-lite — but our
+// patterns have no internal repetition, so the rewind is just "back to
+// the longest matching prefix of length k for some k < cur"). All zero
+// alloc, all branch-friendly.
+string?  haltPattern    = haltOnOutput;        // null when no halt-on-token mode
+int      haltCur        = 0;
+bool     haltTokenSeen  = false;
+string[] promptPatterns = { "~ #", "~#", "# " };
+int[]    promptCur      = new int[promptPatterns.Length];
+bool     autoCommandsSent = false;
+
+static int RewindMatch(string pat, int cur, char c)
+{
+    // After a mismatch at position `cur` on input char `c`, find the longest
+    // proper suffix of pat[0..cur] that is also a prefix of pat AND extends
+    // by `c`. For our short patterns ("~ #", "~#", "# ") we just retry the
+    // shorter prefixes linearly — at most pat.Length iterations.
+    while (cur > 0)
+    {
+        cur--;
+        if (cur == 0) return (c == pat[0]) ? 1 : 0;
+        // Check whether pat[0..cur] is a suffix of the consumed input.
+        // Cheap heuristic for our 2-3 char patterns: just try pat[cur]==c.
+        if (c == pat[cur]) return cur + 1;
+    }
+    return (c == pat[0]) ? 1 : 0;
+}
+
+// Raw-byte path: avoids per-char Console.Write boxing/locking that would
+// otherwise be reached from the VEH callback's UART write. The drain
+// thread writes byte[] directly to stdout — zero allocation per char.
+uart.OutputStream = Console.OpenStandardOutput();
+
+// The match-loop callbacks (autoCommands / haltOnOutput) still run, but
+// now off the VEH path on the drain thread. The OutputHandler hook
+// fires per-char from drain — must remain allocation-free per char.
 uart.OutputHandler = c =>
 {
-    Console.Write(c);
-    if (haltOnOutput != null && !haltTokenSeen)
+    if (haltPattern != null && !haltTokenSeen)
     {
-        haltTail.Enqueue(c);
-        while (haltTail.Count > haltOnOutput.Length) haltTail.Dequeue();
-        if (new string(haltTail.ToArray()).EndsWith(haltOnOutput, StringComparison.Ordinal))
+        if (c == haltPattern[haltCur])
         {
-            haltTokenSeen = true;
-            emu.SetHalted(true);
+            haltCur++;
+            if (haltCur == haltPattern.Length)
+            {
+                haltTokenSeen = true;
+                emu.SetHalted(true);
+            }
+        }
+        else if (haltCur > 0)
+        {
+            haltCur = RewindMatch(haltPattern, haltCur, c);
         }
     }
 
     if (autoCommands == null || autoCommandsSent) return;
-
-    uartTail.Enqueue(c);
-    while (uartTail.Count > 8) uartTail.Dequeue();
-    string tail = new(uartTail.ToArray());
-    if (!tail.EndsWith("~ #") && !tail.EndsWith("~#") && !tail.EndsWith("# "))
-        return;
-
-    autoCommandsSent = true;
-    ThreadPool.QueueUserWorkItem(_ => EnqueueGuestInput(uart, autoCommands));
+    for (int i = 0; i < promptPatterns.Length; i++)
+    {
+        var p   = promptPatterns[i];
+        int cur = promptCur[i];
+        if (c == p[cur])
+        {
+            cur++;
+            if (cur == p.Length)
+            {
+                autoCommandsSent = true;
+                ThreadPool.QueueUserWorkItem(_ => EnqueueGuestInput(uart, autoCommands));
+                return;
+            }
+        }
+        else if (cur > 0)
+        {
+            cur = RewindMatch(p, cur, c);
+        }
+        promptCur[i] = cur;
+    }
 };
 
 // Halt when Linux powers off
@@ -410,11 +590,42 @@ if (trace)
 {
     new System.Threading.Thread(() =>
     {
-        while (!cts.IsCancellationRequested && !emu.IsHalted)
+        unsafe
         {
-            System.Threading.Thread.Sleep(2000);
-            if (cts.IsCancellationRequested || emu.IsHalted) break;
-            Console.Error.WriteLine($"[trace] mtime={emu.MTime:N0} pc=0x{emu.PC:X8}");
+            byte* host = (byte*)memory.Reservation.Base;
+            uint* tf   = (uint*)(host + 0x0F000000);   // trap-frame page
+            uint  tvecPeak = 0;
+            uint  tvecAtPeak = 0;
+            // Aggressive sub-200ms poll of TRAP_VECTOR so we catch the
+            // value the kernel writes before it's cleared.
+            new System.Threading.Thread(() => {
+                while (!cts.IsCancellationRequested && !emu.IsHalted)
+                {
+                    uint v = tf[1];
+                    if (v != 0 && v != tvecPeak)
+                    {
+                        tvecPeak = v;
+                        tvecAtPeak = (uint)emu.MTime;
+                        Console.Error.WriteLine($"[trap-watch] TVEC set to 0x{v:X8} @ mtime~{tvecAtPeak}");
+                    }
+                    System.Threading.Thread.Sleep(50);
+                }
+            }) { IsBackground = true, Name = "TrapVecWatch" }.Start();
+            while (!cts.IsCancellationRequested && !emu.IsHalted)
+            {
+                System.Threading.Thread.Sleep(2000);
+                if (cts.IsCancellationRequested || emu.IsHalted) break;
+                uint ieFlag  = tf[0];                  // +0x000  IE_FLAG (mstatus image)
+                uint tvec    = tf[1];                  // +0x004  TRAP_VECTOR
+                uint ieMask  = tf[2];                  // +0x008  IE_MASK
+                uint epc     = tf[0x100/4 + 0];        // landing pad word[0] = epc
+                uint cause   = tf[0x100/4 + 34];       // landing pad word[34] = cause
+                uint tval    = tf[0x100/4 + 33];       // landing pad word[33] = tval (badaddr)
+                Console.Error.WriteLine(
+                    $"[trace] mtime={emu.MTime:N0} pc=0x{emu.PC:X8} " +
+                    $"tvec=0x{tvec:X8} ieflag=0x{ieFlag:X} iemask=0x{ieMask:X} " +
+                    $"last_epc=0x{epc:X8} cause=0x{cause:X} tval=0x{tval:X8}");
+            }
         }
     }) { IsBackground = true, Name = "Heartbeat" }.Start();
 }

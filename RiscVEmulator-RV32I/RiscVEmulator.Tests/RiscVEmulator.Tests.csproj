@@ -21,6 +21,10 @@
   <ItemGroup>
     <None Include="..\Runtime\linker.ld"    CopyToOutputDirectory="Always" Link="Runtime\linker.ld" />
     <None Update="Programs\primes.c"        CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench.c"          CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_matmul.c"   CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_crc.c"      CopyToOutputDirectory="Always" />
+    <None Update="Programs\bench_softfp.c"   CopyToOutputDirectory="Always" />
     <None Update="Programs\fibonacci.c"     CopyToOutputDirectory="Always" />
     <None Update="Programs\bubblesort.c"    CopyToOutputDirectory="Always" />
     <None Update="Programs\bitops.c"        CopyToOutputDirectory="Always" />
@@ -43,6 +47,8 @@
     <None Include="Programs\direct_user_ecall.c" CopyToOutputDirectory="Always" />
     <None Include="Programs\nested_trap.c" CopyToOutputDirectory="Always" />
     <None Include="Programs\timer_irq.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\softfloat_microbench.c" CopyToOutputDirectory="Always" />
+    <None Include="Programs\int_libcalls.c" CopyToOutputDirectory="Always" />
     <None Update="Programs\runtime_ops.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\malloc_test.c"  CopyToOutputDirectory="Always" />
     <None Update="Programs\vfs_test.c"     CopyToOutputDirectory="Always" />
@@ -52,6 +58,13 @@
     <None Update="Programs\string_test.c" CopyToOutputDirectory="Always" />
     <None Update="Programs\ctype_test.c"  CopyToOutputDirectory="Always" />
     <None Include="..\Runtime\softfloat.c"   CopyToOutputDirectory="Always" Link="Runtime\softfloat.c" />
+    <None Include="..\Runtime\softfp\softfp.c"        CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp.c" />
+    <None Include="..\Runtime\softfp\softfp.h"        CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp.h" />
+    <None Include="..\Runtime\softfp\softfp_template.h"      CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp_template.h" />
+    <None Include="..\Runtime\softfp\softfp_template_icvt.h" CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp_template_icvt.h" />
+    <None Include="..\Runtime\softfp\softfp_shim.c"   CopyToOutputDirectory="Always" Link="Runtime\softfp\softfp_shim.c" />
+    <None Include="..\Runtime\softfp\cutils.h"        CopyToOutputDirectory="Always" Link="Runtime\softfp\cutils.h" />
+    <None Include="..\Runtime\softfp\rvemu_softfp_force.h" CopyToOutputDirectory="Always" Link="Runtime\softfp\rvemu_softfp_force.h" />
     <None Include="..\Runtime\crt0.c"        CopyToOutputDirectory="Always" Link="Runtime\crt0.c" />
     <None Include="..\Runtime\runtime.c"     CopyToOutputDirectory="Always" Link="Runtime\runtime.c" />
     <None Include="..\Runtime\malloc.c"      CopyToOutputDirectory="Always" Link="Runtime\malloc.c" />

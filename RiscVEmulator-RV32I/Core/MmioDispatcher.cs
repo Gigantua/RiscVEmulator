@@ -20,8 +20,22 @@ namespace RiscVEmulator.Core
             public IPeripheral Owner;
         }
 
-        private static readonly List<Range> s_ranges = new();
-        private static readonly object       s_lock   = new();
+        // Lock-free hot path: VEH handler reads s_snapshot without taking any
+        // lock. Register / Clear publish a new snapshot via Volatile.Write
+        // under s_writerLock. Crucial because the VEH callback runs inside a
+        // Windows kernel-injected exception-dispatch frame; taking a managed
+        // Monitor in that context can race with GC suspend on other threads
+        // and fast-fail the process with STATUS_STACK_BUFFER_OVERRUN under
+        // MMIO storms.
+        //
+        // NB: NO try/catch inside HandleException — adding it on .NET 10
+        // breaks the [UnmanagedCallersOnly] contract ("Invalid Program:
+        // attempted to call a UnmanagedCallersOnly method from managed
+        // code"). Peripherals must therefore guarantee no exception escapes
+        // their Read/Write methods. Audit each implementation accordingly.
+        private static Range[]               s_snapshot   = System.Array.Empty<Range>();
+        private static readonly List<Range>  s_ranges     = new();
+        private static readonly object       s_writerLock = new();
         private static IntPtr                s_vehHandle;
 
         private const int  EXCEPTION_CONTINUE_EXECUTION = -1;
@@ -30,7 +44,7 @@ namespace RiscVEmulator.Core
 
         public static void Register(IntPtr hostStart, uint size, IPeripheral owner)
         {
-            lock (s_lock)
+            lock (s_writerLock)
             {
                 EnsureInstalled();
                 ulong start = (ulong)hostStart.ToInt64();
@@ -41,26 +55,29 @@ namespace RiscVEmulator.Core
                     GuestBase = owner.BaseAddress,
                     Owner     = owner,
                 });
+                System.Threading.Volatile.Write(ref s_snapshot, s_ranges.ToArray());
             }
         }
 
         public static void Clear()
         {
-            lock (s_lock) s_ranges.Clear();
+            lock (s_writerLock)
+            {
+                s_ranges.Clear();
+                System.Threading.Volatile.Write(ref s_snapshot, System.Array.Empty<Range>());
+            }
         }
 
         private static void EnsureInstalled()
         {
             if (s_vehHandle != IntPtr.Zero) return;
             // Use a function pointer (delegate*<...>) over &HandleException
-            // rather than Marshal.GetFunctionPointerForDelegate(<UnmanagedFunctionPointer delegate>).
-            // The legacy delegate path generates a reverse-pinvoke stub that
-            // .NET 10 internally tags as UnmanagedCallersOnly — and the JIT
-            // then refuses to invoke methods we transitively reach from inside
-            // that stub (any P/Invoke nested below the VEH callback triggers
-            // "Invalid Program: attempted to call a UnmanagedCallersOnly method
-            // from managed code"). The explicit [UnmanagedCallersOnly] + raw
-            // function pointer avoids the delegate stub entirely.
+            // rather than Marshal.GetFunctionPointerForDelegate. The legacy
+            // delegate path generates a reverse-pinvoke stub that .NET 10
+            // internally tags as UnmanagedCallersOnly — and the JIT then
+            // refuses to invoke methods we transitively reach from inside
+            // that stub. The explicit [UnmanagedCallersOnly] + raw function
+            // pointer avoids the delegate stub entirely.
             delegate* unmanaged[Cdecl]<IntPtr, int> fp = &HandleException;
             s_vehHandle = AddVectoredExceptionHandler(1, (IntPtr)fp);
             if (s_vehHandle == IntPtr.Zero)
@@ -79,39 +96,42 @@ namespace RiscVEmulator.Core
             ulong faultAddr = rec->Info1;
             bool  isWrite   = rec->Info0 == 1;
 
-            Range range;
-            lock (s_lock)
+            // Lock-free snapshot lookup. The Volatile.Read is a one-shot
+            // load; the loop walks an immutable array — no managed lock, no
+            // allocation, nothing the GC suspend protocol can race with.
+            Range[] ranges = System.Threading.Volatile.Read(ref s_snapshot);
+            Range range = default;
+            int   idx   = -1;
+            for (int i = 0; i < ranges.Length; i++)
             {
-                int idx = -1;
-                for (int i = 0; i < s_ranges.Count; i++)
+                if (faultAddr >= ranges[i].HostStart && faultAddr < ranges[i].HostEnd)
                 {
-                    if (faultAddr >= s_ranges[i].HostStart && faultAddr < s_ranges[i].HostEnd)
+                    idx = i;
+                    range = ranges[i];
+                    break;
+                }
+            }
+
+            if (idx < 0)
+            {
+                // Unmapped MMIO — treat as "no device": reads return 0, writes
+                // discarded. Lets the kernel probe address space safely.
+                byte* ctxNoDev = (byte*)ep->ContextRecord;
+                byte* ripNoDev = (byte*)(*(ulong*)(ctxNoDev + 0xF8));
+                if (!Decode(ripNoDev, out var dNoDev)) return EXCEPTION_CONTINUE_SEARCH;
+                if (!isWrite)
+                {
+                    if (dNoDev.SignExtend || dNoDev.ZeroExtendToFull)
+                        WriteGpr(ctxNoDev, dNoDev.RegIndex, 0);
+                    else
                     {
-                        idx = i; break;
+                        ulong prev = ReadGpr(ctxNoDev, dNoDev.RegIndex);
+                        ulong mask = dNoDev.Width == 1 ? 0xFFUL : 0xFFFFUL;
+                        WriteGpr(ctxNoDev, dNoDev.RegIndex, prev & ~mask);
                     }
                 }
-                if (idx < 0)
-                {
-                    // Unmapped MMIO — treat as "no device": reads return 0, writes
-                    // discarded. Lets the kernel probe address space safely.
-                    byte* ctxNoDev = (byte*)ep->ContextRecord;
-                    byte* ripNoDev = (byte*)(*(ulong*)(ctxNoDev + 0xF8));
-                    if (!Decode(ripNoDev, out var dNoDev)) return EXCEPTION_CONTINUE_SEARCH;
-                    if (!isWrite)
-                    {
-                        if (dNoDev.SignExtend || dNoDev.ZeroExtendToFull)
-                            WriteGpr(ctxNoDev, dNoDev.RegIndex, 0);
-                        else
-                        {
-                            ulong prev = ReadGpr(ctxNoDev, dNoDev.RegIndex);
-                            ulong mask = dNoDev.Width == 1 ? 0xFFUL : 0xFFFFUL;
-                            WriteGpr(ctxNoDev, dNoDev.RegIndex, prev & ~mask);
-                        }
-                    }
-                    *(ulong*)(ctxNoDev + 0xF8) = (ulong)(ripNoDev + dNoDev.Length);
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-                range = s_ranges[idx];
+                *(ulong*)(ctxNoDev + 0xF8) = (ulong)(ripNoDev + dNoDev.Length);
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
 
             byte* context = (byte*)ep->ContextRecord;

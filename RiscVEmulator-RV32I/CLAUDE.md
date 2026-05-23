@@ -83,6 +83,28 @@ all `static` functions, `static constexpr` immediate decoders,
 `__builtin_expect` branch hints. The whole CPU state is a single `CPU_State`
 struct; `do_step` and all helpers take it by `CPU_State&` reference.
 
+**JIT** (`Native/rv32i_jit.h`, included by the core): basic-block translator
+to x86-64. Guest registers stay memory-resident in `cpu.regs[]`; the JIT
+loads/writes them through a base register so MMIO loads/stores remain plain
+x86 MOVs the VEH can decode. Each block runs a 3-instruction prologue that
+re-loads three volatile-register base pointers (`R11=&cpu`, `R10=cpu.mem`,
+`R9=&g_mmio_tab`), then a budget gate (`sub [cpu.budget], insns ; js
+exit_stub`) — the gate also doubles as the halt observer because
+`rv32i_set_halted` writes `cpu.budget=-1`. Static-target exits (BRANCH, JAL,
+straight-line cap) are eagerly chained: the exit emits `jmp rel32` directly
+into the next block's chain_entry (skipping its prologue) if that block is
+already translated, otherwise falls back to spilling `cpu.pc` and returning
+to the C dispatcher. Self-loops chain at translate time. JALR remains
+unchained (dynamic target). Memory accesses pick between a fast inline
+`mov reg, [REG_MEM+idx]` and a slow call into `jit_helper_l?` /
+`jit_helper_s?` (in `rv32i_core.cpp`) based on
+`g_mmio_tab[addr>>20]` — VEH-mediated MMIO from RWX-page stores hangs in
+some host processes, so MMIO regions get the helper while plain RAM stays
+inline. Set `RVEMU_JIT=0` to fall back to the pure-interpreter path
+(useful when bisecting a JIT bug). Throughput across bench/primes/matmul/
+crc/softfp (best of 3, geomean ≈11.6× interpreter): bench 21×, primes 4×,
+matmul 12×, crc 15×, softfp 13×.
+
 **Host integration**: `HostMemoryReservation` reserves the entire 4 GB
 guest VA up front with `VirtualAlloc(MEM_RESERVE | PAGE_NOACCESS)` — costs
 only a VAD entry, no commit. Each peripheral commits its slice with

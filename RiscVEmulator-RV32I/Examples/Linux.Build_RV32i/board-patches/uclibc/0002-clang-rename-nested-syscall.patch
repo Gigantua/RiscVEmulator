@@ -1,0 +1,28 @@
+uClibc-ng: rename.c — hoist nested _syscall5() out of rename()
+
+Original code defines renameat2() via the _syscall5 macro *inside* the body
+of rename(), relying on GCC's nested-functions extension. clang has no
+nested-function support, so the macro expansion fails with:
+
+  error: function definition is not allowed here
+
+Lift the _syscall5() macro to file scope (one line up) so the function
+definition lands at translation-unit scope where it belongs. Behaviour is
+identical for both GCC and clang.
+
+Signed-off-by: Examples.Linux.Build_RV32i <rvemu@localhost>
+--- a/libc/sysdeps/linux/common/rename.c
++++ b/libc/sysdeps/linux/common/rename.c
+@@ -19,10 +19,10 @@ int rename(const char *oldpath, const char *newpath)
+ }
+ #elif defined __NR_renameat2
+ # include <fcntl.h>
++_syscall5(int, renameat2, int, olddfd, const char *, oldpath,
++	  int, newdfd, const char *, newpath, int, flags)
+ int rename(const char *oldpath, const char *newpath)
+ {
+-	_syscall5(int, renameat2, int, olddfd, const char *, oldpath,
+-		  int, newdfd, const char *, newpath, int, flags)
+ 	return renameat2(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);
+ }
+ #else

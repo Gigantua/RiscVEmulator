@@ -50,10 +50,11 @@ extern "C" void* memset(void* dst, int c, unsigned long long n) {
 // ════════════════════════════════════════════════════════════════════
 
 struct CPU_State {
-    uint32_t regs[32];
-    uint32_t pc;
-    int      halted;     // run/stop bit driven by the host
-    uint8_t* mem;        // host base; guest access = *(mem + addr)
+    uint32_t regs[32];   // 0
+    uint32_t pc;         // 128
+    int32_t  budget;     // 132 — JIT-only: instructions left in this run
+    int      halted;     // 136 — run/stop bit driven by the host
+    uint8_t* mem;        // 144 — host base; guest access = *(mem + addr)
 };
 
 // What cpu_step hands back. EXC_NONE: instruction retired. EXC_ILLEGAL: the
@@ -255,7 +256,16 @@ static void do_trap(CPU_State& cpu, TrapUnit& trap, uint32_t cause, uint32_t tva
 
     mem_write<uint32_t>(cpu, IE_FLAG, 0u);
     trap.priv = PRIV_M;
-    cpu.pc = mem_read<uint32_t>(cpu, TRAP_VECTOR);
+    // Read TVEC from the canonical offset (+0x004). Legacy May-17 era
+    // paravirt kernels stored TVEC at +0x008 (now the IE_MASK slot);
+    // when buildroot's clang/gcc rebuild path is blocked we still want
+    // those images to boot, so fall back to +0x008 if +0x004 is zero.
+    // A new kernel always writes both 0x004 (TVEC) and 0x008 (IE_MASK,
+    // with a real interrupt mask value), so the fallback is unreachable
+    // once a current kernel is in place.
+    uint32_t tvec = mem_read<uint32_t>(cpu, TRAP_VECTOR);
+    if (tvec == 0) tvec = mem_read<uint32_t>(cpu, IE_MASK);
+    cpu.pc = tvec;
 }
 
 // Trap return (the PV_RESUME_GATEWAY): reload x1..x31 from the handler's
@@ -274,13 +284,49 @@ static void trap_return(CPU_State& cpu, TrapUnit& trap) {
 // Act on a SYSTEM instruction the CPU handed back. The base ISA has only
 // ECALL and EBREAK; every other SYSTEM encoding — MRET, SRET, WFI, all CSR
 // ops — is illegal. Trap return is the PV_RESUME_GATEWAY, not an instruction.
+// Soft CSR storage for legacy paravirt kernels. The native trap-frame
+// page made architectural CSRs redundant, but May-17 era kernel images
+// still emit a handful of `csrrw rd, csr, rs1` instructions in trap
+// entry/exit (e.g. `csrrw tp, mscratch, tp` to swap thread pointer).
+// Trapping those as illegal makes the kernel re-enter its own handler
+// forever. Each CSR address gets a soft slot: writes go in, reads come
+// out. Side effects (interrupts, traps, FP) are deliberately not wired
+// — that's what the trap-frame page is for.
+static uint32_t soft_csr[4096];
+
 static void trap_system(CPU_State& cpu, TrapUnit& trap, uint32_t instr) {
     uint32_t f3 = (instr >> 12) & 0x7;
     uint32_t fn = (instr >> 20) & 0xFFF;
-    if      (f3 == 0 && fn == 0x000) do_trap(cpu, trap,                            // ECALL
-                 trap.priv == PRIV_M ? CAUSE_ECALL_M : CAUSE_ECALL_U, 0);
-    else if (f3 == 0 && fn == 0x001) do_trap(cpu, trap, CAUSE_EBREAK, cpu.pc);     // EBREAK
-    else                             do_trap(cpu, trap, CAUSE_ILLEGAL, instr);    // illegal
+    if (f3 == 0 && fn == 0x000) {
+        do_trap(cpu, trap,                                                          // ECALL
+                trap.priv == PRIV_M ? CAUSE_ECALL_M : CAUSE_ECALL_U, 0);
+        return;
+    }
+    if (f3 == 0 && fn == 0x001) {
+        do_trap(cpu, trap, CAUSE_EBREAK, cpu.pc);                                   // EBREAK
+        return;
+    }
+    // f3 == 0 with any other fn (MRET, SRET, WFI, SFENCE) -> still illegal.
+    if (f3 == 0) {
+        do_trap(cpu, trap, CAUSE_ILLEGAL, instr);
+        return;
+    }
+    // CSR encodings: csrrw/csrrs/csrrc + csrrwi/csrrsi/csrrci.
+    // Read the soft slot into rd, optionally write the new value back.
+    uint32_t rd  = (instr >> 7)  & 0x1F;
+    uint32_t rs1 = (instr >> 15) & 0x1F;
+    uint32_t old = soft_csr[fn];
+    uint32_t src = (f3 & 4) ? rs1 : cpu.regs[rs1];      // immediate variants use rs1 as imm
+    uint32_t op  = f3 & 3;                              // 1=RW, 2=RS, 3=RC
+    bool write = (op == 1) || (rs1 != 0);               // CSRRS/CSRRC with rs1==0 is read-only
+    if (write) {
+        uint32_t nv = (op == 1) ? src
+                    : (op == 2) ? (old |  src)
+                                : (old & ~src);
+        soft_csr[fn] = nv;
+    }
+    if (rd) cpu.regs[rd] = old;
+    cpu.pc += 4;
 }
 
 // Sample the host interrupt pins. If one is enabled and pending, take the
@@ -303,6 +349,38 @@ static bool check_interrupts(CPU_State& cpu, TrapUnit& trap) {
 static CPU_State cpu;
 static TrapUnit  trap;
 
+// ────────────────────────────────────────────────────────────────────
+// JIT store helpers. The JIT emits a `call` into one of these instead of
+// inlining the store, so the actual `mov [base], reg` ends up in this DLL's
+// .text section. That matters because VEH-mediated MMIO dispatch from
+// stores inside our RWX arena hangs in some host processes (Mp4Player /
+// TinyCC / DOOM), while VEH dispatch from stores in DLL .text works.
+// ────────────────────────────────────────────────────────────────────
+extern "C" __declspec(noinline) void jit_helper_sb(uint32_t addr, uint32_t val) {
+    *(volatile uint8_t*)(cpu.mem + addr) = (uint8_t)val;
+}
+extern "C" __declspec(noinline) void jit_helper_sh(uint32_t addr, uint32_t val) {
+    *(volatile uint16_t*)(cpu.mem + addr) = (uint16_t)val;
+}
+extern "C" __declspec(noinline) void jit_helper_sw(uint32_t addr, uint32_t val) {
+    *(volatile uint32_t*)(cpu.mem + addr) = val;
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lb(uint32_t addr) {
+    return (uint32_t)(int32_t)(int8_t)*(volatile uint8_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lh(uint32_t addr) {
+    return (uint32_t)(int32_t)(int16_t)*(volatile uint16_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lw(uint32_t addr) {
+    return *(volatile uint32_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lbu(uint32_t addr) {
+    return *(volatile uint8_t*)(cpu.mem + addr);
+}
+extern "C" __declspec(noinline) uint32_t jit_helper_lhu(uint32_t addr) {
+    return *(volatile uint16_t*)(cpu.mem + addr);
+}
+
 // One emulation step: the trap unit samples interrupts; otherwise the CPU
 // runs one instruction and the trap unit handles anything it raised.
 static void do_step() {
@@ -320,7 +398,13 @@ static void do_step() {
     else if (e.kind == EXC_ILLEGAL) do_trap(cpu, trap, CAUSE_ILLEGAL, e.instr);
 }
 
+// x86-64 JIT — translated-block fast path. Included here so it can see the
+// CPU state, the trap unit and cpu_step(); falls back to the interpreter.
+#include "rv32i_jit.h"
+static bool g_use_jit = false;
+
 extern "C" int rv32i_step_n(int n) {
+    if (g_use_jit) return jit_run(n);
     for (int i = 0; i < n; i++) {
         do_step();
         if (__builtin_expect(cpu.halted, 0)) return -(i + 1);
@@ -334,6 +418,15 @@ extern "C" void rv32i_init(uint8_t* mem, uint32_t entry) {
     cpu.pc    = entry;
     cpu.mem   = mem;
     trap.priv = PRIV_M;
+
+    // JIT on unless RVEMU_JIT=0. A fresh program means a fresh memory base,
+    // so discard any blocks translated for a previous run.
+    char buf[8] = {};
+    unsigned long got = GetEnvironmentVariableA("RVEMU_JIT", buf, sizeof(buf));
+    bool want_jit = !(got == 1 && buf[0] == '0');
+
+    g_use_jit = want_jit && jit_alloc();
+    if (g_use_jit) jit_flush();
 }
 
 extern "C" void rv32i_destroy() { cpu.mem = nullptr; }
@@ -341,7 +434,12 @@ extern "C" void rv32i_destroy() { cpu.mem = nullptr; }
 extern "C" uint32_t rv32i_get_pc()                   { return cpu.pc; }
 extern "C" int      rv32i_is_halted()                { return cpu.halted; }
 extern "C" void     rv32i_set_reg(int i, uint32_t v) { if (i) cpu.regs[i & 31] = v; }
-extern "C" void     rv32i_set_halted(int v)          { cpu.halted = v; }
+extern "C" void     rv32i_set_halted(int v) {
+    cpu.halted = v;
+    // Force the JIT's next per-block budget check (sub/js) to exit to C so
+    // chained execution doesn't keep running after a halt MMIO write.
+    if (v) cpu.budget = -1;
+}
 
 // Host interrupt pins (trap unit) — PLIC drives external, CLINT drives timer.
 extern "C" void rv32i_set_meip(int level) {

@@ -169,7 +169,13 @@ bool Compile(string src, string obj, string[] extraFlags, bool mExt)
     var compileArgs = new List<string>
     {
         "--target=riscv32-unknown-elf", $"-march={march}", "-mabi=ilp32",
-        "-nostdlib", "-nostartfiles", "-O3", "-fno-builtin", "-fsigned-char", "-c",
+        "-nostdlib", "-O3", "-fno-builtin", "-fsigned-char", "-c",
+        "-Wno-unused-command-line-argument",
+        "-Werror=implicit-function-declaration", "-Werror=int-conversion",
+        /* PureDOOM.h is the 1993 id software source amalgamation; it has
+         * dozens of K&R-style declarations and `if (x = y)` patterns.
+         * Not our code, not fixable upstream — silence the noise. */
+        "-Wno-deprecated-non-prototype", "-Wno-parentheses", "-Wno-enum-compare",
     };
     compileArgs.AddRange(extraFlags);
     compileArgs.Add(src);
