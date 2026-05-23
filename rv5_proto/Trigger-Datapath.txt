@@ -1,0 +1,552 @@
+================================================================================
+              TRIGGER-WORD DATAPATH — HARDWARE SKETCH (rv5_proto)
+================================================================================
+
+THESIS
+------
+All the components of the RV32I micro-architecture — implemented in a handful
+of primitive instructions — become a single PARALLEL MOVE MACHINE.  The CPU
+stops being an opcode dispatcher; it becomes a fabric of latches connected by
+fixed wires, and the only thing the program does is pick which wires fire
+each cycle.
+
+PRINCIPLE
+---------
+The whole core, per cycle, is one wide bitfield: the TRIGGER WORD.
+  - Every edge in the graph below owns ONE bit position.
+  - Bit i = 1  ⇒  that edge fires this cycle (sample source latch at the
+    start of the cycle, commit it into the sink latch at the end).
+  - All set bits fire IN PARALLEL: N bits set ⇒ N transfers in one cycle.
+  - There is no opcode and no per-cycle decode.  The bitfield IS the op.
+
+A trigger word is a `move(BitVec<E>)` where E = number of edges (see end of
+file).  uint64 fits only the smallest sub-cores; we keep the move width open
+and report the count.
+
+ROUTING CONSTRAINT
+------------------
+Every port (= vertex) has at most 4 edges INCOMING and at most 4 edges
+OUTGOING (8 wires total touching any port).  This is the hardware budget
+that bounds the crossbar — anything richer must go through staging lanes.
+
+================================================================================
+1.  OPERATIONAL UNITS  (the minimum-ISA from emu/core_5op, expanded to expose
+    AND/XOR/ROTL separately instead of the fused FSX)
+================================================================================
+
+  unit     inputs        output        function
+  ----     ------        ------        --------
+  ADD      ADD_A, ADD_B  ADD_O         O = A + B            (32-bit add)
+  AND      AND_A, AND_B  AND_O         O = A & B
+  XOR      XOR_A, XOR_B  XOR_O         O = A ^ B
+  ROTL     ROTL_A, ROTL_N  ROTL_O      O = rotl(A, N & 31)
+  BNE      BNE_A, BNE_B  BNE_O         O = (A != B) ? 1 : 0  (1-bit guard)
+  LW       LW_ADDR       LW_O          O = mem[ADDR >> 2]    (combinational from latched addr)
+  SW       SW_ADDR, SW_DATA  ─         mem[ADDR >> 2] = DATA (no output)
+
+Each unit input is a 32-bit latch.  Each unit output is a 32-bit value
+that is combinationally a pure function of the input latches (no internal
+state beyond the input latches themselves).
+
+================================================================================
+2.  PORT ENUMERATION  (every vertex in the graph)
+================================================================================
+
+  category            ports                                                  count
+  --------            -----                                                  -----
+  register reads      R0_RD  .. R31_RD                                       32
+  register writes     R0_WR  .. R31_WR                                       32
+  unit inputs         ADD_A, ADD_B,
+                      AND_A, AND_B,
+                      XOR_A, XOR_B,
+                      ROTL_A, ROTL_N,
+                      BNE_A, BNE_B,
+                      LW_ADDR,
+                      SW_ADDR, SW_DATA                                       13
+  unit outputs        ADD_O, AND_O, XOR_O, ROTL_O, BNE_O, LW_O                6
+  control             PC_RD, PC_WR                                            2
+  injectors           IMM_O   (constant from move-word payload)
+                      ZERO_O  (always 0; the "free" source)                   2
+  read-side lanes     LRD0 .. LRD7  (staging buses, source side)              8
+  write-side lanes    LWR0 .. LWR7  (staging buses, sink side)                8
+  trunk lanes         T0, T1, T2, T3  (cross-fabric)                          4
+                                                                            ----
+  TOTAL VERTICES                                                            107
+
+Notes
+  - LRDi is fed by 4 register reads; it then drives up to 4 unit inputs /
+    trunks.  Lanes are the *only* way a register's value reaches a unit.
+  - LWRi accepts up to 4 producers (units / trunks) and drives 4 register
+    writes.  Lanes are the *only* way a unit result reaches a register.
+  - Trunks T0..T3 are the cross-fabric: they relay between read- and
+    write-lanes, and carry IMM/ZERO/PC to far-away units.
+  - Banks are physical groupings of 4 registers:
+        BANK 0 = R0..R3       served by LRD0 / LWR0
+        BANK 1 = R4..R7       served by LRD1 / LWR1
+        ...
+        BANK 7 = R28..R31     served by LRD7 / LWR7
+
+================================================================================
+3.  CONNECTION ENUMERATION
+    Each entry is one edge = one bit in the trigger word.
+    Format:   bit#  src --> dst
+================================================================================
+
+--- 3.1  REGISTER-READ → READ-LANE (32 edges, INTERLEAVED) ---------------------
+    Mapping:   R_r_RD  -->  LRD_{r mod 8}
+    Each lane gets 4 incoming edges, but they come from 4 registers spread
+    8-apart in the file (R_i, R_{i+8}, R_{i+16}, R_{i+24}).  This way ANY
+    8 consecutive registers go to 8 different lanes — same-bank pairs like
+    {R13, R14} can be read into separate shadow regs in ONE cycle.
+
+    bit  0   R0_RD  --> LRD0     bit 16   R16_RD --> LRD0
+    bit  1   R1_RD  --> LRD1     bit 17   R17_RD --> LRD1
+    bit  2   R2_RD  --> LRD2     bit 18   R18_RD --> LRD2
+    bit  3   R3_RD  --> LRD3     bit 19   R19_RD --> LRD3
+    bit  4   R4_RD  --> LRD4     bit 20   R20_RD --> LRD4
+    bit  5   R5_RD  --> LRD5     bit 21   R21_RD --> LRD5
+    bit  6   R6_RD  --> LRD6     bit 22   R22_RD --> LRD6
+    bit  7   R7_RD  --> LRD7     bit 23   R23_RD --> LRD7
+    bit  8   R8_RD  --> LRD0     bit 24   R24_RD --> LRD0
+    bit  9   R9_RD  --> LRD1     bit 25   R25_RD --> LRD1
+    bit 10   R10_RD --> LRD2     bit 26   R26_RD --> LRD2
+    bit 11   R11_RD --> LRD3     bit 27   R27_RD --> LRD3
+    bit 12   R12_RD --> LRD4     bit 28   R28_RD --> LRD4
+    bit 13   R13_RD --> LRD5     bit 29   R29_RD --> LRD5
+    bit 14   R14_RD --> LRD6     bit 30   R30_RD --> LRD6
+    bit 15   R15_RD --> LRD7     bit 31   R31_RD --> LRD7
+
+    The new "conflict pairs" are registers separated by EXACTLY 8
+    ({R0,R8}, {R13,R21}, …) — rare in typical RV32I, so this is a net win.
+
+--- 3.2  WRITE-LANE → REGISTER-WRITE (32 edges, INTERLEAVED) -------------------
+    Mapping:   LWR_{r mod 8}  -->  R_r_WR
+    Mirror of §3.1: LWR_i drives {R_i, R_{i+8}, R_{i+16}, R_{i+24}}.
+
+    bit 32   LWR0 --> R0_WR      bit 48   LWR0 --> R16_WR
+    bit 33   LWR1 --> R1_WR      bit 49   LWR1 --> R17_WR
+    bit 34   LWR2 --> R2_WR      bit 50   LWR2 --> R18_WR
+    ...
+    bit 39   LWR7 --> R7_WR      bit 55   LWR7 --> R23_WR
+    bit 40   LWR0 --> R8_WR      bit 56   LWR0 --> R24_WR
+    ...
+    bit 63   LWR7 --> R31_WR
+
+--- 3.3  READ-LANE → UNIT-INPUT / TRUNK (32 edges) -----------------------------
+    Each LRD_i has 4 fan-out edges.  The pattern below maps each bank's
+    lane to a balanced subset of unit A-inputs, B-inputs, and a trunk, so
+    any operand can be steered to any unit in ≤ 2 cycles via a trunk hop.
+
+    bit 64   LRD0 --> ADD_A
+    bit 65   LRD0 --> AND_A
+    bit 66   LRD0 --> XOR_A
+    bit 67   LRD0 --> T0
+
+    bit 68   LRD1 --> ADD_B
+    bit 69   LRD1 --> AND_B
+    bit 70   LRD1 --> XOR_B
+    bit 71   LRD1 --> T0
+
+    bit 72   LRD2 --> ROTL_A
+    bit 73   LRD2 --> BNE_A
+    bit 74   LRD2 --> LW_ADDR
+    bit 75   LRD2 --> T1
+
+    bit 76   LRD3 --> ROTL_N
+    bit 77   LRD3 --> BNE_B
+    bit 78   LRD3 --> SW_DATA
+    bit 79   LRD3 --> T1
+
+    bit 80   LRD4 --> ADD_A
+    bit 81   LRD4 --> XOR_A
+    bit 82   LRD4 --> SW_ADDR
+    bit 83   LRD4 --> T2
+
+    bit 84   LRD5 --> ADD_B
+    bit 85   LRD5 --> XOR_B
+    bit 86   LRD5 --> BNE_A
+    bit 87   LRD5 --> T2
+
+    bit 88   LRD6 --> AND_A
+    bit 89   LRD6 --> ROTL_A
+    bit 90   LRD6 --> LW_ADDR
+    bit 91   LRD6 --> T3
+
+    bit 92   LRD7 --> AND_B
+    bit 93   LRD7 --> ROTL_N
+    bit 94   LRD7 --> BNE_B
+    bit 95   LRD7 --> T3
+
+--- 3.4  UNIT-OUTPUT → WRITE-LANE / TRUNK (24 edges) ----------------------------
+    Each unit output has 4 fan-out edges (a "result distribution" tree).
+
+    bit 96   ADD_O  --> LWR0
+    bit 97   ADD_O  --> LWR4
+    bit 98   ADD_O  --> PC_WR   (JAL / PC = pc+imm)
+    bit 99   ADD_O  --> T1      (chain into another commutative unit)
+
+    bit100   AND_O  --> LWR2
+    bit101   AND_O  --> LWR3
+    bit102   AND_O  --> LWR5
+    bit103   AND_O  --> LWR6
+
+    bit104   XOR_O  --> LWR0
+    bit105   XOR_O  --> LWR2
+    bit106   XOR_O  --> LWR4
+    bit107   XOR_O  --> T1      (chain into another commutative unit)
+
+    bit108   ROTL_O --> LWR1
+    bit109   ROTL_O --> LWR3
+    bit110   ROTL_O --> LWR5
+    bit111   ROTL_O --> LWR7
+
+    bit112   LW_O   --> LWR0
+    bit113   LW_O   --> LWR2
+    bit114   LW_O   --> LWR4
+    bit115   LW_O   --> LWR6
+
+    bit116   BNE_O  --> PC_WR   (single-target: branch guard goes only to PC)
+
+--- 3.5  TRUNK ROUTING — READ-SIDE RELAY (16 edges) -----------------------------
+    Trunks are now dedicated read-side relays: each pair of lanes shares a
+    trunk that fills in the unit-input destinations the pair can't reach
+    directly.  Every register reaches every functional unit in ≤ 1 hop.
+
+    Pair (LRD0,LRD1) direct: ADD/AND/XOR (both sides).  Missing: ROTL, BNE, LW, SW.
+    bit120   T0 --> ROTL_A     (covers ROTL via A; compiler swaps if needed)
+    bit121   T0 --> BNE_A
+    bit122   T0 --> LW_ADDR
+    bit123   T0 --> SW_ADDR
+
+    Pair (LRD2,LRD3) direct: ROTL, BNE, LW, SW_DATA.  Missing: ADD/AND/XOR, SW_ADDR.
+    bit124   T1 --> ADD_A
+    bit125   T1 --> AND_A
+    bit126   T1 --> XOR_A
+    bit127   T1 --> SW_ADDR
+
+    Pair (LRD4,LRD5) direct: ADD/XOR (both), SW_ADDR, BNE_A.  Missing: AND, ROTL, LW, SW_DATA.
+    bit128   T2 --> AND_A
+    bit129   T2 --> ROTL_A
+    bit130   T2 --> LW_ADDR
+    bit131   T2 --> SW_DATA
+
+    Pair (LRD6,LRD7) direct: AND, ROTL, LW, BNE_B.  Missing: ADD, XOR, SW.
+    bit132   T3 --> ADD_B
+    bit133   T3 --> XOR_A
+    bit134   T3 --> SW_ADDR
+    bit135   T3 --> SW_DATA
+
+    NOTE on the trade-off: trunks no longer fan out to LWRs, so a unit result
+    can no longer "teleport" across to a far-away LWR via a trunk.  A unit
+    output reaches only the 3-4 LWRs it's directly wired to (§3.4) — the
+    compiler picks rd to match.  We chose this trade because the *need* for
+    cross-fabric routing is far more acute on the read side (8 lanes ×
+    7 functional units to reach) than on the write side (~3-4 reachable LWRs
+    per unit is usually enough since LWRs interleave across the register file).
+
+--- 3.6  INJECTORS & PC (12 edges) ----------------------------------------------
+    IMM, ZERO, and PC fan out to the unit inputs that have room.  Note that
+    LW_ADDR is now full at 4 lane/trunk inputs (LRD2, LRD6, T0, T2), so
+    IMM_O can NOT drive LW_ADDR directly — load offsets must be precomputed
+    via ADD.  Same for SW_ADDR (LRD4, T0, T1, T3 = 4).
+
+    bit136   IMM_O  --> ADD_B
+    bit137   IMM_O  --> XOR_B
+    bit138   IMM_O  --> ROTL_N
+    bit139   IMM_O  --> BNE_B     (compare against literal)
+
+    bit140   ZERO_O --> AND_B     (clear-via-AND)
+    bit141   ZERO_O --> BNE_B     (test-against-zero)
+    bit142   ZERO_O --> SW_DATA   (store zero)
+    bit143   ZERO_O --> LWR0      (zero a register directly)
+
+    bit144   PC_RD  --> ADD_A     (AUIPC, JAL link)
+    bit145   PC_RD  --> BNE_A     (compare with PC, e.g., for tail-call detection)
+    bit146   PC_RD  --> LWR1      (link register stash)
+    bit147   PC_RD  --> LWR4      (alt link register stash)
+
+    bit148   T0     --> PC_WR     (computed branch/jump target arrives here)
+    bit149   T1     --> PC_WR
+    bit150   ADD_O  --> PC_WR     (direct path for PC += imm)
+    bit151   ROTL_O --> PC_WR     (used for jalr alignment via ROTL)
+
+================================================================================
+4.  THE TWO BIT-PLANES
+================================================================================
+
+The architecture uses TWO independent bit-vectors.  Both are computed at
+COMPILE TIME for each operation; the CPU only ever sees plane 2.
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  PLANE 1  —  MACRO-OP FOOTPRINT  (two 73-bit masks per op)           │
+  │                                                                      │
+  │  W-mask:  latches the op WRITES — LRD/LWR/T/unit-port/PC/IMM and     │
+  │           the architectural register it produces.                    │
+  │  R-mask:  architectural registers the op READS.                      │
+  │           (Intermediate latches don't have R-bits — only one op can  │
+  │           own a shadow reg per cycle, so 'write claim' suffices.)    │
+  │                                                                      │
+  │  Use:     FUSION LEGALITY. Three ANDs, one OR per fused-pair:        │
+  │           conflict(A, B) = (A.W & B.W)   // WAW                      │
+  │                          | (A.W & B.R)   // WAR                      │
+  │                          | (A.R & B.W)   // RAW                      │
+  │           fusable        = conflict == 0                             │
+  │                                                                      │
+  │  Critically: R∩R is NEVER tested, so multiple ops reading the same   │
+  │  architectural register fuse freely — the register file's read side  │
+  │  becomes naturally multi-tenant.  N ops all reading R1 collapse into │
+  │  ONE cycle of wire-fires, broadcasting R1 into up to N distinct      │
+  │  shadow/unit-input latches in parallel.                              │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  PLANE 2  —  PER-CYCLE TRIGGER WORD                                  │
+  │  Width:    225 bits.  Layout per writable latch:                     │
+  │              1 enable bit  +  N writer-select bits  (N = fan-in ≤ 4) │
+  │            Plus 6 FIRE bits (one per functional unit).               │
+  │  Meaning:  bit set ⇔ this wire/enable fires this cycle.              │
+  │  Use:      EXECUTION.  The CPU latches whatever bits say.            │
+  │            No legality check at runtime — legality was proven by     │
+  │            plane 1 at compile time.                                  │
+  └──────────────────────────────────────────────────────────────────────┘
+
+An operation is the pair ( footprint, [per_cycle_TWs] ).
+
+  4.1  PLANE 1 — FOOTPRINT BIT ASSIGNMENT
+  ----------------------------------------
+  Bits indexed 0..72.  One bit per storage cell.
+
+    bits  0.. 31    R0  .. R31                (the 32 architectural regs)
+    bits 32.. 39    LRD0 .. LRD7              (read-side shadow regs)
+    bits 40.. 47    LWR0 .. LWR7              (write-side shadow regs)
+    bit  48         ADD_A          bit  49    ADD_B
+    bit  50         AND_A          bit  51    AND_B
+    bit  52         XOR_A          bit  53    XOR_B
+    bit  54         ROTL_A         bit  55    ROTL_N
+    bit  56         BNE_A          bit  57    BNE_B
+    bit  58         LW_ADDR
+    bit  59         SW_ADDR        bit  60    SW_DATA
+    bit  61         ADD_O          bit  62    AND_O
+    bit  63         XOR_O          bit  64    ROTL_O
+    bit  65         BNE_O          bit  66    LW_O
+    bit  67         PC                                       (architectural PC)
+    bits 68..71     T0 .. T3                  (cross-fabric trunks)
+    bit  72         IMM                       (per-cycle constant register)
+
+  ZERO is omitted — it's a constant wire, never written, no claim needed.
+  SW has no output latch, so no SW_O bit.
+
+  Footprint fits in a 128-bit value (uint128, or two uint64s) with 55 bits
+  spare for future expansion.
+
+  4.2  PLANE 2 — PER-CYCLE TRIGGER WORD
+  --------------------------------------
+  Per-latch field width = 1 (enable) + (# writers, capped at 4):
+
+      destination       writers   bits
+      ------------      -------   ----
+      R0..R31_WR         1 each    32 ×  2 =   64
+      LRD0..LRD7         4 each     8 ×  5 =   40
+      LWR0..LWR7         4 each     8 ×  5 =   40
+      ADD_A, XOR_A       4 each     2 ×  5 =   10
+      ADD_B, XOR_B,
+        AND_B, ROTL_N    3 each     4 ×  4 =   16
+      AND_A, ROTL_A,
+        BNE_A, BNE_B,
+        LW_ADDR          3 each     5 ×  4 =   20
+      SW_ADDR, SW_DATA   1 each     2 ×  2 =    4
+      T0..T3             4 each     4 ×  5 =   20
+      PC_WR              4          1 ×  5 =    5
+      FIRE_* (per unit)  —          6 ×  1 =    6
+                                            -----
+      TOTAL TW WIDTH                          225 bits
+
+  The trigger word fits in 4 × uint64 = 256-bit register with 31 spare bits.
+
+  4.3  HOW A FIELD ENCODES "WHICH WRITER"
+  ----------------------------------------
+  For a latch L with k writers, its field is:
+
+      [ enable_bit ][ writer_sel_bit_0 ][ writer_sel_bit_1 ] ... [ ..._{k-1} ]
+
+  Hardware fire rule (one trivial AND-gate per latch):
+
+      L.commit_this_cycle  ⇔  L.enable  ∧  exactly_one(L.writer_sel_bits)
+
+  Compiler invariant: when emitting a cycle that writes L, set L.enable AND
+  exactly one of L.writer_sel_bits. The footprint of that op includes L
+  in plane 1.
+
+================================================================================
+5.  FAN VERIFICATION  (per-port edge counts ≤ 4 in, ≤ 4 out)
+================================================================================
+
+  port-class            fan-in     fan-out
+  ----------            ------     -------
+  R*_RD                 0          1 (one bit lands it on a lane)
+  R*_WR                 1          0
+  LRD0..LRD7            4 (regs)   4 (units/trunks)
+  LWR0..LWR7            4 (producers: units/trunks)   4 (regs)
+  T0..T3                ≤4 (units/lanes/PC/IMM)        4 (write-lanes/PC)
+  ADD_A,ADD_B           ≤4 (LRD*, IMM, ZERO, PC)       —
+  AND_A..ROTL_N         ≤4                              —
+  BNE_A,BNE_B           ≤4                              —
+  LW_ADDR,SW_*          ≤4                              —
+  ADD_O,AND_O,XOR_O,
+  ROTL_O                —                              4
+  LW_O                  —                              4
+  BNE_O                 —                              4
+  PC_RD                 0                              4
+  PC_WR                 ≤4                             0
+  IMM_O, ZERO_O         0                              4
+
+  Constraint satisfied throughout.
+
+================================================================================
+6.  COMPILER VIEW
+================================================================================
+
+A "move plan" for one RV32I instruction is a sequence of trigger words.
+Example — encoded `xor x10, x3, x7` (rd=10, rs1=3, rs2=7) in 3 cycles:
+
+  cycle 1:    R3_RD→LRD0       (bit 3)
+              R7_RD→LRD1       (bit 7)
+  cycle 2:    LRD0→XOR_A       (bit 66)
+              LRD1→XOR_B       (bit 70)
+  cycle 3:    XOR_O→LWR2       (bit 104)
+              LWR2→R10_WR      (bit 40)        # 32 + (10 - 8) = 42 ... see §3.2 mapping
+
+The compiler emits one 225-bit trigger word per cycle, plus the 73-bit
+footprint that travels with the operation.  Hardware OR-merges trigger
+words for fused cycles; it does not synthesize bits.
+
+================================================================================
+7.  VISUALIZATION
+================================================================================
+
+See `Trigger-Datapath.html` next to this file — the blueprint visualizer.
+It also exposes the footprint bit-index in every node's tooltip and includes
+a runtime-fusion sandbox (§8 below).
+
+================================================================================
+8.  FUSION  — RUNTIME µOP MERGING
+================================================================================
+
+µop fusion happens AT RUNTIME, in a dedicated front-end pipeline stage that
+sits between instruction decode and the latch-execution back-end.  This is
+the entire reason for the two-plane design: the legality check is one
+128-bit AND, fast enough to live in a single hardware pipeline stage with
+the OR-merge happening in the same cycle.
+
+  8.1  PIPELINE STAGE
+  --------------------
+
+    ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐
+    │ DECODE     │──▶ │ FUSE       │──▶ │ EXECUTE    │──▶ │ COMMIT     │
+    │            │    │ (this §)   │    │            │    │            │
+    └────────────┘    └────────────┘    └────────────┘    └────────────┘
+       emits 1..N        merges ops      raises wires      regs/mem
+       ops/cycle into    while AND==0,   per TW; one        latch in.
+       a small FIFO.     stops at first   cycle = one TW.
+                        conflict.
+
+  8.2  STATE
+  ----------
+  Each op in the FIFO is a struct:
+
+      struct Op {
+          uint128_t footprint;     // plane 1, 73 bits used
+          TW        cycles[<= MAX_CYC];
+          uint8_t   num_cycles;
+      };
+
+  The fusion stage keeps a single "current merged op" register:
+
+      struct Op merged;
+
+  8.3  LEGALITY CHECK  — THREE ANDs, ONE OR
+  ------------------------------------------
+  When considering whether to fold the next FIFO op into `merged`:
+
+      bool can_fuse =
+            ( (merged.W & next.W)        // WAW: both write same latch
+            | (merged.W & next.R)        // WAR: A writes a reg B reads
+            | (merged.R & next.W)        // RAW: B writes a reg A reads
+            ) == 0 ;
+
+  Three ANDs and two ORs. No tables, no scoreboard, no liveness pass.
+  The masks already encode every latch the op touches across its lifetime,
+  so cross-cycle "still-in-use" conflicts are caught by the same check.
+
+  Crucially, merged.R & next.R is NEVER tested.  Two ops both reading
+  R1 fuse without conflict, broadcasting R1 to both consumers in one
+  cycle of wire-fires.  This is the whole reason for the two-mask split.
+
+  8.4  MERGE
+  ----------
+  On `can_fuse`:
+
+      merged.W  |=  next.W;
+      merged.R  |=  next.R;
+      // OR the cycle streams aligned at cycle 0:
+      for (k = 0; k < max(merged.num_cycles, next.num_cycles); k++)
+          merged.cycles[k]  =  tw_or( merged.cycles[k], next.cycles[k] );
+      merged.num_cycles  =  max(merged.num_cycles, next.num_cycles);
+
+  Pop the FIFO. Try the new head against `merged` again.  Keep fusing
+  until either the FIFO empties or the next op conflicts.
+
+  8.5  ISSUE
+  ----------
+  When the fusion stage either finds a conflict OR fills its TW budget,
+  it issues `merged` to the EXECUTE stage one TW at a time and starts
+  a new merge with the conflicting op.
+
+  8.6  WHY IT WORKS WITHOUT A SCOREBOARD
+  --------------------------------------
+  Consider FIRE_ROT firing twice with no consume in between.  Both ops
+  have ROTL_O in their footprint (their lifetime touches it).  AND ≠ 0
+  on the second op ⇒ fusion rejected ⇒ the second op is issued AFTER
+  the first completes.  By then any move ROTL_O → consumer has shipped
+  and the scheduler is free.
+
+  Same logic catches WAW (two writers of L), WAR/RAW within an op (the
+  per-op TW emitter already obeys the disjoint-writers invariant), and
+  unit busy-while-O-live.  All three reduce to "their footprints overlap
+  on L's bit, AND ≠ 0".
+
+  8.7  CODE
+  ---------
+
+      typedef struct { uint128_t W, R; } Mask;
+
+      static inline bool no_hazard(Mask a, Mask b) {
+          return ( (a.W & b.W) | (a.W & b.R) | (a.R & b.W) ) == 0;
+      }
+
+      // Called once per pending op in the FIFO. Returns whether the
+      // merge succeeded (false ⇒ stall and issue the current merged op).
+      bool try_fuse(Op* merged, const Op* next) {
+          if (!no_hazard(merged->mask, next->mask)) return false;
+          merged->mask.W |= next->mask.W;
+          merged->mask.R |= next->mask.R;
+          uint8_t nc = MAX(merged->num_cycles, next->num_cycles);
+          for (uint8_t k = 0; k < nc; k++) {
+              TW a = (k < merged->num_cycles) ? merged->cycles[k] : TW_ZERO;
+              TW b = (k < next  ->num_cycles) ? next  ->cycles[k] : TW_ZERO;
+              merged->cycles[k] = tw_or(a, b);
+          }
+          merged->num_cycles = nc;
+          return true;
+      }
+
+  In hardware: three 128-bit AND trees (depth ≤ 7) feeding one OR, plus
+  one 256-bit OR per cycle slot, one MUX per cycle slot.  All combinational.
+  Fits in one stage.
+
+================================================================================
+7.  VISUALIZATION
+================================================================================
+
+See `Trigger-Datapath.html` next to this file — opens any browser and
+renders the blueprint with 90° wire routing, lane buses, and bit labels.

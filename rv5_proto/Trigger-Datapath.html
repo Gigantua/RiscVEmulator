@@ -1,0 +1,791 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Trigger-Datapath Blueprint</title>
+<style>
+  html, body { margin: 0; background: #0f1419; color: #d8e1e8; font-family: ui-monospace, Consolas, monospace; }
+  header { padding: 12px 18px; border-bottom: 1px solid #1f2a33; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 500; }
+  header .meta { font-size: 12px; color: #6b7a86; margin-top: 4px; }
+  .controls { padding: 8px 18px; font-size: 12px; color: #97a4ae; border-bottom: 1px solid #1f2a33; }
+  .controls label { margin-right: 14px; cursor: pointer; user-select: none; }
+  .controls input { vertical-align: middle; margin-right: 4px; }
+  .controls kbd { background:#1c2730; border:1px solid #2c3a45; border-radius:3px; padding:0 4px; font-size:10px; }
+  #stage { display: block; width: 100vw; height: calc(100vh - 96px); background: #0b0f12; cursor: grab; }
+  #stage.panning { cursor: grabbing; }
+
+  .band-rd      { fill: #112018; stroke: #1d3328; }
+  .band-wr      { fill: #1a1820; stroke: #2d2638; }
+  .band-trunk   { fill: #1f1410; stroke: #3a221a; }
+  .band-label   { fill: #5d8a72; font-size: 13px; font-weight: 600; letter-spacing: 1.5px; }
+  .band-label-wr{ fill: #8a7da0; }
+  .band-label-tr{ fill: #b07a5a; }
+  .band-sub     { fill: #5a6b76; font-size: 10px; letter-spacing: 0.5px; }
+
+  .node { stroke-width: 1; }
+  .node-reg     { fill: #1b2730; stroke: #2c3a45; }
+  .node-lane    { fill: #15281e; stroke: #2f6a4d; }
+  .node-trunk   { fill: #2b1f1a; stroke: #8a3f2a; }
+  .node-unitbox { fill: #131c2e; stroke: #2d4a82; }
+  .node-uport   { fill: #0e1726; stroke: #2d4a82; }
+  .node-ctl     { fill: #2a1f2d; stroke: #6a3a78; }
+
+  .lbl         { fill: #c7d2db; font-size: 10px; font-family: ui-monospace, Consolas, monospace; pointer-events: none; }
+  .lbl-sub     { fill: #6b7a86; font-size: 9px; pointer-events: none; }
+  .lbl-unit    { fill: #93b3ff; font-size: 13px; font-weight: 700; pointer-events: none; letter-spacing: 1px; }
+  .lbl-fire    { fill: #d4a32a; font-size: 9px; pointer-events: none; }
+
+  .edge        { fill: none; stroke-width: 1; opacity: 0.55; }
+  .edge:hover  { stroke: #ffd54a !important; stroke-width: 2 !important; opacity: 1 !important; }
+  .edge.hi     { stroke: #ffd54a !important; stroke-width: 1.6 !important; opacity: 1 !important; }
+  .edge.in-hi  { stroke: #4dd4ff !important; stroke-width: 1.8 !important; opacity: 1 !important; }
+  .edge.out-hi { stroke: #ff7aa0 !important; stroke-width: 1.8 !important; opacity: 1 !important; }
+  .edge-reg    { stroke: #345566; }
+  .edge-lane   { stroke: #2e7a5a; }
+  .edge-unit   { stroke: #3a5fa8; }
+  .edge-trunk  { stroke: #a05a3a; }
+  .edge-ctl    { stroke: #7a4a8a; }
+  .edge-fire   { stroke: #d4a32a; stroke-dasharray: 4 2; opacity: 0.9; }
+
+  .node-hi rect { stroke: #ffd54a; stroke-width: 2; }
+  .node-g.fp-a-w     rect { stroke: #4dd4ff; stroke-width: 2.5; }
+  .node-g.fp-a-r     rect { stroke: #4dd4ff; stroke-width: 2.5; stroke-dasharray: 4 2; }
+  .node-g.fp-b-w     rect { stroke: #ff7aa0; stroke-width: 2.5; }
+  .node-g.fp-b-r     rect { stroke: #ff7aa0; stroke-width: 2.5; stroke-dasharray: 4 2; }
+  .node-g.fp-waw     rect { stroke: #ff3a4a; stroke-width: 3.5; fill: #3a1a1a; }
+  .node-g.fp-hazard  rect { stroke: #ffa83a; stroke-width: 3.5; fill: #3a2a18; }
+  .node-g.fp-rr      rect { stroke: #7a8a93; stroke-width: 2; fill: #1f2730; }
+
+  #tooltip {
+    position: fixed; pointer-events: none; padding: 5px 9px;
+    background: #1c2730; border: 1px solid #2c3a45; border-radius: 3px;
+    font-size: 11px; color: #d8e1e8; display: none; white-space: pre; z-index: 10;
+  }
+</style>
+
+<header>
+  <h1>Trigger-Datapath Blueprint <span style="color:#6b7a86">— rv5_proto / core_5op expanded</span></h1>
+  <div class="meta" id="meta"></div>
+</header>
+<div class="controls">
+  <label><input type="checkbox" id="t-reg"   checked> reg ↔ shadow</label>
+  <label><input type="checkbox" id="t-lane"  checked> shadow → unit</label>
+  <label><input type="checkbox" id="t-unit"  checked> unit → shadow</label>
+  <label><input type="checkbox" id="t-trunk" checked> trunk</label>
+  <label><input type="checkbox" id="t-ctl"   checked> IMM/ZERO/PC</label>
+  <label><input type="checkbox" id="t-fire"  checked> FIRE</label>
+  &nbsp;&nbsp;
+  Hover node = light up its edges. Hover edge = bit#. <b>Pan</b>: drag · <b>Zoom</b>: wheel · <b>Reset</b>: <kbd>0</kbd> / dbl.
+</div>
+
+<div id="fusebar" style="padding:8px 18px;font-size:12px;color:#97a4ae;border-bottom:1px solid #1f2a33;display:flex;gap:14px;flex-wrap:wrap;align-items:center;">
+  <b style="color:#d8e1e8">FUSION SANDBOX:</b>
+  <select id="opA" style="background:#1c2730;color:#d8e1e8;border:1px solid #2c3a45;padding:2px 6px;"></select>
+  <span style="color:#5d8a72">&amp;</span>
+  <select id="opB" style="background:#1c2730;color:#d8e1e8;border:1px solid #2c3a45;padding:2px 6px;"></select>
+  <button id="fuseBtn" style="background:#1c3a2a;color:#a8e0bf;border:1px solid #2f6a4d;padding:3px 12px;cursor:pointer;font-family:inherit">test fuse</button>
+  <span style="margin-left:18px;color:#6b7a86">
+    <span style="color:#4dd4ff">━━ A.W</span> &nbsp;
+    <span style="color:#4dd4ff">┄┄ A.R</span> &nbsp;
+    <span style="color:#ff7aa0">━━ B.W</span> &nbsp;
+    <span style="color:#ff7aa0">┄┄ B.R</span> &nbsp;
+    <span style="color:#ff3a4a">▮ WAW</span> &nbsp;
+    <span style="color:#ffa83a">▮ RAW/WAR</span> &nbsp;
+    <span style="color:#7a8a93">▮ shared R (safe)</span>
+  </span>
+  <span id="fuseResult" style="margin-left:auto"></span>
+</div>
+
+<svg id="stage"></svg>
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+
+// ============================================================================
+// LAYOUT GEOMETRY
+// ============================================================================
+const W = 2600, H = 1600;
+
+// Columns (x-centers). 7 main columns + a vertical trunk band at the bottom.
+const COL_REG_RD    = 100;
+const COL_SHADOW_RD = 320;
+const COL_UNIT_IN   = 600;
+const COL_UNIT_BODY = 860;
+const COL_UNIT_OUT  = 1120;
+const COL_SHADOW_WR = 1400;
+const COL_REG_WR    = 1620;
+
+const ROWH = 22;
+const TOP  = 130;        // y of first reg row
+
+// Trunk band sits below all units.
+const TRUNK_Y = TOP + 38 * ROWH;
+
+// ============================================================================
+// NODES
+// ============================================================================
+// Each node: { id, x, y, w, h, type, label, sub }
+const nodes = {};
+function N(id, x, y, type, label, sub) {
+  let w, h;
+  if      (type === "reg")     { w = 70;  h = 18; }
+  else if (type === "lane")    { w = 92;  h = 20; }
+  else if (type === "uport")   { w = 92;  h = 20; }
+  else if (type === "unitbox") { w = 110; h = 60; }
+  else if (type === "trunk")   { w = 80;  h = 24; }
+  else if (type === "ctl")     { w = 80;  h = 20; }
+  nodes[id] = { id, x, y, w, h, type, label, sub: sub || "" };
+}
+
+// --- 32 registers, INTERLEAVED layout --------------------------------------
+// Registers are positioned vertically grouped by their target lane:
+//   lane `i` (LRDi/LWRi) hosts {R_i, R_{i+8}, R_{i+16}, R_{i+24}}.
+// This removes the "same-bank-of-4" read penalty — any 8 consecutive
+// registers now hit 8 different lanes and can be read in parallel.
+for (let lane = 0; lane < 8; lane++) {
+  for (let i = 0; i < 4; i++) {
+    const r = lane + i * 8;     // R_lane, R_{lane+8}, R_{lane+16}, R_{lane+24}
+    const y = TOP + (lane * 5 + i) * ROWH;
+    N(`R${r}_RD`, COL_REG_RD, y, "reg", `R${r}`, "RD");
+    N(`R${r}_WR`, COL_REG_WR, y, "reg", `R${r}`, "WR");
+  }
+}
+
+// --- shadow-register lanes (1 per bank, centered on its 4 regs) -------------
+for (let b = 0; b < 8; b++) {
+  const y = TOP + (b * 5 + 1.5) * ROWH;
+  N(`LRD${b}`, COL_SHADOW_RD, y, "lane", `LRD${b}`, "shadow");
+  N(`LWR${b}`, COL_SHADOW_WR, y, "lane", `LWR${b}`, "shadow");
+}
+
+// --- 7 functional units, each with input ports, body, output port -----------
+const units = [
+  { name: "ADD",  ins: ["ADD_A",  "ADD_B"],   out: "ADD_O"  },
+  { name: "AND",  ins: ["AND_A",  "AND_B"],   out: "AND_O"  },
+  { name: "XOR",  ins: ["XOR_A",  "XOR_B"],   out: "XOR_O"  },
+  { name: "ROTL", ins: ["ROTL_A", "ROTL_N"],  out: "ROTL_O" },
+  { name: "BNE",  ins: ["BNE_A",  "BNE_B"],   out: "BNE_O"  },
+  { name: "LW",   ins: ["LW_ADDR"],            out: "LW_O"   },
+  { name: "SW",   ins: ["SW_ADDR", "SW_DATA"], out: null     },
+];
+const UNIT_PITCH_Y = 110;
+const UNIT_Y0 = TOP + 4 * ROWH;
+units.forEach((u, ui) => {
+  const yc = UNIT_Y0 + ui * UNIT_PITCH_Y;
+  // unit body box
+  N(`UB_${u.name}`, COL_UNIT_BODY, yc, "unitbox", u.name);
+  // inputs: stacked at left of body
+  u.ins.forEach((p, i) => {
+    const offs = (i - (u.ins.length - 1) / 2) * 24;
+    N(p, COL_UNIT_IN, yc + offs, "uport", p);
+  });
+  // output: at right of body
+  if (u.out) N(u.out, COL_UNIT_OUT, yc, "uport", u.out);
+});
+
+// --- trunks along the bottom band -------------------------------------------
+// T0..T3 are READ-SIDE relays (lane → unit-input). See §3.5 (read).
+// T4..T5 are WRITE-SIDE relays (unit-output → LWR). See §3.5 (write).
+// Required because the user-facing RV32I decoder picks rd freely; the
+// micro-ISA expansion under it has to be able to land any unit's result
+// in any LWR without compiler-side hints.
+for (let t = 0; t < 4; t++) {
+  N(`T${t}`, COL_UNIT_IN + t * 200, TRUNK_Y, "trunk", `T${t}`, "read");
+}
+for (let t = 4; t < 6; t++) {
+  N(`T${t}`, COL_UNIT_OUT + (t - 4) * 220, TRUNK_Y + 40, "trunk", `T${t}`, "write");
+}
+
+// --- control / injectors (top-left corner) ----------------------------------
+N("PC_RD",  COL_REG_RD, TOP - 100, "ctl", "PC", "RD");
+N("PC_WR",  COL_REG_WR, TOP - 100, "ctl", "PC", "WR");
+N("IMM_O",  COL_REG_RD, TOP - 70,  "ctl", "IMM", "const");
+N("ZERO_O", COL_REG_RD, TOP - 40,  "ctl", "ZERO", "const");
+
+// ============================================================================
+// EDGES
+// ============================================================================
+const edges = [];
+function E(src, dst, kind) { edges.push({ bit: edges.length, src, dst, kind }); }
+
+// 3.1  R*_RD -> LRD*
+for (let b = 0; b < 8; b++)
+  for (let k = 0; k < 4; k++)
+    E(`R${b*4+k}_RD`, `LRD${b}`, "reg");
+
+// 3.2  LWR* -> R*_WR
+for (let b = 0; b < 8; b++)
+  for (let k = 0; k < 4; k++)
+    E(`LWR${b}`, `R${b*4+k}_WR`, "reg");
+
+// 3.3  LRD* -> unit inputs / trunks  (each lane has 4 out)
+const laneOut = [
+  ["ADD_A","AND_A","XOR_A","T0"],     // LRD0
+  ["ADD_B","AND_B","XOR_B","T0"],     // LRD1
+  ["ROTL_A","BNE_A","LW_ADDR","T1"],  // LRD2
+  ["ROTL_N","BNE_B","SW_DATA","T1"],  // LRD3
+  ["ADD_A","XOR_A","SW_ADDR","T2"],   // LRD4
+  ["ADD_B","XOR_B","BNE_A","T2"],     // LRD5
+  ["AND_A","ROTL_A","LW_ADDR","T3"],  // LRD6
+  ["AND_B","ROTL_N","BNE_B","T3"],    // LRD7
+];
+laneOut.forEach((d, i) => d.forEach(p => E(`LRD${i}`, p, "lane")));
+
+// 3.4  unit outputs -> LWR* / PC_WR / write-trunk   (each unit-out has 4 out)
+// Each unit reaches 1-2 LWRs directly and all remaining LWRs via T4 (odd)
+// or T5 (even). T1 chaining (read-side) replaced by write-side relay.
+const unitOut = {
+  "ADD_O":  ["LWR0", "PC_WR", "T4", "T5"],    // direct LWR0; T4→odds, T5→evens, PC for JAL
+  "AND_O":  ["LWR3", "LWR6", "T4", "T5"],     // direct LWR3, LWR6; T4 + T5 fill the rest
+  "XOR_O":  ["LWR0", "LWR4", "T4", "T5"],     // direct LWR0, LWR4; T4 + T5 fill the rest
+  "ROTL_O": ["LWR1", "LWR3", "LWR7", "T5"],   // direct odds (LWR5 reached via T4 from other units only)
+  "LW_O":   ["LWR0", "LWR2", "LWR4", "T4"],   // direct evens (drop LWR6); T4 for odds
+  // BNE_O is the branch GUARD — a 1-bit signal. Single-target: PC_WR only.
+  "BNE_O":  ["PC_WR"],
+};
+Object.entries(unitOut).forEach(([s, d]) => d.forEach(t => E(s, t, "unit")));
+
+// 3.5a  READ-SIDE trunks (T0..T3) — lane → unit-input relay.
+const trunkOutRead = {
+  "T0": ["ROTL_A","BNE_A","LW_ADDR","SW_ADDR"],
+  "T1": ["ADD_A","AND_A","XOR_A","SW_ADDR"],
+  "T2": ["AND_A","ROTL_A","LW_ADDR","SW_DATA"],
+  "T3": ["ADD_B","XOR_A","SW_ADDR","SW_DATA"],
+};
+Object.entries(trunkOutRead).forEach(([s, d]) => d.forEach(t => E(s, t, "trunk")));
+
+// 3.5b  WRITE-SIDE trunks (T4, T5) — unit-output → LWR relay.
+// T4 reaches all 4 odd LWRs; T5 reaches all 4 even LWRs.
+// Combined with each unit's direct LWR fan-out, every unit reaches every
+// LWR in ≤ 1 hop (except ROTL → LWR5, which needs a 2-hop relay handled
+// by the micro-ISA layer — rare for SLL/SRL/SRA destinations).
+const trunkOutWrite = {
+  "T4": ["LWR1","LWR3","LWR5","LWR7"],   // odd LWRs
+  "T5": ["LWR0","LWR2","LWR4","LWR6"],   // even LWRs
+};
+Object.entries(trunkOutWrite).forEach(([s, d]) => d.forEach(t => E(s, t, "trunk")));
+
+// 3.6  IMM / ZERO / PC_RD  (each injector has up to 4 out)
+// LW_ADDR is now FULL at 4 in (LRD2, LRD6, T0, T2) — no room for IMM_O.
+// Consequence: load offsets must be precomputed via ADD (lw rd, 0(rs1+imm)
+// becomes one ADD then one LW). Acceptable cost for full unit coverage.
+[["IMM_O","ADD_B"],  ["IMM_O","XOR_B"],  ["IMM_O","ROTL_N"], ["IMM_O","BNE_B"] ].forEach(([s,d])=>E(s,d,"ctl"));
+// ZERO_O → LWR0 dropped because LWR0 is now full from T5 (write-side relay).
+// To zero a register: use ADD with both inputs from R0 (which is hardwired 0).
+[["ZERO_O","AND_B"], ["ZERO_O","BNE_B"], ["ZERO_O","SW_DATA"]].forEach(([s,d])=>E(s,d,"ctl"));
+[["PC_RD","ADD_A"],  ["PC_RD","BNE_A"],  ["PC_RD","LWR1"],   ["PC_RD","LWR4"]  ].forEach(([s,d])=>E(s,d,"ctl"));
+
+// 3.7  FIRE  — one bit per unit, drawn as in→body→out
+units.forEach(u => {
+  if (!u.out) return;
+  u.ins.forEach(p => E(p, `UB_${u.name}`, "fire"));
+  E(`UB_${u.name}`, u.out, "fire");
+});
+
+// ============================================================================
+// SVG SETUP + PAN/ZOOM
+// ============================================================================
+const svg = document.getElementById("stage");
+svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+const root = document.createElementNS("http://www.w3.org/2000/svg","g");
+svg.appendChild(root);
+
+let scale = 1, tx = 0, ty = 0;
+function apply() { root.setAttribute("transform", `translate(${tx} ${ty}) scale(${scale})`); }
+apply();
+
+function clientToWorld(cx, cy) {
+  const r = svg.getBoundingClientRect();
+  const k = Math.min(r.width / W, r.height / H);
+  const xOff = (r.width  - W * k) / 2;
+  const yOff = (r.height - H * k) / 2;
+  return { x: ((cx - r.left - xOff) / k - tx) / scale,
+           y: ((cy - r.top  - yOff) / k - ty) / scale };
+}
+
+svg.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const k = Math.exp(-ev.deltaY * 0.0015);
+  const ns = Math.max(0.2, Math.min(10, scale * k));
+  const w = clientToWorld(ev.clientX, ev.clientY);
+  tx += (scale - ns) * w.x;
+  ty += (scale - ns) * w.y;
+  scale = ns; apply();
+}, { passive: false });
+
+let panning = false, panStart = null;
+svg.addEventListener("mousedown", ev => {
+  if (ev.target.closest("path.edge")) return;       // edges handle their own clicks
+  if (ev.target.closest("g.node-g"))  return;       // nodes handle their own hovers
+  panning = true;
+  panStart = { x: ev.clientX, y: ev.clientY, tx, ty };
+  svg.classList.add("panning");
+  ev.preventDefault();
+});
+window.addEventListener("mousemove", ev => {
+  if (!panning) return;
+  const r = svg.getBoundingClientRect();
+  const k = Math.min(r.width / W, r.height / H);
+  tx = panStart.tx + (ev.clientX - panStart.x) / k;
+  ty = panStart.ty + (ev.clientY - panStart.y) / k;
+  apply();
+});
+window.addEventListener("mouseup", () => {
+  if (panning) { panning = false; svg.classList.remove("panning"); }
+});
+function reset() { scale = 1; tx = 0; ty = 0; apply(); }
+svg.addEventListener("dblclick", reset);
+window.addEventListener("keydown", ev => {
+  if (ev.key === "0") reset();
+  else if (ev.key === "+" || ev.key === "=") { scale = Math.min(10, scale*1.2); apply(); }
+  else if (ev.key === "-" || ev.key === "_") { scale = Math.max(0.2, scale/1.2); apply(); }
+});
+
+// ============================================================================
+// DRAWING — layers: bands < edges < nodes
+// ============================================================================
+const bandLayer = document.createElementNS("http://www.w3.org/2000/svg","g");
+const edgeLayer = document.createElementNS("http://www.w3.org/2000/svg","g");
+const nodeLayer = document.createElementNS("http://www.w3.org/2000/svg","g");
+root.appendChild(bandLayer); root.appendChild(edgeLayer); root.appendChild(nodeLayer);
+
+function rect(cls, x, y, w, h, rx) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg","rect");
+  e.setAttribute("x", x); e.setAttribute("y", y);
+  e.setAttribute("width", w); e.setAttribute("height", h);
+  if (rx) e.setAttribute("rx", rx);
+  e.setAttribute("class", cls);
+  return e;
+}
+function text(cls, x, y, s, anchor) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg","text");
+  e.setAttribute("x", x); e.setAttribute("y", y);
+  if (anchor) e.setAttribute("text-anchor", anchor);
+  e.setAttribute("class", cls);
+  e.textContent = s;
+  return e;
+}
+
+// Bands behind columns.
+function band(cx, halfW, top, bottom, cls, label, labelCls) {
+  const x = cx - halfW;
+  bandLayer.appendChild(rect(cls, x, top, halfW * 2, bottom - top, 8));
+  if (label) {
+    bandLayer.appendChild(text("band-label " + (labelCls||""), cx, top + 24, label, "middle"));
+    bandLayer.appendChild(text("band-sub",   cx, top + 40, "shadow registers", "middle"));
+  }
+}
+const BAND_TOP = TOP - 18;
+const BAND_BOT = TOP + 40 * ROWH + 20;
+band(COL_SHADOW_RD, 80, BAND_TOP, BAND_BOT, "band-rd", "STAGING ← OUT");
+band(COL_SHADOW_WR, 80, BAND_TOP, BAND_BOT, "band-wr", "STAGING → IN",  "band-label-wr");
+// Trunk band along the bottom
+{
+  const x1 = COL_UNIT_IN  - 60;
+  const x2 = COL_UNIT_OUT + 60 + 200; // covers trunks 0..3
+  bandLayer.appendChild(rect("band-trunk", x1, TRUNK_Y - 26, x2 - x1, 56, 6));
+  bandLayer.appendChild(text("band-label band-label-tr", (x1 + x2) / 2, TRUNK_Y - 8, "CROSS-FABRIC TRUNKS", "middle"));
+}
+
+// ----------------------------------------------------------------------------
+// Edges  — orthogonal routing
+// ----------------------------------------------------------------------------
+function portOut(n) { return { x: n.x + n.w/2, y: n.y }; }
+function portIn (n) { return { x: n.x - n.w/2, y: n.y }; }
+
+const edgeEls = edges.map(e => {
+  const ns = nodes[e.src], nd = nodes[e.dst];
+  if (!ns || !nd) return null;
+
+  let a, b, d;
+  if (e.kind === "fire") {
+    // FIRE wires live INSIDE the unit body region. Route from the input/output
+    // port edge straight to the body's edge — short stubby segments.
+    if (ns.type === "uport") {
+      a = portOut(ns);
+      // arrive at left edge of unit body, at body's y
+      b = { x: nd.x - nd.w/2, y: nd.y };
+    } else { // ns is unitbox, nd is uport (output)
+      a = { x: ns.x + ns.w/2, y: ns.y };
+      b = portIn(nd);
+    }
+    const midX = (a.x + b.x) / 2;
+    d = `M${a.x},${a.y} L${midX},${a.y} L${midX},${b.y} L${b.x},${b.y}`;
+  } else {
+    a = portOut(ns); b = portIn(nd);
+    if (b.x > a.x) {
+      const midX = (a.x + b.x) / 2;
+      d = `M${a.x},${a.y} L${midX},${a.y} L${midX},${b.y} L${b.x},${b.y}`;
+    } else {
+      // backwards: detour BELOW the trunk band so we don't slash through everything
+      const detourY = TRUNK_Y + 80 + (e.bit % 40);
+      d = `M${a.x},${a.y} L${a.x+22},${a.y} L${a.x+22},${detourY} L${b.x-22},${detourY} L${b.x-22},${b.y} L${b.x},${b.y}`;
+    }
+  }
+  const el = document.createElementNS("http://www.w3.org/2000/svg","path");
+  el.setAttribute("d", d);
+  el.setAttribute("class", `edge edge-${e.kind}`);
+  el.dataset.bit  = e.bit;
+  el.dataset.src  = e.src;
+  el.dataset.dst  = e.dst;
+  el.dataset.kind = e.kind;
+  edgeLayer.appendChild(el);
+  return el;
+}).filter(Boolean);
+
+// ----------------------------------------------------------------------------
+// Per-node incidence index for hover-highlight, plus 4-fan budget audit.
+// ----------------------------------------------------------------------------
+const incidence = {};
+edgeEls.forEach(el => {
+  (incidence[el.dataset.src] ||= {in:[],out:[]}).out.push(el);
+  (incidence[el.dataset.dst] ||= {in:[],out:[]}).in.push(el);
+});
+
+// Audit: any port with >4 in OR >4 out is a constraint violation.
+const violations = [];
+Object.entries(incidence).forEach(([id, inc]) => {
+  if (inc.in.length  > 4) violations.push(`${id}: ${inc.in.length} IN edges (max 4)`);
+  if (inc.out.length > 4) violations.push(`${id}: ${inc.out.length} OUT edges (max 4)`);
+});
+if (violations.length) {
+  console.error("Datapath fan-budget violations:\n  " + violations.join("\n  "));
+  document.getElementById("meta").style.color = "#ff7a8c";
+  document.getElementById("meta").textContent =
+    "⚠ FAN-BUDGET VIOLATIONS — " + violations.join("; ");
+}
+
+// ----------------------------------------------------------------------------
+// Tooltip helpers
+// ----------------------------------------------------------------------------
+const tooltip = document.getElementById("tooltip");
+function showTip(msg, ev) {
+  tooltip.textContent = msg;
+  tooltip.style.display = "block";
+  tooltip.style.left = (ev.clientX + 12) + "px";
+  tooltip.style.top  = (ev.clientY + 12) + "px";
+}
+function hideTip() { if (!pinnedEdge) tooltip.style.display = "none"; }
+
+// ----------------------------------------------------------------------------
+// Nodes  — draw + wire hover behavior
+// ----------------------------------------------------------------------------
+Object.values(nodes).forEach(n => {
+  const g = document.createElementNS("http://www.w3.org/2000/svg","g");
+  g.classList.add("node-g");
+  g.dataset.nodeId = n.id;
+
+  const r = rect(`node node-${n.type}`, n.x - n.w/2, n.y - n.h/2, n.w, n.h, 3);
+  g.appendChild(r);
+
+  // labels
+  if (n.type === "unitbox") {
+    g.appendChild(text("lbl-unit", n.x, n.y + 4, n.label, "middle"));
+    g.appendChild(text("lbl-fire", n.x, n.y + 18, "FIRE", "middle"));
+  } else {
+    g.appendChild(text("lbl", n.x, n.y + 3.5, n.label, "middle"));
+    if (n.sub) g.appendChild(text("lbl-sub", n.x, n.y + 13, n.sub, "middle"));
+  }
+
+  // hover-highlight all incident edges
+  g.addEventListener("mouseenter", ev => {
+    if (pinnedEdge) return;
+    g.classList.add("node-hi");
+    const inc = incidence[n.id];
+    if (inc) {
+      inc.in .forEach(e => e.classList.add("in-hi"));
+      inc.out.forEach(e => e.classList.add("out-hi"));
+    }
+    const ins  = inc ? inc.in .map(e => `${e.dataset.src}  (edge bit ${e.dataset.bit})`) : [];
+    const outs = inc ? inc.out.map(e => `${e.dataset.dst}  (edge bit ${e.dataset.bit})`) : [];
+    const pad = arr => arr.length ? arr.map(s => "    " + s).join("\n") : "    (none)";
+    const lname = latchOfNode(n.id);
+    let fpLine;
+    if (lname && LATCH_BIT[lname] !== undefined) {
+      // Annotate which mask(s) of the currently-selected ops touch this latch.
+      const a = OPS[+opA.value], b = OPS[+opB.value];
+      const tags = [];
+      if (fpHas(a.W, lname)) tags.push("A.W");
+      if (fpHas(a.R, lname)) tags.push("A.R");
+      if (fpHas(b.W, lname)) tags.push("B.W");
+      if (fpHas(b.R, lname)) tags.push("B.R");
+      const tagStr = tags.length ? `  [${tags.join(", ")}]` : "";
+      fpLine = `footprint bit ${LATCH_BIT[lname]}  (latch '${lname}')${tagStr}\n`;
+    } else {
+      fpLine = `footprint:  (wire, no latch bit)\n`;
+    }
+    const msg =
+      `${n.id}\n` +
+      `─────────────────────────────\n` +
+      fpLine +
+      `IN  (${ins.length}/4):\n${pad(ins)}\n` +
+      `OUT (${outs.length}/4):\n${pad(outs)}`;
+    showTip(msg, ev);
+  });
+  g.addEventListener("mousemove", ev => {
+    if (!pinnedEdge) showTip(tooltip.textContent, ev);
+  });
+  g.addEventListener("mouseleave", () => {
+    g.classList.remove("node-hi");
+    const inc = incidence[n.id];
+    if (inc) {
+      inc.in .forEach(e => e.classList.remove("in-hi"));
+      inc.out.forEach(e => e.classList.remove("out-hi"));
+    }
+    hideTip();
+  });
+
+  nodeLayer.appendChild(g);
+});
+
+// ----------------------------------------------------------------------------
+// Edge hover + click-to-pin
+// ----------------------------------------------------------------------------
+let pinnedEdge = null;
+edgeEls.forEach(el => {
+  el.addEventListener("mouseenter", ev => {
+    if (pinnedEdge) return;
+    el.classList.add("hi");
+    showTip(`bit ${el.dataset.bit}   ${el.dataset.src} → ${el.dataset.dst}\n[${el.dataset.kind}]`, ev);
+  });
+  el.addEventListener("mousemove", ev => {
+    if (!pinnedEdge) showTip(tooltip.textContent, ev);
+  });
+  el.addEventListener("mouseleave", () => {
+    if (pinnedEdge !== el) el.classList.remove("hi");
+    if (!pinnedEdge) tooltip.style.display = "none";
+  });
+  el.addEventListener("click", ev => {
+    if (pinnedEdge && pinnedEdge !== el) pinnedEdge.classList.remove("hi");
+    pinnedEdge = (pinnedEdge === el) ? null : el;
+    if (!pinnedEdge) { tooltip.style.display = "none"; el.classList.remove("hi"); }
+    ev.stopPropagation();
+  });
+});
+svg.addEventListener("click", () => {
+  if (pinnedEdge) { pinnedEdge.classList.remove("hi"); pinnedEdge = null; tooltip.style.display = "none"; }
+});
+
+// ----------------------------------------------------------------------------
+// Edge-group filters
+// ----------------------------------------------------------------------------
+function refresh() {
+  const want = {
+    reg:   document.getElementById("t-reg").checked,
+    lane:  document.getElementById("t-lane").checked,
+    unit:  document.getElementById("t-unit").checked,
+    trunk: document.getElementById("t-trunk").checked,
+    ctl:   document.getElementById("t-ctl").checked,
+    fire:  document.getElementById("t-fire").checked,
+  };
+  edgeEls.forEach(el => el.style.display = want[el.dataset.kind] ? "" : "none");
+}
+["t-reg","t-lane","t-unit","t-trunk","t-ctl","t-fire"].forEach(id =>
+  document.getElementById(id).addEventListener("change", refresh));
+
+// ============================================================================
+// PLANE 1 — LATCH ENUMERATION AND FOOTPRINT BITS
+// ============================================================================
+// One footprint bit per LATCH (storage cell). Ports that share a register
+// (R*_RD and R*_WR) collapse to one latch. ZERO is a constant wire — no bit.
+//
+// Layout follows §4.1 of Trigger-Datapath.txt.
+const LATCH_ORDER = [
+  // 0..31  : R0..R31
+  ...Array.from({length:32}, (_,i)=>`R${i}`),
+  // 32..39 : LRD lanes
+  ...Array.from({length:8},  (_,i)=>`LRD${i}`),
+  // 40..47 : LWR lanes
+  ...Array.from({length:8},  (_,i)=>`LWR${i}`),
+  // 48..60 : unit input latches
+  "ADD_A","ADD_B","AND_A","AND_B","XOR_A","XOR_B",
+  "ROTL_A","ROTL_N","BNE_A","BNE_B","LW_ADDR","SW_ADDR","SW_DATA",
+  // 61..66 : unit output latches
+  "ADD_O","AND_O","XOR_O","ROTL_O","BNE_O","LW_O",
+  // 67     : PC
+  "PC",
+  // 68..71 : trunks
+  "T0","T1","T2","T3",
+  // 72     : IMM (per-cycle constant register)
+  "IMM",
+];
+const LATCH_BIT = {};
+LATCH_ORDER.forEach((name, i) => LATCH_BIT[name] = i);
+const NUM_LATCHES = LATCH_ORDER.length;
+
+// nodeId -> latch name. Several node ids map to the same latch.
+function latchOfNode(id) {
+  const m = id.match(/^R(\d+)_(RD|WR)$/);     if (m) return `R${m[1]}`;
+  if (id === "PC_RD" || id === "PC_WR")       return "PC";
+  if (id === "IMM_O")                          return "IMM";
+  if (id === "ZERO_O")                          return null;        // no claim
+  if (id.startsWith("UB_"))                    return id.slice(3) + "_O";  // unit body claims its output
+  return id;  // LRD*, LWR*, ADD_A, T0, ADD_O, etc.
+}
+
+// Footprint helpers — represented as a JS BigInt for clean bit ops up to 128.
+function fpEmpty() { return 0n; }
+function fpAdd(fp, latchName) {
+  const i = LATCH_BIT[latchName];
+  if (i === undefined) return fp;
+  return fp | (1n << BigInt(i));
+}
+function fpHas(fp, latchName) {
+  const i = LATCH_BIT[latchName];
+  if (i === undefined) return false;
+  return (fp & (1n << BigInt(i))) !== 0n;
+}
+function fpAnd(a, b) { return a & b; }
+function fpOr (a, b) { return a | b; }
+function fpFmt(fp) {
+  // Pretty list of latch names.
+  const out = [];
+  for (let i = 0; i < NUM_LATCHES; i++)
+    if (fp & (1n << BigInt(i))) out.push(LATCH_ORDER[i]);
+  return out.join(", ") || "(empty)";
+}
+
+// ============================================================================
+// CANNED OPERATIONS — each carries its footprint (the union of all latches
+// the op touches across its life) plus a list of per-cycle trigger words.
+// (We keep cycles abstract — for the demo, only the footprint matters.)
+// ============================================================================
+function mkOp(name, wLatches, rRegs, cycles) {
+  let W = fpEmpty(), R = fpEmpty();
+  wLatches.forEach(l => { W = fpAdd(W, l); });
+  rRegs   .forEach(l => { R = fpAdd(R, l); });
+  return { name, W, R, cycles };
+}
+
+// W_mask = all the latches the op WRITES (lanes, unit ports, target register).
+// R_mask = the architectural registers the op READS (and ONLY arch regs).
+// Reads of intermediates aren't tracked — only one op can own a shadow reg
+// per cycle, so the W-claim already prevents that.
+const OPS = [
+  // (none) — empty mask, picks no latches. Useful for sanity-checking the
+  // fuse logic: (none) & anything == 0 ⇒ always fusable.
+  mkOp("(none)", /*W*/ [], /*R*/ []),
+
+  mkOp("xor x10,x3,x7",
+    /*W*/ ["LRD0","LRD1","XOR_A","XOR_B","XOR_O","LWR2","R10"],
+    /*R*/ ["R3","R7"],
+    [["read"], ["fwd"], ["FIRE_XOR"], ["write"]]),
+
+  mkOp("add x11,x4,x8",
+    /*W*/ ["LRD1","LRD2","ADD_A","ADD_B","ADD_O","LWR0","R11"],
+    /*R*/ ["R4","R8"],
+    [["read"], ["fwd"], ["FIRE_ADD"], ["write"]]),
+
+  mkOp("and x12,x5,x9",
+    /*W*/ ["LRD3","LRD4","AND_A","AND_B","AND_O","LWR1","R12"],
+    /*R*/ ["R5","R9"],
+    [["read"], ["fwd"], ["FIRE_AND"], ["write"]]),
+
+  mkOp("rotl x13,x6,x2",
+    /*W*/ ["LRD5","LRD6","ROTL_A","ROTL_N","ROTL_O","LWR3","R13"],
+    /*R*/ ["R6","R2"],
+    [["read"], ["fwd"], ["FIRE_ROTL"], ["write"]]),
+
+  mkOp("lw x14,0(x16)",
+    /*W*/ ["LRD4","LW_ADDR","LW_O","LWR4","IMM","R14"],
+    /*R*/ ["R16"],
+    [["read"], ["IMM→LW_ADDR"], ["FIRE_LW"], ["write"]]),
+
+  mkOp("sw x18,4(x20)",
+    /*W*/ ["LRD4","LRD3","SW_ADDR","SW_DATA","IMM"],
+    /*R*/ ["R20","R18"],
+    [["read"], ["addr+data"], ["mem write"]]),
+
+  mkOp("bne x21,x22,L1",
+    /*W*/ ["LRD2","LRD3","BNE_A","BNE_B","BNE_O","PC"],
+    /*R*/ ["R21","R22"],
+    [["read"], ["fwd"], ["FIRE_BNE"], ["PC update"]]),
+
+  // Two ops both reading R1 — should FUSE freely (R∩R not tested).
+  mkOp("add x20,x1,x2",
+    /*W*/ ["LRD0","LRD1","ADD_A","ADD_B","ADD_O","LWR5","R20"],
+    /*R*/ ["R1","R2"]),
+
+  mkOp("xor x21,x1,x3",
+    /*W*/ ["LRD2","LRD3","XOR_A","XOR_B","XOR_O","LWR5","R21"],
+    /*R*/ ["R1","R3"]),
+
+  // RAW hazard: op writes x3, next op reads x3 → must NOT fuse.
+  mkOp("add x3,x1,x4   (writes x3)",
+    /*W*/ ["LRD6","LRD7","ADD_A","ADD_B","ADD_O","LWR0","R3"],
+    /*R*/ ["R1","R4"]),
+];
+
+// ============================================================================
+// FUSION SANDBOX UI
+// ============================================================================
+const opA = document.getElementById("opA");
+const opB = document.getElementById("opB");
+OPS.forEach((op, i) => {
+  opA.appendChild(new Option(op.name, i));
+  opB.appendChild(new Option(op.name, i));
+});
+// Default to (none) vs (none) so the initial state shows the trivial fuse.
+opA.value = 0; opB.value = 0;
+
+function clearHighlights() {
+  document.querySelectorAll("g.node-g").forEach(g => {
+    g.classList.remove("fp-a-w","fp-a-r","fp-b-w","fp-b-r","fp-waw","fp-hazard","fp-rr");
+  });
+}
+
+document.getElementById("fuseBtn").addEventListener("click", () => {
+  clearHighlights();
+  const a = OPS[+opA.value], b = OPS[+opB.value];
+
+  // The 3-AND hazard check.
+  const waw    = fpAnd(a.W, b.W);   // both write same latch
+  const war    = fpAnd(a.W, b.R);   // A writes, B reads
+  const raw    = fpAnd(a.R, b.W);   // B writes, A reads
+  const rr     = fpAnd(a.R, b.R);   // shared READS — NOT a conflict, shown gray
+  const hazard = waw | war | raw;
+  const can    = hazard === 0n;
+
+  // Highlight each latch by its strongest classification.
+  document.querySelectorAll("g.node-g").forEach(g => {
+    const lname = latchOfNode(g.dataset.nodeId);
+    if (!lname) return;
+    const inAW = fpHas(a.W, lname), inAR = fpHas(a.R, lname);
+    const inBW = fpHas(b.W, lname), inBR = fpHas(b.R, lname);
+    if (inAW && inBW)               g.classList.add("fp-waw");          // red
+    else if ((inAW && inBR) || (inAR && inBW))
+                                    g.classList.add("fp-hazard");       // orange
+    else if (inAR && inBR)          g.classList.add("fp-rr");           // gray (safe)
+    else if (inAW)                  g.classList.add("fp-a-w");          // cyan solid
+    else if (inAR)                  g.classList.add("fp-a-r");          // cyan dashed
+    else if (inBW)                  g.classList.add("fp-b-w");          // pink solid
+    else if (inBR)                  g.classList.add("fp-b-r");          // pink dashed
+  });
+
+  const r = document.getElementById("fuseResult");
+  const parts = [];
+  if (can) {
+    parts.push(`<span style="color:#7adf95">✓ FUSABLE</span>`);
+    if (rr !== 0n)
+      parts.push(`<span style="color:#7a8a93">shared reads (safe): ${fpFmt(rr)}</span>`);
+  } else {
+    parts.push(`<span style="color:#ff7a8c">✗ HAZARD</span>`);
+    if (waw !== 0n) parts.push(`<span style="color:#ff7a8c">WAW: ${fpFmt(waw)}</span>`);
+    if (war !== 0n) parts.push(`<span style="color:#ffa83a">WAR: ${fpFmt(war)}</span>`);
+    if (raw !== 0n) parts.push(`<span style="color:#ffa83a">RAW: ${fpFmt(raw)}</span>`);
+  }
+  r.innerHTML = parts.join("&nbsp;·&nbsp;");
+});
+// Show initial state
+document.getElementById("fuseBtn").click();
+
+// ============================================================================
+// Header meta
+// ============================================================================
+const byKind = {};
+edges.forEach(e => byKind[e.kind] = (byKind[e.kind] || 0) + 1);
+const breakdown = Object.entries(byKind).map(([k,v]) => `${k}=${v}`).join(" · ");
+document.getElementById("meta").textContent =
+  `${Object.keys(nodes).length} ports · ${edges.length} edges (${breakdown}) · ${NUM_LATCHES} latches · footprint = ${NUM_LATCHES} bits, trigger word ≈ 225 bits`;
+</script>

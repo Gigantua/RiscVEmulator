@@ -9,3 +9,4 @@ EXPORTS
     rv32i_set_halted
     rv32i_set_meip
     rv32i_set_mtip
+    rv32i_set_softfloat_hook

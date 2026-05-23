@@ -11,6 +11,7 @@ namespace RiscVEmulator.Core.Peripherals
         private Memory? _ram;
         private uint _vsyncFlag;
         private bool _vsyncEverUsed;
+        private ulong _vsyncCount;
         private uint _paletteIndex;
         private uint _mode;
         private uint _fbAddr;
@@ -20,6 +21,8 @@ namespace RiscVEmulator.Core.Peripherals
         public uint VsyncFlag     => _vsyncFlag;
         public uint Mode          => _mode;
         public bool VsyncEverUsed => _vsyncEverUsed;
+        /// <summary>Number of times the guest wrote VSYNC=1 (frames presented).</summary>
+        public ulong VsyncCount   => _vsyncCount;
 
         public DisplayControlDevice(FramebufferDevice fb) { _fb = fb; }
         public void SetMemory(Memory ram) => _ram = ram;
@@ -45,6 +48,7 @@ namespace RiscVEmulator.Core.Peripherals
                     if (value != 0)
                     {
                         _vsyncEverUsed = true;
+                        _vsyncCount++;
                         if (_fbAddr != 0 && _ram != null)
                         {
                             int len = _fb.Width * _fb.Height * FramebufferDevice.BytesPerPixel;

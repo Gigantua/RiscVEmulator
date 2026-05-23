@@ -39,6 +39,14 @@ public abstract class EmulatorTestBase
         psi.ArgumentList.Add("-O3");
         psi.ArgumentList.Add("-fno-builtin");
         psi.ArgumentList.Add("-fuse-ld=lld");
+        /* Promote the two warnings that cause silent miscompiles in
+         * RV32 ilp32 soft-float to hard errors. Implicit-int return type
+         * makes clang emit __floatsisf after `jal atof` instead of
+         * __truncdfsf2 — the kind of bug that destroyed every Quake
+         * entity origin until we forward-declared atof. Int-conversion
+         * catches related cases where pointer/int gets swapped. */
+        psi.ArgumentList.Add("-Werror=implicit-function-declaration");
+        psi.ArgumentList.Add("-Werror=int-conversion");
         psi.ArgumentList.Add($"-I{RuntimeDir}");
         psi.ArgumentList.Add($"-Wl,-T,{LinkerScript}");
         foreach (string src in srcFiles)
@@ -71,7 +79,12 @@ public abstract class EmulatorTestBase
         psi.ArgumentList.Add("-mabi=ilp32");
         psi.ArgumentList.Add(optLevel);
         psi.ArgumentList.Add("-fno-builtin");
+        psi.ArgumentList.Add("-Werror=implicit-function-declaration");
+        psi.ArgumentList.Add("-Werror=int-conversion");
         psi.ArgumentList.Add($"-I{RuntimeDir}");
+        psi.ArgumentList.Add($"-I{Path.Combine(RuntimeDir, "softfp")}");
+        psi.ArgumentList.Add("-include");
+        psi.ArgumentList.Add(Path.Combine(RuntimeDir, "softfp", "rvemu_softfp_force.h"));
         psi.ArgumentList.Add("-c");
         psi.ArgumentList.Add(srcFile);
         psi.ArgumentList.Add("-o");

@@ -643,25 +643,68 @@ unsigned long strtoul(const char *s, char **endptr, int base)
     return val;
 }
 
-/* strtod/strtof: minimal implementation for bare-metal.
- * Parses the integer part only; sufficient for TCC's float-constant parsing
- * when only integer-valued constants appear.
- * Note: strtold is omitted — 128-bit long double (__floatsitf) is unavailable
- * on bare-metal RV32I.  Use strtod if you need extended range. */
+/* strtod / strtof: parses optional sign, integer part, fractional part,
+ * and decimal exponent ([eE][+-]?digits). No hex floats, no INF/NAN
+ * literals. Accuracy is naïve (digit-by-digit accumulation) but precision
+ * is well within float range — sufficient for Quake BSP entity strings
+ * like "-512.125 256 88.5" where the previous integer-only stub silently
+ * truncated fractional components and put brush models / spawn points
+ * on the wrong side of clip planes. */
 double strtod(const char *s, char **endptr)
 {
-    char *end;
-    long n = strtol(s, &end, 10);
-    if (endptr) *endptr = end;
-    return (double)n;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+
+    int neg = 0;
+    if (*p == '+')      { p++; }
+    else if (*p == '-') { p++; neg = 1; }
+
+    /* If neither a digit nor a '.' follows the sign, this is not a valid
+     * number — match strtol behaviour and report no characters consumed. */
+    if (!((*p >= '0' && *p <= '9') || (*p == '.' && p[1] >= '0' && p[1] <= '9'))) {
+        if (endptr) *endptr = (char *)s;
+        return 0.0;
+    }
+
+    double val = 0.0;
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10.0 + (double)(*p - '0');
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        double frac = 0.1;
+        while (*p >= '0' && *p <= '9') {
+            val += (double)(*p - '0') * frac;
+            frac *= 0.1;
+            p++;
+        }
+    }
+    if (*p == 'e' || *p == 'E') {
+        const char *exp_start = p;
+        p++;
+        int exp_neg = 0;
+        if (*p == '+')      { p++; }
+        else if (*p == '-') { p++; exp_neg = 1; }
+        if (*p >= '0' && *p <= '9') {
+            int e = 0;
+            while (*p >= '0' && *p <= '9') { e = e * 10 + (*p - '0'); p++; }
+            double scale = 1.0;
+            for (int i = 0; i < e; i++) scale *= 10.0;
+            if (exp_neg) val /= scale; else val *= scale;
+        } else {
+            /* No digits after the 'e' — rewind to before the 'e'. */
+            p = exp_start;
+        }
+    }
+
+    if (endptr) *endptr = (char *)p;
+    return neg ? -val : val;
 }
 
 float strtof(const char *s, char **endptr)
 {
-    char *end;
-    long n = strtol(s, &end, 10);
-    if (endptr) *endptr = end;
-    return (float)n;
+    return (float)strtod(s, endptr);
 }
 
 static unsigned int _rand_seed = 1;

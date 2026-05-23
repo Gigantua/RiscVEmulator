@@ -24,7 +24,7 @@ string  wslDir        = DefaultWslDir;
 string  distro        = "";
 string? sudoPassword  = null;     // --sudo-password skips the interactive prompt
 int     jobs          = 32;
-string  toolchain     = "clang";  // default: clang (LLVM-unified); pass --toolchain=gcc for legacy buildroot GCC
+string  toolchain     = "gcc";    // default: gcc (proven boot path). Pass --toolchain=clang for the LLVM-unified path (in progress — currently produces a kernel that hangs at PC=0 immediately)
 var     extraApt      = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
@@ -458,6 +458,11 @@ RunWsl($"cat >> {wslDir}/.config << 'BR_CFG_EOF'\n" +
        // Examples.Doom bare-metal demo, so SFX + music work out of the box.
        "BR2_PACKAGE_DOOM_PUREDOOM=y\n" +
        "BR2_PACKAGE_DOOM_WAD=y\n" +
+       // tyrquake disabled: my session's package recipe couldn't resolve
+       // upstream source (buildroot 404s on sources.buildroot.net/tyrquake/
+       // tyrquake-master-git4.tar.gz). Re-enable once the .mk pins a
+       // concrete tag like `tyrquake-0.71` and a verified checksum.
+       // "BR2_PACKAGE_TYRQUAKE=y\n" +
        // ncurses in the base image — purely so its terminfo database
        // (/usr/share/terminfo: vt100, vt102, linux, xterm, ...) ships in
        // the rootfs. ncurses apps installed later via rvpkg (sl, frotz,
@@ -765,6 +770,46 @@ RunWsl($"cat > {wslDir}/board/rvemu/busybox.fragment << 'BB_EOF'\n" +
     RunWsl("bash /mnt/c/work/RiscV/RiscVEmulator/Examples/Linux.Build_RV32i/scripts/stage-nanox.sh");
 }
 
+// ── Custom buildroot package: tyrquake ────────────────────────────────────
+// Quake software renderer for the desktop. Mirrors doom-puredoom's
+// install pattern: copy the package definition into buildroot, splice
+// the Games menu, then defconfig already has BR2_PACKAGE_TYRQUAKE=y.
+//
+// Source layout in the rvemu tree (vid driver lives next to the package;
+// upstream source is fetched at build time from github.com/sezero/tyrquake):
+//   Examples/Linux.Build_RV32i/tyrquake/Config.in
+//   Examples/Linux.Build_RV32i/tyrquake/tyrquake.mk
+//   Examples/Linux.Build_RV32i/tyrquake/src/vid_rvemu.c
+//   Examples/Linux.Build_RV32i/tyrquake/src/quake.sh
+//   Examples/Linux.Build_RV32i/tyrquake/src/quake.desktop
+{
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (dir != null && !Directory.Exists(Path.Combine(dir.FullName, "tyrquake")))
+        dir = dir.Parent;
+    if (dir == null)
+        throw new DirectoryNotFoundException(
+            "Could not locate tyrquake/ above " + AppContext.BaseDirectory);
+
+    string hostQDir = Path.Combine(dir.FullName, "tyrquake").Replace("\\", "/");
+    string wslQDir  = $"$(wslpath -u '{hostQDir}')";
+
+    Console.WriteLine("Installing tyrquake buildroot package...");
+    RunWsl($"rm -rf {wslDir}/package/tyrquake && " +
+           $"mkdir -p {wslDir}/package/tyrquake/src");
+    RunWsl($"cp {wslQDir}/Config.in       {wslDir}/package/tyrquake/");
+    RunWsl($"cp {wslQDir}/tyrquake.mk     {wslDir}/package/tyrquake/");
+    RunWsl($"cp {wslQDir}/src/vid_rvemu.c    {wslDir}/package/tyrquake/src/");
+    RunWsl($"cp {wslQDir}/src/Makefile.rvemu {wslDir}/package/tyrquake/src/");
+    RunWsl($"cp {wslQDir}/src/quake.sh       {wslDir}/package/tyrquake/src/");
+    RunWsl($"cp {wslQDir}/src/quake.desktop  {wslDir}/package/tyrquake/src/");
+
+    // Splice `source "package/tyrquake/Config.in"` into the Games submenu
+    // (idempotent).
+    RunWsl($"grep -q 'package/tyrquake/Config.in' {wslDir}/package/Config.in || " +
+           $"sed -i '/menu \"Games\"/a\\\tsource \"package/tyrquake/Config.in\"' " +
+           $"{wslDir}/package/Config.in");
+}
+
 // rvpkg — tiny shell-script package installer. Fetches the host feed,
 // extracts the .ipk (ar + tar.gz inside) into /. No opkg dependencies.
 // Transfer via base64 because `bash -c` + heredoc still expands `$VAR`
@@ -883,6 +928,24 @@ RunWsl($"ln -sf apt {wslDir}/board/rvemu/rootfs-overlay/usr/bin/apt-get");
 // Source lives at guest-userspace/rvemu-input.c. We cross-compile it here
 // with buildroot's toolchain (which produces a statically-linked nommu
 // uclibc RV32I binary) and drop the result into the overlay.
+// Build the buildroot cross-toolchain FIRST so the userspace cross-compile
+// (rvemu-input/desktop/audiod/...) and the Microwindows BFLT build that
+// follow succeed on a clean checkout's very first pass. Without this,
+// the first run prints "rvemu-input cross-compile failed (toolchain not
+// built yet — first `make` will build it; rerun Prepare after)" and the
+// rootfs comes out without any rvemu userspace daemons. Idempotent —
+// re-running on an already-built tree is fast (stamp check).
+{
+    int toolRc = RunWslSilent(
+        "test -x $HOME/rvemu-buildroot/output/host/bin/riscv32-buildroot-linux-uclibc-gcc.br_real");
+    if (toolRc != 0)
+    {
+        Console.WriteLine("Building cross-toolchain (one-shot) so userspace cross-compile + Microwindows succeed this pass...");
+        int rc = RunWsl($"cd {wslDir} && make -j{jobs} toolchain");
+        if (rc != 0) { Console.Error.WriteLine("toolchain build failed"); return rc; }
+    }
+}
+
 Console.WriteLine("Cross-compiling rvemu-input...");
 // AppContext.BaseDirectory varies by build flavour:
 //   Debug:        bin/Debug/net10.0/            → 3 levels up = project dir
@@ -1082,18 +1145,33 @@ ctl.!default {
     // ── Microwindows (nano-X) ────────────────────────────────────────────────
     // If a pre-built Microwindows tree exists at ~/rvemu-mw/microwindows, ship
     // its BFLT binaries into the rootfs and replace our makeshift rvemu-desktop
-    // with a real retained-mode window manager + a couple of demo clients.
-    //
-    // Build steps (one-time, manual):
-    //   git clone https://github.com/ghaerr/microwindows.git ~/rvemu-mw/microwindows
-    //   cp .../microwindows/config        ~/rvemu-mw/microwindows/src/config
-    //   cp .../microwindows/scr_rvemu.c   ~/rvemu-mw/microwindows/src/drivers/
-    //   ... (Arch.rules, Objects.rules tweaks — see scripts/)
-    //   cd ~/rvemu-mw/microwindows/src && make
+    // with a real retained-mode window manager + a couple of demo clients
+    // (nxclock, nxchess, nxtetris, nxcalc, nxeyes, demos) plus the
+    // rvemu-taskbar bottom-of-screen launcher.
     //
     // The Microwindows binaries are BFLT executables linked against the same
-    // buildroot uclibc toolchain we use here. They mmap /dev/mem at 0x85FC0000
-    // (see scr_rvemu.c) so they need CONFIG_DEVMEM in the kernel (already on).
+    // buildroot uclibc toolchain. They mmap /dev/mem at 0x85FC0000 (see
+    // scr_rvemu.c) so they need CONFIG_DEVMEM in the kernel (already on).
+    //
+    // Step 1: ensure the tree is built. The build is one-shot (BFLTs go to
+    // ~/rvemu-mw/microwindows/src/bin/), idempotent (skipped if `nano-X`
+    // already exists). Takes ~3-5 min on a cold build.
+    {
+        int mwBuiltRc = RunWslSilent(
+            "test -x $HOME/rvemu-mw/microwindows/src/bin/nano-X && " +
+            "test -x $HOME/rvemu-mw/microwindows/src/bin/nanowm && " +
+            "test -x $HOME/rvemu-mw/microwindows/src/bin/rvemu-taskbar");
+        if (mwBuiltRc != 0)
+        {
+            Console.WriteLine("  Microwindows not built yet — running build-microwindows.sh.");
+            int rc = RunWsl("bash /mnt/c/work/RiscV/RiscVEmulator/RiscVEmulator-RV32I/" +
+                            "Examples/Linux.Build_RV32i/scripts/build-microwindows.sh");
+            if (rc != 0)
+            {
+                Console.WriteLine("  build-microwindows.sh failed (rc=" + rc + ") — skipping nano-X install.");
+            }
+        }
+    }
     int mwRc = RunWsl(
         "test -x $HOME/rvemu-mw/microwindows/src/bin/nano-X && " +
         "test -x $HOME/rvemu-mw/microwindows/src/bin/nanowm");
@@ -1191,16 +1269,29 @@ case ""$1"" in
         /usr/bin/nxclock       >/dev/null 2>&1 &
         /usr/bin/nxeyes        >/dev/null 2>&1 &
         echo 'OK'
+        # Auto-launch Doom — bypasses the taskbar click. Set
+        # rvemu.noautodoom=1 on the kernel cmdline to disable.
+        if ! grep -qw 'rvemu.noautodoom=1' /proc/cmdline; then
+            if [ -x /usr/bin/doom ]; then
+                # Tiny delay so nanowm has its mainloop running before
+                # doom maps its window. Otherwise the WM hasn't set up
+                # X-style root window decorations and doom comes up
+                # rootless.
+                ( sleep 1 && /usr/bin/doom >/dev/null 2>&1 ) &
+                echo $! > /var/run/doom.pid
+                echo 'Auto-launched Doom (sleep 1s then /usr/bin/doom)'
+            fi
+        fi
         ;;
     stop)
         # Kill the taskbar first so its parent loop doesn't try to reconnect
         # to the dying server. Then clients. Then the server itself.
-        for f in rvemu-taskbar nxeyes nxclock nanowm nano-X; do
+        for f in doom rvemu-taskbar nxeyes nxclock nanowm nano-X; do
             [ -f /var/run/$f.pid ] && kill $(cat /var/run/$f.pid) 2>/dev/null
             rm -f /var/run/$f.pid
         done
         # Belt-and-suspenders — vfork'd children may not have written pidfiles.
-        killall nxeyes nxclock nanowm rvemu-taskbar nano-X 2>/dev/null
+        killall doom nxeyes nxclock nanowm rvemu-taskbar nano-X 2>/dev/null
         ;;
 esac
 exit 0
@@ -1554,7 +1645,37 @@ RunWsl(
 // `.rv32i-trapframe-v1-applied` pattern: the swap+dirclean fires exactly
 // once per buildroot tree.
 string clangMarker = $"{wslDir}/board/rvemu/.clang-toolchain-applied";
-if (useClang)
+if (!useClang)
+{
+    // Undo any prior --toolchain=clang staging so the gcc path actually
+    // uses gcc. The clang setup symlinks `…-gcc` and `…-cc` to the
+    // clang shim and patches `linux/linux.mk` to add `LLVM=1
+    // LLVM_SUFFIX=-18`. Without undoing both, a subsequent gcc run
+    // still uses clang for every C file and the kernel build fails
+    // with `linker 'ld.lld' not found` from kconfig.
+    int hadShim = RunWslSilent($"test -f {clangMarker}");
+    if (hadShim == 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine("================================================================");
+        Console.WriteLine(" --toolchain=gcc : reverting prior clang staging");
+        Console.WriteLine("================================================================");
+        string T = "riscv32-buildroot-linux-uclibc";
+        // Drop the shim symlinks; `make toolchain` will re-stage the real
+        // gcc wrapper(s) from the buildroot output tree.
+        RunWsl($"rm -f {wslDir}/output/host/bin/{T}-gcc {wslDir}/output/host/bin/{T}-cc {wslDir}/output/host/bin/{T}-clang-shim");
+        // Remove the LLVM=1 LLVM_SUFFIX=-18 prefix from linux.mk.
+        RunWsl($"sed -i 's|^LINUX_MAKE_FLAGS = LLVM=1 LLVM_SUFFIX=-18 \\\\|LINUX_MAKE_FLAGS = \\\\|' {wslDir}/linux/linux.mk");
+        // Force the toolchain and linux to fully rebuild — the shim
+        // had been the active compiler, so any cached .o is suspect.
+        RunWsl($"cd {wslDir} && make uclibc-dirclean busybox-dirclean linux-dirclean toolchain-dirclean");
+        RunWsl($"cd {wslDir} && make -j{jobs} toolchain");
+        // Clear the marker so the next --toolchain=clang run re-fires
+        // its one-shot staging.
+        RunWsl($"rm -f {clangMarker}");
+    }
+}
+else if (useClang)
 {
     Console.WriteLine();
     Console.WriteLine("================================================================");

@@ -256,7 +256,16 @@ static void do_trap(CPU_State& cpu, TrapUnit& trap, uint32_t cause, uint32_t tva
 
     mem_write<uint32_t>(cpu, IE_FLAG, 0u);
     trap.priv = PRIV_M;
-    cpu.pc = mem_read<uint32_t>(cpu, TRAP_VECTOR);
+    // Read TVEC from the canonical offset (+0x004). Legacy May-17 era
+    // paravirt kernels stored TVEC at +0x008 (now the IE_MASK slot);
+    // when buildroot's clang/gcc rebuild path is blocked we still want
+    // those images to boot, so fall back to +0x008 if +0x004 is zero.
+    // A new kernel always writes both 0x004 (TVEC) and 0x008 (IE_MASK,
+    // with a real interrupt mask value), so the fallback is unreachable
+    // once a current kernel is in place.
+    uint32_t tvec = mem_read<uint32_t>(cpu, TRAP_VECTOR);
+    if (tvec == 0) tvec = mem_read<uint32_t>(cpu, IE_MASK);
+    cpu.pc = tvec;
 }
 
 // Trap return (the PV_RESUME_GATEWAY): reload x1..x31 from the handler's
@@ -275,13 +284,49 @@ static void trap_return(CPU_State& cpu, TrapUnit& trap) {
 // Act on a SYSTEM instruction the CPU handed back. The base ISA has only
 // ECALL and EBREAK; every other SYSTEM encoding — MRET, SRET, WFI, all CSR
 // ops — is illegal. Trap return is the PV_RESUME_GATEWAY, not an instruction.
+// Soft CSR storage for legacy paravirt kernels. The native trap-frame
+// page made architectural CSRs redundant, but May-17 era kernel images
+// still emit a handful of `csrrw rd, csr, rs1` instructions in trap
+// entry/exit (e.g. `csrrw tp, mscratch, tp` to swap thread pointer).
+// Trapping those as illegal makes the kernel re-enter its own handler
+// forever. Each CSR address gets a soft slot: writes go in, reads come
+// out. Side effects (interrupts, traps, FP) are deliberately not wired
+// — that's what the trap-frame page is for.
+static uint32_t soft_csr[4096];
+
 static void trap_system(CPU_State& cpu, TrapUnit& trap, uint32_t instr) {
     uint32_t f3 = (instr >> 12) & 0x7;
     uint32_t fn = (instr >> 20) & 0xFFF;
-    if      (f3 == 0 && fn == 0x000) do_trap(cpu, trap,                            // ECALL
-                 trap.priv == PRIV_M ? CAUSE_ECALL_M : CAUSE_ECALL_U, 0);
-    else if (f3 == 0 && fn == 0x001) do_trap(cpu, trap, CAUSE_EBREAK, cpu.pc);     // EBREAK
-    else                             do_trap(cpu, trap, CAUSE_ILLEGAL, instr);    // illegal
+    if (f3 == 0 && fn == 0x000) {
+        do_trap(cpu, trap,                                                          // ECALL
+                trap.priv == PRIV_M ? CAUSE_ECALL_M : CAUSE_ECALL_U, 0);
+        return;
+    }
+    if (f3 == 0 && fn == 0x001) {
+        do_trap(cpu, trap, CAUSE_EBREAK, cpu.pc);                                   // EBREAK
+        return;
+    }
+    // f3 == 0 with any other fn (MRET, SRET, WFI, SFENCE) -> still illegal.
+    if (f3 == 0) {
+        do_trap(cpu, trap, CAUSE_ILLEGAL, instr);
+        return;
+    }
+    // CSR encodings: csrrw/csrrs/csrrc + csrrwi/csrrsi/csrrci.
+    // Read the soft slot into rd, optionally write the new value back.
+    uint32_t rd  = (instr >> 7)  & 0x1F;
+    uint32_t rs1 = (instr >> 15) & 0x1F;
+    uint32_t old = soft_csr[fn];
+    uint32_t src = (f3 & 4) ? rs1 : cpu.regs[rs1];      // immediate variants use rs1 as imm
+    uint32_t op  = f3 & 3;                              // 1=RW, 2=RS, 3=RC
+    bool write = (op == 1) || (rs1 != 0);               // CSRRS/CSRRC with rs1==0 is read-only
+    if (write) {
+        uint32_t nv = (op == 1) ? src
+                    : (op == 2) ? (old |  src)
+                                : (old & ~src);
+        soft_csr[fn] = nv;
+    }
+    if (rd) cpu.regs[rd] = old;
+    cpu.pc += 4;
 }
 
 // Sample the host interrupt pins. If one is enabled and pending, take the

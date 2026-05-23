@@ -37,3 +37,27 @@ int fputc(int c, FILE *stream);
 
 /* ── Formatted input (stub — returns 0) ───────────────────────────── */
 int sscanf(const char *str, const char *fmt, ...);
+
+/* ── File streams (implementations vary per example) ──────────────── */
+typedef long fpos_t;
+#define BUFSIZ 8192
+
+FILE *fopen(const char *path, const char *mode);
+int   fclose(FILE *stream);
+size_t fread(void *ptr, size_t size, size_t n, FILE *stream);
+size_t fwrite(const void *ptr, size_t size, size_t n, FILE *stream);
+int   fseek(FILE *stream, long offset, int whence);
+long  ftell(FILE *stream);
+void  rewind(FILE *stream);
+int   feof(FILE *stream);
+int   ferror(FILE *stream);
+int   fflush(FILE *stream);
+int   fgetc(FILE *stream);
+char *fgets(char *s, int size, FILE *stream);
+int   fprintf(FILE *stream, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+int   fscanf(FILE *stream, const char *fmt, ...);
+int   vfprintf(FILE *stream, const char *fmt, va_list ap);
+int   getc(FILE *stream);
+int   ungetc(int c, FILE *stream);
+int   remove(const char *path);
+int   rename(const char *old_, const char *new_);

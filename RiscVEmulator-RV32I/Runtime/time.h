@@ -38,3 +38,9 @@ struct tm  *gmtime(const time_t *timep);
 char       *asctime(const struct tm *tm);
 char       *ctime(const time_t *timep);
 time_t      mktime(struct tm *tm);
+
+/* Reentrant variants + strftime — used by tyrquake's buildinfo. */
+struct tm  *gmtime_r(const time_t *timep, struct tm *result);
+struct tm  *localtime_r(const time_t *timep, struct tm *result);
+typedef __SIZE_TYPE__ size_t;
+size_t      strftime(char *s, size_t max, const char *fmt, const struct tm *tm);

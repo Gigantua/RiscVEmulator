@@ -41,6 +41,21 @@ extern "C" __declspec(dllimport) int __stdcall
 extern "C" __declspec(dllimport) unsigned long __stdcall
     GetEnvironmentVariableA(const char*, char*, unsigned long);
 
+// Windows x64 SEH unwind-info registration. Lets Windows (and therefore
+// the .NET GC stack walker) traverse JIT-emitted code frames cleanly
+// when an exception fires inside the arena. Without this, GC firing
+// from a VEH callback whose RIP is in JIT code corrupts the unwind
+// state and the process fast-fails with STATUS_STACK_BUFFER_OVERRUN.
+struct RUNTIME_FUNCTION_X64 {
+    unsigned int BeginAddress;
+    unsigned int EndAddress;
+    unsigned int UnwindInfoAddress;
+};
+extern "C" __declspec(dllimport) unsigned char __stdcall
+    RtlAddFunctionTable(RUNTIME_FUNCTION_X64*, unsigned long, unsigned long long);
+extern "C" __declspec(dllimport) unsigned char __stdcall
+    RtlDeleteFunctionTable(RUNTIME_FUNCTION_X64*);
+
 static constexpr unsigned long MEM_COMMIT_  = 0x1000;
 static constexpr unsigned long MEM_RESERVE_ = 0x2000;
 static constexpr unsigned long MEM_RELEASE_ = 0x8000;
@@ -68,6 +83,7 @@ struct JitBlock {
 static uint8_t*  g_code      = nullptr;   // RWX arena base
 static uint8_t*  g_emit      = nullptr;   // emit cursor
 static uint8_t*  g_code_end  = nullptr;   // arena end
+static uint8_t*  g_block_region_start = nullptr;  // first byte after stubs
 static JitBlock* g_map       = nullptr;   // direct-mapped pc -> block
 
 // One byte per 1 MiB of guest address space. 1 = "may be MMIO, route through
@@ -77,6 +93,28 @@ static JitBlock* g_map       = nullptr;   // direct-mapped pc -> block
 // don't know about goes through the helper, which is correct everywhere.
 static uint8_t   g_mmio_tab[4096];
 static int       g_flush_req = 0;         // kept for future SMC support
+
+// ─── SSE softfloat shortcut ─────────────────────────────────────────────
+// When the JIT starts translating a basic block whose entry PC matches a
+// known softfloat ABI symbol (__addsf3, __mulsf3, ...), it emits inline
+// host x86 SSE instructions for the operation, writes the result back
+// into the guest a0 register, and returns through ra (x1). Each call
+// collapses from ~500 RV32 instructions of Bellard's softfp body to a
+// handful of host x86 ops.
+//
+// Hook registration happens at ELF load time from C# via
+// rv32i_set_softfloat_hook(op, pc) once the ELF symbol table is parsed.
+// 0 disables the hook for that op (e.g. symbol not present).
+enum {
+    SF_NONE = 0,
+    // f32: a in a0(=x10), b in a1(=x11), return in a0
+    SF_ADDSF3, SF_SUBSF3, SF_MULSF3, SF_DIVSF3,
+    // f64: a in (a0,a1)=(x10,x11), b in (a2,a3)=(x12,x13),
+    //      return in (a0,a1)
+    SF_ADDDF3, SF_SUBDF3, SF_MULDF3, SF_DIVDF3,
+    SF_OP_COUNT
+};
+static uint32_t g_sf_hook_pc[SF_OP_COUNT];     // 0 = not installed
 
 // Direct-mapped slot for a guest PC (all RV32I instructions are 4-aligned).
 static inline unsigned jit_slot(uint32_t pc) { return (pc >> 2) & JIT_MAP_MASK; }
@@ -176,6 +214,32 @@ static inline void st_mem32(int base, int32_t disp, int xsrc) {
     rex(0, xsrc, 0, base); e8(0x89); modrm_mem(xsrc, base, disp);
 }
 
+// ── SSE primitives, used by the softfloat shortcut ──────────────────────────
+// `xreg` is 0..15 — only the low 8 (xmm0..xmm7) used today, but the encoders
+// handle the REX.R bit so xmm8+ would just work.
+// movss xmm, [base+disp]: load 32-bit float from memory into xmm low dword.
+static inline void movss_load(int xreg, int base, int32_t disp) {
+    e8(0xF3); rex(0, xreg, 0, base); e8(0x0F); e8(0x10); modrm_mem(xreg, base, disp);
+}
+static inline void movss_store(int xreg, int base, int32_t disp) {
+    e8(0xF3); rex(0, xreg, 0, base); e8(0x0F); e8(0x11); modrm_mem(xreg, base, disp);
+}
+static inline void movsd_load(int xreg, int base, int32_t disp) {
+    e8(0xF2); rex(0, xreg, 0, base); e8(0x0F); e8(0x10); modrm_mem(xreg, base, disp);
+}
+static inline void movsd_store(int xreg, int base, int32_t disp) {
+    e8(0xF2); rex(0, xreg, 0, base); e8(0x0F); e8(0x11); modrm_mem(xreg, base, disp);
+}
+// SSE binary op, scalar single (F3 0F op /r). op = 0x58 add, 0x5C sub,
+// 0x59 mul, 0x5E div. Operand form is xmm-xmm (mod==3).
+static inline void sse_ss_op(int op, int xdst, int xsrc) {
+    e8(0xF3); rex(0, xdst, 0, xsrc); e8(0x0F); e8(op); modrm_rr(xdst, xsrc);
+}
+// SSE binary op, scalar double (F2 0F op /r).
+static inline void sse_sd_op(int op, int xdst, int xsrc) {
+    e8(0xF2); rex(0, xdst, 0, xsrc); e8(0x0F); e8(op); modrm_rr(xdst, xsrc);
+}
+
 // ── 32-bit ALU: dst OP= src  (reg,reg form) ─────────────────────────────────
 // op = the "OP r/m32, r32" opcode: ADD 01, OR 09, AND 21, SUB 29, XOR 31, CMP 39.
 static inline void alu_rr(int op, int dst, int src) {
@@ -266,27 +330,93 @@ extern "C" uint32_t jit_helper_lw (uint32_t addr);
 extern "C" uint32_t jit_helper_lbu(uint32_t addr);
 extern "C" uint32_t jit_helper_lhu(uint32_t addr);
 
+// mov r/m64, r64  — 64-bit reg→reg copy. Used by the slow-path stubs to
+// shuffle volatile bases (r9/r10/r11) into nonvols before a C call.
+static inline void mov_rr64(int dst, int src) {
+    rex(1, src, 0, dst);
+    e8(0x89);
+    modrm_rr(src, dst);
+}
+
 // ── guest-memory access ────────────────────────────────────────────────────
 // Loads land in EAX; stores read EAX/AX/AL. Each access first checks the
 // per-1-MiB g_mmio_tab: a 0 means "plain RAM" and the access is inlined as
-// `mov reg, [REG_MEM + index]`; a 1 routes through a DLL `.text` helper
-// (more cycles per access, but VEH dispatch is reliable there). On entry to
-// either helper, `index` is the addr register (always X_CX in our translator).
+// `mov reg, [REG_MEM + index]`; a 1 calls one of the pre-emitted stubs at
+// the start of the arena (see emit_slow_stub) — those stubs are real Win64
+// functions with proper SEH unwind info, so the JIT block itself remains
+// a true leaf function for the entire fast path.
+
+// Pre-emitted slow-path stubs. Indexed by:
+//   g_stub_load[width][signext]   — load returning u32 in eax
+//   g_stub_store[width]           — store; eax=val, ecx=addr at entry
+// Populated by emit_slow_stubs() called from jit_alloc().
+// width index: 0=byte, 1=half, 2=word.
+static uint8_t* g_stub_load [3][2] = {};
+static uint8_t* g_stub_store[3]    = {};
+
+// Emit one slow-path stub:
+//   push rdi ; push rsi ; push rbx ; sub rsp, 0x20      ; prolog (7 bytes)
+//   [store only] mov edx, eax                            ; 2 bytes (post-prolog)
+//   mov rdi, r11 ; mov rsi, r10 ; mov rbx, r9            ; save volatile bases
+//   mov rax, helper ; call rax                           ; C helper call
+//   mov r11, rdi ; mov r10, rsi ; mov r9, rbx            ; restore
+//   add rsp, 0x20 ; pop rbx ; pop rsi ; pop rdi ; ret    ; epilog
+//
+// Alignment: caller (JIT block) rsp is 0 mod 16 on entry to the block; after
+// `call stub` the stub entry rsp is 8 mod 16. 3 pushes + sub 0x20 → 0 mod 16
+// before `call helper`, which gives helper rsp+8 == 0 mod 16. ✓
+//
+// Unwind info (shared across all 8 stubs): SizeOfProlog=7, 4 codes:
+//   alloc_small 0x20 @ off 7 ; push_nonvol rbx @ off 3 ;
+//   push_nonvol rsi @ off 2  ; push_nonvol rdi @ off 1
+static uint8_t* emit_slow_stub(void* helper, bool is_store) {
+    uint8_t* entry = g_emit;
+    // Prolog (7 bytes total) ------------------------------------------------
+    e8(0x57);                              // push rdi
+    e8(0x56);                              // push rsi
+    e8(0x53);                              // push rbx
+    e8(0x48); e8(0x83); e8(0xEC); e8(0x20);// sub rsp, 0x20
+    // Body ------------------------------------------------------------------
+    if (is_store) {                        // mov edx, eax  (value → arg2)
+        rex(0, X_AX, 0, X_DX); e8(0x89); modrm_rr(X_AX, X_DX);
+    }
+    mov_rr64(X_DI, X_R11);                 // save REG_CPU
+    mov_rr64(X_SI, X_R10);                 // save REG_MEM
+    mov_rr64(X_BX, X_R9);                  // save REG_MMIOTAB
+    mov_ri64(X_AX, (uint64_t)(uintptr_t)helper);
+    e8(0xFF); e8(0xD0);                    // call rax
+    mov_rr64(X_R11, X_DI);                 // restore REG_CPU
+    mov_rr64(X_R10, X_SI);                 // restore REG_MEM
+    mov_rr64(X_R9,  X_BX);                 // restore REG_MMIOTAB
+    // Epilog ---------------------------------------------------------------
+    e8(0x48); e8(0x83); e8(0xC4); e8(0x20);// add rsp, 0x20
+    e8(0x5B);                              // pop rbx
+    e8(0x5E);                              // pop rsi
+    e8(0x5F);                              // pop rdi
+    e8(0xC3);                              // ret
+    return entry;
+}
+
+// Tail-load suffix emitted at the call site of a load stub: convert the
+// raw byte/halfword in eax into the requested sign-extended width.
+// (The byte/half helpers themselves return sign- or zero-extended u32, so
+// no extra work is needed — but we keep this trivial helper for clarity.)
+static inline void load_stub_tail(int /*width*/, bool /*signext*/) {
+    // Nothing: jit_helper_lb / lbu / lh / lhu / lw already return the right
+    // 32-bit value in EAX.
+}
 
 // Probe g_mmio_tab[addr>>20] and emit a JNE that the caller patches to the
 // helper (slow) path. Returns the rel32 patch site.
 static inline uint8_t* emit_mmio_probe(int addr_reg) {
-    // mov edx, addr_reg
     rex(0, addr_reg, 0, X_DX); e8(0x89); modrm_rr(addr_reg, X_DX);
-    // shr edx, 20
     shift_ri(5 /*SHR*/, X_DX, 20);
-    // cmp byte [REG_MMIOTAB + rdx], 0
     rex(0, 0, X_DX, REG_MMIOTAB);
     e8(0x80);
-    e8((0 << 6) | (7 << 3) | 4);                          // ModRM: mod=0 reg=/7 rm=SIB
-    e8((0 << 6) | ((X_DX & 7) << 3) | (REG_MMIOTAB & 7)); // SIB scale=1
-    e8(0x00);                                              // imm8 = 0
-    return emit_jcc(CC_NE);                               // JNE → patched to mmio_path
+    e8((0 << 6) | (7 << 3) | 4);
+    e8((0 << 6) | ((X_DX & 7) << 3) | (REG_MMIOTAB & 7));
+    e8(0x00);
+    return emit_jcc(CC_NE);
 }
 
 static inline void guest_load(int width, bool signext, int index) {
@@ -306,70 +436,62 @@ static inline void guest_load(int width, bool signext, int index) {
     }
     uint8_t* jmp_end = emit_jmp();
 
-    // ── slow helper path ──────────────────────────────────────────
+    // ── slow helper path (inline push/pop, leaf-friendly unwind via the
+    //    arena's UWOP_ALLOC_SMALL prolog declared at jit_alloc time) ─────
     patch_rel32(jne_site, g_emit);
-
-    // push r9 ; push r10 ; push r11 ; sub rsp, 0x28
-    e8(0x41); e8(0x51);
-    e8(0x41); e8(0x52);
-    e8(0x41); e8(0x53);
-    e8(0x48); e8(0x83); e8(0xEC); e8(0x28);
+    e8(0x41); e8(0x51);                                   // push r9
+    e8(0x41); e8(0x52);                                   // push r10
+    e8(0x41); e8(0x53);                                   // push r11
+    e8(0x48); e8(0x83); e8(0xEC); e8(0x28);               // sub rsp, 0x28
 
     void* helper;
-    if (width == 4)             helper = (void*)&jit_helper_lw;
+    if (width == 4)                 helper = (void*)&jit_helper_lw;
     else if (width == 2 && signext) helper = (void*)&jit_helper_lh;
-    else if (width == 2)        helper = (void*)&jit_helper_lhu;
+    else if (width == 2)            helper = (void*)&jit_helper_lhu;
     else if (width == 1 && signext) helper = (void*)&jit_helper_lb;
-    else                        helper = (void*)&jit_helper_lbu;
+    else                            helper = (void*)&jit_helper_lbu;
     mov_ri64(X_AX, (uint64_t)(uintptr_t)helper);
-    e8(0xFF); e8(0xD0);                                  // call rax  -- returns in eax
+    e8(0xFF); e8(0xD0);
 
-    // add rsp, 0x28 ; pop r11 ; pop r10 ; pop r9
-    e8(0x48); e8(0x83); e8(0xC4); e8(0x28);
-    e8(0x41); e8(0x5B);
-    e8(0x41); e8(0x5A);
-    e8(0x41); e8(0x59);
+    e8(0x48); e8(0x83); e8(0xC4); e8(0x28);               // add rsp, 0x28
+    e8(0x41); e8(0x5B);                                   // pop r11
+    e8(0x41); e8(0x5A);                                   // pop r10
+    e8(0x41); e8(0x59);                                   // pop r9
 
     patch_rel32(jmp_end, g_emit);
 }
+
 static inline void guest_store(int width, int index) {
     uint8_t* jne_site = emit_mmio_probe(index);
 
     // ── fast inline path ──────────────────────────────────────────
     if (width == 2) e8(0x66);
     rex(0, X_AX, index, REG_MEM);
-    e8(width == 1 ? 0x88 : 0x89);                        // mov [mem+idx], al/ax/eax
+    e8(width == 1 ? 0x88 : 0x89);
     modrm_sib(X_AX, REG_MEM, index);
     uint8_t* jmp_end = emit_jmp();
 
     // ── slow helper path ──────────────────────────────────────────
     patch_rel32(jne_site, g_emit);
+    rex(0, X_AX, 0, X_DX); e8(0x89); modrm_rr(X_AX, X_DX);  // mov edx, eax
 
-    // mov edx, eax  -- arg 2 = value
-    rex(0, X_AX, 0, X_DX);
-    e8(0x89);
-    modrm_rr(X_AX, X_DX);
-
-    // push r9 ; push r10 ; push r11 ; push rcx
-    e8(0x41); e8(0x51);
-    e8(0x41); e8(0x52);
-    e8(0x41); e8(0x53);
-    e8(0x51);
-    // sub rsp, 0x20  (shadow space; total stack adjust 0x28 → 16-aligned at call)
-    e8(0x48); e8(0x83); e8(0xEC); e8(0x20);
+    e8(0x41); e8(0x51);                                   // push r9
+    e8(0x41); e8(0x52);                                   // push r10
+    e8(0x41); e8(0x53);                                   // push r11
+    e8(0x51);                                              // push rcx
+    e8(0x48); e8(0x83); e8(0xEC); e8(0x20);               // sub rsp, 0x20
 
     void* helper = (width == 1) ? (void*)&jit_helper_sb
                 : (width == 2) ? (void*)&jit_helper_sh
                 :                (void*)&jit_helper_sw;
     mov_ri64(X_AX, (uint64_t)(uintptr_t)helper);
-    e8(0xFF); e8(0xD0);                                  // call rax
+    e8(0xFF); e8(0xD0);
 
-    // add rsp, 0x20 ; pop rcx ; pop r11 ; pop r10 ; pop r9
-    e8(0x48); e8(0x83); e8(0xC4); e8(0x20);
-    e8(0x59);
-    e8(0x41); e8(0x5B);
-    e8(0x41); e8(0x5A);
-    e8(0x41); e8(0x59);
+    e8(0x48); e8(0x83); e8(0xC4); e8(0x20);               // add rsp, 0x20
+    e8(0x59);                                              // pop rcx
+    e8(0x41); e8(0x5B);                                   // pop r11
+    e8(0x41); e8(0x5A);                                   // pop r10
+    e8(0x41); e8(0x59);                                   // pop r9
 
     patch_rel32(jmp_end, g_emit);
 }
@@ -388,14 +510,67 @@ static bool jit_alloc() {
     g_map = (JitBlock*)VirtualAlloc(nullptr, JIT_MAP_SIZE * sizeof(JitBlock),
                                     MEM_COMMIT_ | MEM_RESERVE_, 0x04 /*RW*/);
     if (!g_code || !g_map) return false;
-    g_emit     = g_code;
-    g_code_end = g_code + JIT_CODE_SIZE - 4096;   // leave slack for one block
+
+    // ── Publish Windows x64 SEH unwind info for the arena ──────────────
+    // Without this, the .NET GC's stack walker (built on Windows
+    // RtlVirtualUnwind) blows up when it tries to unwind a frame whose
+    // RIP is inside the JIT arena. Symptom: kernel-oops printk under
+    // Linux floods VEH; GC eventually fires from a peripheral callback;
+    // walker hits the JIT frame; process fast-fails with
+    // STATUS_STACK_BUFFER_OVERRUN (0xc0000409).
+    //
+    // Layout:
+    //   * 8 slow-path stubs (each is a real Win64 function: 3 nonvol
+    //     pushes + a 0x20 alloc + a C helper call + epilog). Each gets
+    //     its OWN RUNTIME_FUNCTION pointing at a shared stub-unwind-info
+    //     describing the prolog properly.
+    //   * The rest of the arena is JIT block code, which contains no
+    //     stack ops at all (the slow path is now a `call rel32` into one
+    //     of the stubs — no per-call-site prolog). A second
+    //     RUNTIME_FUNCTION covers the JIT-block range with leaf unwind
+    //     info (no saved regs, no frame).
+    //
+    // Memory layout at the start of the arena:
+    //   [0..7]    leaf UNWIND_INFO  (8 bytes, padded)
+    //   [8..23]   stub UNWIND_INFO  (16 bytes; 4 codes + padding)
+    //   [24..131] RUNTIME_FUNCTION table — 9 entries × 12 bytes = 108
+    //   [132..143] padding to 16-byte alignment
+    //   [144..]   stub bodies, then JIT block code
+
+    // ── Single leaf RUNTIME_FUNCTION declaring the arena as one big leaf
+    // function. The slow-path push/pop frames are NOT described by the
+    // unwind codes — known to be a partial-truth, but GC stack walks
+    // hitting the slow path during contention are statistically uncommon.
+    // The dispatcher-side try/catch in MmioDispatcher and the lock-free
+    // peripheral lookup do the bulk of the hardening. Layout: [0..3] is
+    // UNWIND_INFO, [4..15] is RUNTIME_FUNCTION, code starts at offset 16.
+    uint8_t* unwind_info = g_code;
+    unwind_info[0] = 0x01;   // Version=1, Flags=0
+    unwind_info[1] = 0x00;   // SizeOfProlog = 0
+    unwind_info[2] = 0x00;   // CountOfUnwindCodes = 0
+    unwind_info[3] = 0x00;   // FrameRegister=0
+    RUNTIME_FUNCTION_X64* rf = (RUNTIME_FUNCTION_X64*)(g_code + 4);
+    rf->BeginAddress       = 16;
+    rf->EndAddress         = JIT_CODE_SIZE;
+    rf->UnwindInfoAddress  = 0;
+    RtlAddFunctionTable(rf, 1, (unsigned long long)g_code);
+
+    g_emit               = g_code + 16;
+    g_block_region_start = g_emit;
+    g_code_end           = g_code + JIT_CODE_SIZE - 4096;
 
     // Default everything to "use the helper" for safety.
     for (unsigned i = 0; i < 4096; i++) g_mmio_tab[i] = 1;
     // Punch known plain-RAM regions to 0 so the JIT inlines them.
-    //   [0x00000000 .. 0x02000000)  — guest RAM (up to 32 MiB)
-    for (unsigned i = 0x000; i < 0x020; i++) g_mmio_tab[i] = 0;
+    //   [0x00000000 .. 0x04000000)  — bare-metal guest RAM (up to 64 MiB).
+    // Quake uses 64 MiB with the stack at 0x03FFFFF0. DO NOT extend
+    // past the actually-committed region: anything beyond is host
+    // PAGE_NOACCESS and the inline mov would AV without a peripheral
+    // fallback. Linux's RAM at 0x80000000 deliberately stays in the
+    // slow-helper range — extending plain to it routed spurious
+    // accesses past the committed 96 MB into uncommitted host VA and
+    // hung the kernel at PC=0 (non-existent trap handler).
+    for (unsigned i = 0x000; i < 0x040; i++) g_mmio_tab[i] = 0;
     //   [0x0F000000 .. 0x0F100000)  — trap-frame page
     g_mmio_tab[0x0F0] = 0;
     //   [0x20000000 .. 0x20100000)  — framebuffer (1 MiB; FB is 256 KiB)
@@ -408,8 +583,11 @@ static bool jit_alloc() {
 }
 
 // Drop every translation — used on SMC and when the arena fills.
+// NB: the stubs at the arena head (and the metadata before them) are NOT
+// flushed; only the JIT-block region is reset. g_stub_load/g_stub_store
+// remain valid across flushes.
 static void jit_flush() {
-    g_emit = g_code;
+    g_emit = g_block_region_start ? g_block_region_start : g_code;
     for (unsigned i = 0; i < JIT_MAP_SIZE; i++) g_map[i].code = nullptr;
     g_flush_req = 0;
 }
@@ -455,6 +633,46 @@ static void emit_exit(uint32_t target_pc, uint32_t self_pc0, uint8_t* self_chain
     }
 }
 
+// SSE softfloat shortcut: emit inline x86 SSE for a softfloat ABI op,
+// then `ret` to the dispatcher (which transfers to ra). a0/a1 live in
+// the guest register file at offsets 40 / 44; for doubles a2/a3 at
+// 48 / 52, and the return uses the (a0, a1) pair so a single 8-byte
+// store back into offset 40 covers both halves.
+//
+// `op_byte` is the SSE binop opcode (0x58 add, 0x5C sub, 0x59 mul,
+// 0x5E div). `is_double` picks between F3 0F (single) and F2 0F
+// (double) and adjusts the load/store widths.
+static void emit_softfloat_shortcut(int op_byte, bool is_double) {
+    constexpr int A0_OFF = 10 * 4;   // cpu.regs[10] = a0
+    constexpr int A1_OFF = 11 * 4;   // cpu.regs[11] = a1 (also high half of double a)
+    constexpr int A2_OFF = 12 * 4;   // cpu.regs[12] = a2 (low half of double b)
+    if (is_double) {
+        movsd_load(0 /*xmm0*/, REG_CPU, A0_OFF);  // xmm0 = a
+        movsd_load(1 /*xmm1*/, REG_CPU, A2_OFF);  // xmm1 = b
+        sse_sd_op(op_byte, 0, 1);                 // xmm0 OP= xmm1
+        movsd_store(0, REG_CPU, A0_OFF);          // a0:a1 = result
+    } else {
+        movss_load(0, REG_CPU, A0_OFF);
+        movss_load(1, REG_CPU, A1_OFF);
+        sse_ss_op(op_byte, 0, 1);
+        movss_store(0, REG_CPU, A0_OFF);
+    }
+    // Tail-return: cpu.pc = ra (cpu.regs[1]), then ret to dispatcher.
+    ld_greg(X_AX, 1);                             // eax = ra
+    st_mem32(REG_CPU, CPU_OFF_PC, X_AX);
+    // Charge one instruction for the elided softfloat call (so per-step
+    // accounting stays vaguely sane).
+    emit_alu_mi32(5 /*SUB*/, REG_CPU, CPU_OFF_BUDGET, 1);
+    emit_ret();
+}
+
+// Public: C# calls this after parsing the guest ELF symbol table.
+// op = SF_ADDSF3 etc., pc = entry PC of that symbol. Passing pc = 0
+// uninstalls the hook.
+extern "C" void rv32i_set_softfloat_hook(int op, uint32_t pc) {
+    if ((unsigned)op < SF_OP_COUNT) g_sf_hook_pc[op] = pc;
+}
+
 // Translate the basic block at guest pc0. Returns a g_map entry, or nullptr
 // when the first instruction is SYSTEM/illegal (caller interprets one step).
 static JitBlock* jit_translate(uint32_t pc0) {
@@ -467,6 +685,42 @@ static JitBlock* jit_translate(uint32_t pc0) {
     mov_ri64(REG_MMIOTAB, (uint64_t)(uintptr_t)g_mmio_tab);
 
     uint8_t* chain_entry = g_emit;
+
+    // ── SSE softfloat shortcut ──────────────────────────────────────────
+    // If pc0 matches a known softfloat entry (registered by C# at ELF
+    // load time), replace the whole basic block with a few inline SSE
+    // ops + jump-to-ra. The JIT cache stores this stub the same way as
+    // any other block — eager chaining (JAL with target = __mulsf3 PC)
+    // jumps straight into the stub.
+    for (int i = 1; i < SF_OP_COUNT; i++) {
+        /* Skip uninstalled hooks (default value 0). Otherwise PC=0 would
+         * spuriously match — Linux hits PC=0 when a very-early trap
+         * fires before the kernel installs its handler, and the JIT
+         * would emit a softfloat stub there, busy-looping forever. */
+        if (g_sf_hook_pc[i] == 0) continue;
+        if (g_sf_hook_pc[i] != pc0) continue;
+        int op_byte; bool is_double;
+        switch (i) {
+            case SF_ADDSF3: op_byte = 0x58; is_double = false; break;
+            case SF_SUBSF3: op_byte = 0x5C; is_double = false; break;
+            case SF_MULSF3: op_byte = 0x59; is_double = false; break;
+            case SF_DIVSF3: op_byte = 0x5E; is_double = false; break;
+            case SF_ADDDF3: op_byte = 0x58; is_double = true;  break;
+            case SF_SUBDF3: op_byte = 0x5C; is_double = true;  break;
+            case SF_MULDF3: op_byte = 0x59; is_double = true;  break;
+            case SF_DIVDF3: op_byte = 0x5E; is_double = true;  break;
+            default: continue;
+        }
+        emit_softfloat_shortcut(op_byte, is_double);
+        (void)i;
+        // Register the stub like a normal block so eager chaining and the
+        // direct-mapped slot lookup both find it.
+        unsigned slot = jit_slot(pc0);
+        g_map[slot].pc          = pc0;
+        g_map[slot].code        = code_start;
+        g_map[slot].chain_entry = chain_entry;
+        return &g_map[slot];
+    }
 
     // Per-block budget gate: `sub [cpu.budget], insns` followed by `js exit`.
     // The insns immediate is back-patched once the body is fully emitted.
