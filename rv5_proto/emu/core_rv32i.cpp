@@ -218,7 +218,7 @@ EXPORT Core* core_create(uint8_t* mem, uint32_t entry_pc) {
     c->mem = mem;
     return c;
 }
-EXPORT bool     core_step    (Core* c)        { return do_step(*c); }
+EXPORT int      core_step    (Core* c)        { return do_step(*c) ? 1 : 0; }
 EXPORT void     core_run     (Core* c)        { while (do_step(*c)) {} }
 EXPORT void     core_destroy (Core* c)        { delete c; }
 EXPORT uint32_t core_get_pc  (Core* c)        { return c->pc; }

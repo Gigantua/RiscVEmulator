@@ -29,6 +29,7 @@ var cores = new (string Name, string Src, string Dll)[] {
     ("5op",  Path.Combine(emuDir, "core_5op.cpp"),  Path.Combine(buildDir, "rv32emu_5op.dll")),
     ("4op",  Path.Combine(emuDir, "core_4op.cpp"),  Path.Combine(buildDir, "rv32emu_4op.dll")),
     ("1op",  Path.Combine(emuDir, "core_1op.cpp"),  Path.Combine(buildDir, "rv32emu_1op.dll")),
+    ("1op+dec", Path.Combine(emuDir, "core_1op_decode.cpp"), Path.Combine(buildDir, "rv32emu_1op_decode.dll")),
     ("move", Path.Combine(emuDir, "core_move.cpp"), Path.Combine(buildDir, "rv32emu_move.dll")),
 };
 
@@ -127,7 +128,7 @@ if (hasTui) {
             ? (r.CrcOk ? "[ \x1b[32m✓\x1b[0m valid    ]" : "[ \x1b[31m✗\x1b[0m FAILED   ]")
             : (r.Status == "failed" ? "[ \x1b[31m✗\x1b[0m FAILED   ]" : $"[ · {r.Status,-8} ]");
         string fabricStr = r.Fabric > 0 ? $"{r.Fabric,14:N0} fab.cyc" : new string(' ', 22);
-        Console.WriteLine($"  {r.Name,-5} {status} PC=0x{r.Pc:x8}  {r.Ms,7:F1} ms  {r.Cycles,12:N0} cycles  {r.Uops,14:N0} uops  {fabricStr}");
+        Console.WriteLine($"  {r.Name,-7} {status} PC=0x{r.Pc:x8}  {r.Ms,7:F1} ms  {r.Cycles,12:N0} cycles  {r.Uops,14:N0} uops  {fabricStr}");
     }
 }
 
@@ -226,7 +227,7 @@ static (int written, int total) Render(CoreResult[] rs, int selected, bool[] exp
         string body = r.Status == "done"
             ? $"PC=0x{r.Pc:x8}  {r.Ms,7:F1} ms  {r.Cycles,12:N0} cycles  {r.Uops,14:N0} uops  " + (r.Fabric > 0 ? $"{r.Fabric,14:N0} fab.cyc" : new string(' ', 22))
             : (r.Status == "failed" ? r.Error ?? "(error)" : "...");
-        string row = $"{marker} {r.Name,-5} {statusPlain} {body}";
+        string row = $"{marker} {r.Name,-7} {statusPlain} {body}";
         string padded = Pad(row, width);
         // Wrap only the single-char symbol with color, after padding so the
         // visible width is unchanged.
@@ -335,11 +336,20 @@ static unsafe void RunCore(CoreResult r, byte[] image, uint hostCrc)
         ulong cycles = 0;
         ulong uopsCount = 0;
         ulong fabricCount = 0;
+        const long TIMEOUT_MS = 1000;
+        bool timedOut = false;
         var sw = Stopwatch.StartNew();
         fixed (byte* p = mem) {
             IntPtr core = create((IntPtr)p, 0);
             // Step in a loop so we get a uniform cycle count across cores.
-            while (step(core) != 0) cycles++;
+            // Poll the wall clock every 4096 steps to bound timeout cost.
+            while (step(core) != 0) {
+                cycles++;
+                if ((cycles & 0xFFF) == 0 && sw.ElapsedMilliseconds > TIMEOUT_MS) {
+                    timedOut = true;
+                    break;
+                }
+            }
             sw.Stop();
             pc = getPc(core);
             for (int i = 0; i < 32; i++) regs[i] = getReg(core, i);
@@ -410,7 +420,12 @@ static unsafe void RunCore(CoreResult r, byte[] image, uint hostCrc)
         } else {
             r.CrcOk = false;
         }
-        r.Status = "done";
+        if (timedOut) {
+            r.Error = $"timed out after {TIMEOUT_MS} ms ({cycles:N0} steps)";
+            r.Status = "failed";
+        } else {
+            r.Status = "done";
+        }
     } catch (Exception ex) {
         r.Error = ex.Message;
         r.FullLog = log.ToString() + "\n" + ex;
