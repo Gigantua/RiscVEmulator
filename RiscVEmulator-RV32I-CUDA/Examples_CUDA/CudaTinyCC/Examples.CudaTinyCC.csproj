@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Core\RiscVEmulator.Core.csproj" />
+    <!-- Build the CUDA core DLL (nvcc) before this project so the copy below
+         picks up a fresh build. ReferenceOutputAssembly=false: it's native. -->
+    <ProjectReference Include="..\..\Native\rv32i_cuda.vcxproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Examples.CudaTinyCC</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Copy the CUDA core DLL (built by nvcc / rv32i_cuda.vcxproj, Release) to
+       the output dir. cudart is statically linked, so no cudart64_*.dll is
+       needed alongside it. -->
+  <ItemGroup>
+    <!-- No Exists() condition: the rv32i_cuda ProjectReference builds the DLL
+         before this project's copy step runs, so the file is present even from
+         a clean tree. -->
+    <Content Include="..\..\Native\bin\Release\rv32i_cuda.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>rv32i_cuda.dll</Link>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+</Project>

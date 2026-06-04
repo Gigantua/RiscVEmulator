@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- CUDA port of the RV32I core -> rv32i_cuda.dll.
+
+       This is an NMake (Makefile) project that invokes nvcc directly rather
+       than the VS "CUDA NN.N" build customization. The customization passes
+       -ccbin "%(VCBinDir)", which this VS18 preview leaves empty (the standalone
+       MSVC toolset doesn't populate VCToolsInstallDir), so nvcc fails with
+       "Cannot find compiler '' in PATH". Driving nvcc ourselves through
+       vcvars64 is version-independent and matches the dev command in the docs.
+       cudart is linked statically -> no cudart64_*.dll needs shipping. -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{0C0DA000-1111-2222-3333-000000000001}</ProjectGuid>
+    <RootNamespace>rv32i_cuda</RootNamespace>
+    <Keyword>MakeFileProj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\cuda\$(Configuration)\</IntDir>
+    <!-- Resolve the VS dev environment (cl.exe in PATH for nvcc's host pass). -->
+    <VcVars>"$(VsInstallRoot)\VC\Auxiliary\Build\vcvars64.bat"</VcVars>
+    <VcVars Condition="'$(VsInstallRoot)'==''">"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"</VcVars>
+    <NvccArch Condition="'$(Configuration)'=='Debug'">-G -g</NvccArch>
+    <NvccArch Condition="'$(Configuration)'=='Release'">-O3</NvccArch>
+    <NMakeBuildCommandLine>call $(VcVars) &gt;nul 2&gt;&amp;1 &amp;&amp; nvcc $(NvccArch) -std=c++20 --expt-relaxed-constexpr -arch=sm_86 -shared -cudart static -o "$(OutDir)rv32i_cuda.dll" "$(ProjectDir)rv32i_cuda.cu"</NMakeBuildCommandLine>
+    <NMakeReBuildCommandLine>$(NMakeBuildCommandLine)</NMakeReBuildCommandLine>
+    <NMakeCleanCommandLine>if exist "$(OutDir)rv32i_cuda.dll" del /q "$(OutDir)rv32i_cuda.dll"</NMakeCleanCommandLine>
+    <NMakeOutput>$(OutDir)rv32i_cuda.dll</NMakeOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="rv32i_cuda.cu" />
+    <!-- Shared memory model + trap unit, #included by rv32i_cuda.cu and by the
+         runtime-generated JIT module (Core/Cuda/RvJitRuntime.cs). -->
+    <None Include="rv32i_jit_shared.cuh" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

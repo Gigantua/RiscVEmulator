@@ -1,0 +1,39 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Folder Name="/Native/">
+    <Project Path="Native\rv32i_core.vcxproj" />
+    <Project Path="Native\rv32i_cuda.vcxproj" />
+    <Project Path="Native\slirp_bridge.vcxproj" />
+  </Folder>
+  <Folder Name="/Examples/">
+    <Project Path="Examples\Runner\Examples.Runner.csproj" />
+    <Project Path="Examples\Doom\Examples.Doom.csproj" />
+    <Project Path="Examples\Video\Examples.Video.csproj" />
+    <Project Path="Examples\Sound\Examples.Sound.csproj" />
+    <Project Path="Examples\Input\Examples.Input.csproj" />
+    <Project Path="Examples\Voxel\Examples.Voxel.csproj" />
+    <Project Path="Examples\TinyCC\Examples.TinyCC.csproj" />
+    <Project Path="Examples\Linux\Examples.Linux.csproj" />
+    <Project Path="Examples\Midi\Examples.Midi.csproj" />
+    <Project Path="Examples\Mp4Player\Examples.Mp4Player.csproj" />
+    <Project Path="Examples\Quake\Examples.Quake.csproj" />
+    <Project Path="Examples\Linux.Build_RV32i\Examples.Linux.Build_RV32i.csproj" />
+    <Project Path="Examples\Linux.Packageserver\Examples.Linux.Packageserver.csproj" />
+  </Folder>
+  <Folder Name="/Examples_CUDA/">
+    <Project Path="Examples_CUDA\CudaTinyCC\Examples.CudaTinyCC.csproj" />
+    <Project Path="Examples_CUDA\CudaPeriphTest\Examples.CudaPeriphTest.csproj" />
+    <Project Path="Examples_CUDA\CudaVoxel\Examples.CudaVoxel.csproj" />
+    <Project Path="Examples_CUDA\CudaGfx\Examples.CudaGfx.csproj" />
+    <Project Path="Examples_CUDA\CudaBench\Examples.CudaBench.csproj" />
+    <Project Path="Examples_CUDA\CudaDoom\Examples.CudaDoom.csproj" />
+  </Folder>
+  <Project Path="Core\RiscVEmulator.Core.csproj" />
+  <Project Path="Frontend\RiscVEmulator.Frontend.csproj" />
+  <Project Path="RiscVEmulator.Tests\RiscVEmulator.Tests.csproj" />
+</Solution>
