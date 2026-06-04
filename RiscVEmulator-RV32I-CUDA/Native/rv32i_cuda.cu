@@ -337,9 +337,10 @@ static int        g_l2advise_dirty = 1; // 1 → (re)apply residency hints on ne
 // Failures are swallowed — advice is best-effort by design.
 static void l2_advise_buf(void* p, size_t bytes, int dev, bool readMostly) {
     if (!p || bytes == 0) return;
-    if (readMostly) cudaMemAdvise(p, bytes, cudaMemAdviseSetReadMostly, dev);
-    cudaMemAdvise(p, bytes, cudaMemAdviseSetPreferredLocation, dev);
-    cudaMemPrefetchAsync(p, bytes, dev, 0);
+    cudaMemLocation loc; loc.type = cudaMemLocationTypeDevice; loc.id = dev;
+    if (readMostly) cudaMemAdvise(p, bytes, cudaMemAdviseSetReadMostly, loc);
+    cudaMemAdvise(p, bytes, cudaMemAdviseSetPreferredLocation, loc);
+    cudaMemPrefetchAsync(p, bytes, loc, 0, (cudaStream_t)0);
 }
 
 // Apply residency hints to the whole per-core CPU working set + shared code
