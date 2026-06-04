@@ -469,6 +469,64 @@ static constexpr int32_t s_imm(uint32_t i) {
     return ((int32_t)(i & 0xFE000000) >> 20) | (int32_t)((i >> 7) & 0x1Fu);
 }
 
+// ── Branchless primitives (BOOL branch-eliminator experiment) ──
+//
+// These compute the BRANCH-condition and the OP/OP-IMM ALU result with no
+// data-dependent control flow, so ptxas keeps the warp converged on the hot
+// integer path (the common case: every lane in a warp running the same image
+// usually executes the SAME opcode, but f3 still varies and the nested
+// switch(f3) is what ptxas had to lower to a jump table / chained branch).
+//
+// Bit-exactness: each select below is the algebraic identity of the
+// corresponding switch arm. `?:` over scalars is just an x86/PTX select
+// (no branch). The full f3∈[0..7] arithmetic mux is computed unconditionally
+// and the right lane is picked by index — same value the switch produced,
+// no observable side effects (pure register math, no memory touched).
+
+// BRANCH taken predicate, branchless over f3.
+static __device__ __forceinline__ int branch_taken_bl(uint32_t f3,
+        uint32_t u1, uint32_t u2, int32_t s1, int32_t s2) {
+    // f3: 0 BEQ 1 BNE 4 BLT 5 BGE 6 BLTU 7 BGEU. f3 bit2 selects signed-vs-
+    // unsigned LT family; bit0 inverts (NE/GE). bit1 selects EQ-family vs
+    // LT-family. Compute the two base predicates then mux.
+    int eq = (u1 == u2);                  // EQ result (f3 0/1)
+    int lt = (f3 & 4u) ? (u1 < u2)        // unsigned LT (f3 6/7)
+                       : (s1 < s2);       // signed   LT (f3 4/5)
+    // bit2 set ⇒ LT family (4..7); bit2 clear ⇒ EQ family (0/1).
+    int base = (f3 & 4u) ? lt : eq;
+    int taken = base ^ (int)(f3 & 1u);    // bit0 inverts (NE, BGE, BGEU)
+    return taken;
+}
+
+// OP / OP-IMM ALU mux, branchless over f3. `arg2` is rs2 (OP) or imm (OP-IMM);
+// `sh` is the 5-bit shift amount. `sub` selects SUB over ADD (only OP with
+// f7==0x20,f3==0 — OP-IMM ADDI is ALWAYS add, so callers pass sub=false there).
+// `sra` selects SRA over SRL (f7==0x20, f3==5, both OP and OP-IMM).
+static __device__ __forceinline__ uint32_t alu_bl(uint32_t f3,
+        uint32_t u1, int32_t s1, uint32_t arg2u, int32_t arg2s,
+        uint32_t sh, bool sub, bool sra) {
+    // Compute every arm; index-select the live one. ptxas turns this into a
+    // straight run of ALU ops + selects (no divergent branch).
+    uint32_t add = sub ? (u1 - arg2u) : (u1 + arg2u);       // f3 0
+    uint32_t sll = u1 << sh;                                // f3 1
+    uint32_t slt = (uint32_t)(s1 < arg2s);                  // f3 2
+    uint32_t sltu= (uint32_t)(u1 < arg2u);                  // f3 3
+    uint32_t xr  = u1 ^ arg2u;                              // f3 4
+    uint32_t sr  = sra ? (uint32_t)(s1 >> sh) : (u1 >> sh); // f3 5
+    uint32_t orr = u1 | arg2u;                              // f3 6
+    uint32_t andr= u1 & arg2u;                              // f3 7
+    // 8-way select by a clean 3-bit decode (each ?: is a PTX selp, no branch):
+    //   0 add 1 sll 2 slt 3 sltu 4 xor 5 sr 6 or 7 and
+    uint32_t e0 = (f3 & 4u) ? xr  : add;   // 0->add 4->xor
+    uint32_t e1 = (f3 & 4u) ? sr  : sll;   // 1->sll 5->sr
+    uint32_t e2 = (f3 & 4u) ? orr : slt;   // 2->slt 6->or
+    uint32_t e3 = (f3 & 4u) ? andr: sltu;  // 3->sltu 7->and
+    uint32_t res = (f3 & 1u) ? ((f3 & 2u) ? e3 : e1)
+                             : ((f3 & 2u) ? e2 : e0);
+    return res;
+}
+
+template<bool BRANCHLESS = true>
 static __device__ __forceinline__ CpuException cpu_step(Hart& cpu, CoreMem& mm, uint32_t instr) {
     const int      rd    = (instr >>  7) & 0x1F;
     const uint32_t f3    = (instr >> 12) & 0x7;
@@ -486,13 +544,20 @@ static __device__ __forceinline__ CpuException cpu_step(Hart& cpu, CoreMem& mm, 
     case 0x67: { uint32_t t = (uint32_t)(s1 + i_imm(instr)) & ~1u;               // JALR
                  cpu.regs[rd] = cpu.pc + 4; nextpc = t;                   break; }
     case 0x63: {                                                                 // BRANCH
-        int taken = 0;
-        switch (f3) {
-            case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
-            case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
-            case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
+        int taken;
+        if constexpr (BRANCHLESS) {
+            taken = branch_taken_bl(f3, u1, u2, s1, s2);
+        } else {
+            taken = 0;
+            switch (f3) {
+                case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
+                case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
+                case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
+            }
         }
-        if (taken) nextpc = cpu.pc + b_imm(instr);
+        // Branchless next-pc select: avoids the data-dependent `if (taken)`.
+        uint32_t tgt = cpu.pc + b_imm(instr);
+        nextpc = taken ? tgt : nextpc;
         break;
     }
     case 0x03: {                                                                 // LOAD
@@ -518,18 +583,28 @@ static __device__ __forceinline__ CpuException cpu_step(Hart& cpu, CoreMem& mm, 
     case 0x13: {                                                                 // OP-IMM
         const int32_t imm = i_imm(instr);
         const int     sh  = (instr >> 20) & 0x1F;
-        if ((f3 == 1 && f7 != 0x00) || (f3 == 5 && f7 != 0x00 && f7 != 0x20))
-            return { EXC_ILLEGAL, instr };
-        uint32_t r = 0;
-        switch (f3) {
-            case 0: r = (uint32_t)(s1 + imm);                         break;
-            case 1: r = u1 << sh;                                     break;
-            case 2: r = s1 < imm           ? 1u : 0u;                 break;
-            case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                 break;
-            case 4: r = u1 ^ (uint32_t)imm;                           break;
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh; break;
-            case 6: r = u1 | (uint32_t)imm;                           break;
-            case 7: r = u1 & (uint32_t)imm;                           break;
+        // Illegal-funct: SLLI must have f7==0; SRLI/SRAI f7∈{0,0x20}.
+        // Branchless predicate (bitwise OR of the two violation flags) sets a
+        // single bool; the rare illegal case takes the cold return.
+        const bool bad = ((f3 == 1u) & (f7 != 0x00u))
+                       | ((f3 == 5u) & (f7 != 0x00u) & (f7 != 0x20u));
+        if (bad) return { EXC_ILLEGAL, instr };
+        uint32_t r;
+        if constexpr (BRANCHLESS) {
+            r = alu_bl(f3, u1, s1, (uint32_t)imm, imm, (uint32_t)sh,
+                       /*sub=*/false, /*sra=*/f7 == 0x20u);
+        } else {
+            r = 0;
+            switch (f3) {
+                case 0: r = (uint32_t)(s1 + imm);                         break;
+                case 1: r = u1 << sh;                                     break;
+                case 2: r = s1 < imm           ? 1u : 0u;                 break;
+                case 3: r = u1 < (uint32_t)imm ? 1u : 0u;                 break;
+                case 4: r = u1 ^ (uint32_t)imm;                           break;
+                case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh; break;
+                case 6: r = u1 | (uint32_t)imm;                           break;
+                case 7: r = u1 & (uint32_t)imm;                           break;
+            }
         }
         cpu.regs[rd] = r;
         break;
@@ -555,16 +630,21 @@ static __device__ __forceinline__ CpuException cpu_step(Hart& cpu, CoreMem& mm, 
         } else if (f7 != 0x00 && !(f7 == 0x20 && (f3 == 0 || f3 == 5))) {
             return { EXC_ILLEGAL, instr };
         } else {
-            const int sh = s2 & 0x1F;
-            switch (f3) {
-                case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
-                case 1: r = u1 << sh;                                              break;
-                case 2: r = s1 < s2 ? 1u : 0u;                                     break;
-                case 3: r = u1 < u2 ? 1u : 0u;                                     break;
-                case 4: r = u1 ^ u2;                                               break;
-                case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;          break;
-                case 6: r = u1 | u2;                                               break;
-                default:r = u1 & u2;                                               break;
+            const uint32_t sh = (uint32_t)(s2 & 0x1F);
+            if constexpr (BRANCHLESS) {
+                r = alu_bl(f3, u1, s1, u2, s2, sh,
+                           /*sub=*/f7 == 0x20u, /*sra=*/f7 == 0x20u);
+            } else {
+                switch (f3) {
+                    case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
+                    case 1: r = u1 << sh;                                              break;
+                    case 2: r = s1 < s2 ? 1u : 0u;                                     break;
+                    case 3: r = u1 < u2 ? 1u : 0u;                                     break;
+                    case 4: r = u1 ^ u2;                                               break;
+                    case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh;          break;
+                    case 6: r = u1 | u2;                                               break;
+                    default:r = u1 & u2;                                               break;
+                }
             }
         }
         cpu.regs[rd] = r;

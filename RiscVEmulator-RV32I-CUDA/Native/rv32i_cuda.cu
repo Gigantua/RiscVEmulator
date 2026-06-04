@@ -115,11 +115,18 @@ static __device__ __forceinline__ uint32_t fetch(Hart& c, CoreMem& m) {
     }
 }
 
+// BOOL branch-eliminator A/B switch. Default ON (branchless hot path). Define
+// RVCUDA_BRANCHLESS=0 at compile time to fall back to the switch-based baseline
+// for a head-to-head measurement (both paths are bit-exact — see PERF_BOOL.md).
+#ifndef RVCUDA_BRANCHLESS
+#define RVCUDA_BRANCHLESS 1
+#endif
+
 template<bool PF>
 static __device__ __forceinline__ void do_step(Hart& cpu, CoreMem& mm) {
     if (check_interrupts(cpu, mm)) return;
     if (cpu.pc == PV_RESUME_GATEWAY) { trap_return(cpu, mm); return; }
-    CpuException e = cpu_step(cpu, mm, fetch<PF>(cpu, mm));
+    CpuException e = cpu_step<RVCUDA_BRANCHLESS != 0>(cpu, mm, fetch<PF>(cpu, mm));
     if (e.kind == EXC_SYSTEM)       trap_system(cpu, mm, e.instr);
     else if (e.kind == EXC_ILLEGAL) do_trap(cpu, mm, CAUSE_ILLEGAL, e.instr);
 }
