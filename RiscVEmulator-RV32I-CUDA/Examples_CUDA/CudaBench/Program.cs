@@ -24,6 +24,7 @@ const string Lib = "rv32i_cuda";
 [DllImport(Lib)] static extern void   cuda_rv32i_set_fpdispatch(int on);
 [DllImport(Lib)] static extern void   cuda_rv32i_set_pico(int on);
 [DllImport(Lib)] static extern uint   cuda_rv32i_corestate_bytes();
+[DllImport(Lib)] static extern void   cuda_rv32i_set_l2advise(int on);
 [DllImport(Lib)] static extern int    cuda_rv32i_step_all(long budget);
 [DllImport(Lib)] static extern void   cuda_rv32i_shutdown();
 
@@ -150,11 +151,12 @@ if (args.Contains("--profile1"))
 // Run one config; returns (aggregate MIPS, verify-word = guest RAM[verifyAddr]).
 (double mips, uint verify) Run(in (byte[] elf,uint entry,uint lo,uint hi,byte[] img) g,
                                int cores, int block, bool shared, bool prefetch,
-                               long budget, uint verifyAddr)
+                               long budget, uint verifyAddr, int l2 = 1)
 {
     var image = new byte[RamBytes];
     ElfLoader.Load(g.elf, new ArrayBus(image));
     if (cuda_rv32i_init(cores, RamBytes, 64, 64, 4096) != 0) return (-1, 0);
+    cuda_rv32i_set_l2advise(l2);                 // Mott: L2-resident working set (1=ON, 0=baseline)
     for (int c = 0; c < cores; c++)
     {
         Marshal.Copy(image, 0, cuda_rv32i_ram_ptr(c), image.Length);
@@ -192,6 +194,41 @@ if (args.Contains("--profile1"))
     Console.WriteLine($"[correctness] bench guest, {b:N0} steps: prefetch OFF a[0]=0x{off.verify:X8}, " +
                       $"ON a[0]=0x{on.verify:X8}  →  {(ok ? "PASS" : "FAIL")}\n");
     if (!ok) return 1;
+}
+
+// ── 1b) Mott A/B: L2-resident working set (cudaMemAdvise + prefetch) ──
+// Bit-exact gate + MIPS A/B for the residency hints. Placement only, so the
+// verify word MUST match between baseline (l2=0) and advised (l2=1).
+{
+    Console.WriteLine("[mott/L2-advise] memory-residency hints (cudaMemAdvise ReadMostly +");
+    Console.WriteLine("                 PreferredLocation=device + prefetch). Placement only — bit-exact.");
+    Console.WriteLine("  config                guest      L2advise   MIPS/core   verify        speedup");
+    Console.WriteLine("  ──────────────────    ───────    ────────   ─────────   ──────────    ───────");
+    foreach (var (g, name) in new[] { (comp, "compute"), (bench, "data") })
+    {
+        // Single-core latency A/B (the case Mott targets: one lane, fetch stall).
+        var baseR = Run(g, 1, 1, true, false, 300_000, 0x4000, l2: 0);
+        var l2R   = Run(g, 1, 1, true, false, 300_000, 0x4000, l2: 1);
+        bool ok = baseR.verify == l2R.verify;
+        Console.WriteLine($"  single-core (1)       {name,-7}    off       {baseR.mips,9:F2}   0x{baseR.verify:X8}");
+        Console.WriteLine($"  single-core (1)       {name,-7}    on        {l2R.mips,9:F2}   0x{l2R.verify:X8}    " +
+                          $"{l2R.mips / Math.Max(baseR.mips, 1e-9),6:F2}x  {(ok ? "BIT-EXACT" : "MISMATCH!")}");
+        if (!ok) { Console.Error.WriteLine($"[mott] L2-advise changed results for {name} — ABORT"); return 1; }
+    }
+    // Many-core throughput A/B (working set spans many per-core RAMs → DRAM
+    // pressure is real; capped at 4096 cores / ≤256 MB per the safety rule).
+    {
+        long b = 60_000;
+        var baseR = Run(comp, 4096, 256, true, false, b, 0x4000, l2: 0);
+        var l2R   = Run(comp, 4096, 256, true, false, b, 0x4000, l2: 1);
+        bool ok = baseR.verify == l2R.verify;
+        Console.WriteLine($"  multi-core (4096x256) compute    off       {baseR.mips,9:F0}   0x{baseR.verify:X8}");
+        Console.WriteLine($"  multi-core (4096x256) compute    on        {l2R.mips,9:F0}   0x{l2R.verify:X8}    " +
+                          $"{l2R.mips / Math.Max(baseR.mips, 1e-9),6:F2}x  {(ok ? "BIT-EXACT" : "MISMATCH!")}");
+        if (!ok) { Console.Error.WriteLine("[mott] L2-advise changed multi-core results — ABORT"); return 1; }
+    }
+    cuda_rv32i_set_l2advise(1);   // restore the default for the sections below
+    Console.WriteLine();
 }
 
 // ── 2) Single-core latency: prefetch OFF vs ON ──

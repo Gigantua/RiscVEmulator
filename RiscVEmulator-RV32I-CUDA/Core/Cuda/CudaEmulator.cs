@@ -50,6 +50,8 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern void cuda_rv32i_set_prefetch(int on);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_pico(int on);
         [DllImport(Lib)] private static extern uint cuda_rv32i_corestate_bytes();
+        [DllImport(Lib)] private static extern void cuda_rv32i_set_l2advise(int on);
+        [DllImport(Lib)] private static extern int  cuda_rv32i_get_l2advise();
         [DllImport(Lib)] private static extern int  cuda_rv32i_step_all(long budget);
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_state_ptr();
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_mem_ptr();
@@ -106,6 +108,20 @@ namespace RiscVEmulator.Core.Cuda
         /// cp.async-prefetched, hiding the ~530-cycle fetch latency. Best for
         /// single-/few-guest latency (e.g. one Doom instance). Implies shared code.</summary>
         public bool EnablePrefetch { get; set; }
+
+        /// <summary>Mott — L2-resident working set. When true (the DLL default),
+        /// the CPU working set (CoreState[]/CoreMem[] + each core's RAM/trap/
+        /// peripheral page + the shared RO code image) is tagged device-preferred
+        /// (the code image additionally <c>ReadMostly</c>) and prefetched to the
+        /// GPU before launches, so the dependent-load fetch hits L2 instead of
+        /// fault-migrating from host DRAM. Pure placement hint — results are
+        /// bit-for-bit identical with it on or off. Set false to force the
+        /// original allocation behaviour (A/B baseline).</summary>
+        public bool L2Advise
+        {
+            get => cuda_rv32i_get_l2advise() != 0;
+            set => cuda_rv32i_set_l2advise(value ? 1 : 0);
+        }
 
         /// <summary>Translate this guest's code to native CUDA, nvcc-compile it
         /// into a per-guest JIT DLL, and run THAT kernel instead of the

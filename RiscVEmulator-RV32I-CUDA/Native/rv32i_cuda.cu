@@ -312,9 +312,55 @@ static CoreState* g_state  = nullptr;
 static CoreMem*   g_mem    = nullptr;
 static int        g_ncores = 0;
 static uint8_t*   g_code    = nullptr;  // shared RO code image (Tier 1b)
+static size_t     g_code_cap = 0;       // padded byte capacity of g_code
 static int        g_block   = MAX_BLOCK;// cores per block (occupancy / packing knob)
 static int        g_prefetch = 0;       // 1 → double-buffered shared instruction window
 static int        g_fpdispatch = 0;     // 1 → function-pointer opcode dispatch (experiment)
+static int        g_l2advise = 1;       // 1 → memory-residency hints (Mott; default ON)
+static int        g_l2advise_dirty = 1; // 1 → (re)apply residency hints on next step_all
+
+// ── L2-resident working set (Mott) ───────────────────────────────────────
+// A single GPU lane is dependent-load-latency-bound: the ~530-cycle stall is a
+// DRAM round-trip on every instruction fetch / register touch. The placement
+// attack is to keep the whole working set device-resident so accesses hit L2
+// (~200 cyc) instead of fault-migrating from host DRAM over PCIe.
+// cudaMallocManaged pages start with NO physical residency — the first device
+// touch faults them in over the bus, and under memory pressure they can migrate
+// back to host. We therefore:
+//   • tag the shared RO code image ReadMostly + PreferredLocation=device, so it
+//     is pinned/duplicated device-side (the guest never writes its own .text);
+//   • set PreferredLocation=device on each core's writable RAM/trap/periph; and
+//   • cudaMemPrefetchAsync every buffer to the device before the first launch,
+// so the working set is materialized in device memory up front and stays there
+// instead of fault-migrating mid-run. This is PURELY a placement hint: it can
+// never change a load/store result, so RV32IMA stays bit-for-bit identical.
+// Failures are swallowed — advice is best-effort by design.
+static void l2_advise_buf(void* p, size_t bytes, int dev, bool readMostly) {
+    if (!p || bytes == 0) return;
+    if (readMostly) cudaMemAdvise(p, bytes, cudaMemAdviseSetReadMostly, dev);
+    cudaMemAdvise(p, bytes, cudaMemAdviseSetPreferredLocation, dev);
+    cudaMemPrefetchAsync(p, bytes, dev, 0);
+}
+
+// Apply residency hints to the whole per-core CPU working set + shared code
+// image. No-op when g_l2advise==0, so the baseline path keeps the untouched
+// original allocation behaviour, bit-for-bit.
+static void l2_advise_all() {
+    if (!g_l2advise || !g_mem) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    l2_advise_buf(g_state, (size_t)g_ncores * sizeof(CoreState), dev, false);
+    l2_advise_buf(g_mem,   (size_t)g_ncores * sizeof(CoreMem),   dev, false);
+    for (int i = 0; i < g_ncores; i++) {
+        l2_advise_buf(g_mem[i].ram,  g_mem[i].ram_size, dev, false);
+        l2_advise_buf(g_mem[i].trap, TRAP_PAGE_SIZE,    dev, false);
+        l2_advise_buf(g_mem[i].per,  sizeof(Periph),    dev, false);
+        // fb/pcm are large and host-reconciled every launch; leave them unhinted
+        // so they don't evict the hot CPU working set from device residency.
+    }
+    if (g_code) l2_advise_buf(g_code, g_code_cap, dev, /*readMostly=*/true);
+    cudaDeviceSynchronize();
+}
 
 // PICO (state-minimizer) — soft-CSR backing-store allocation strategy. Both
 // strategies are BIT-EXACT (CSR[fn] reads/writes the identical word); they
@@ -421,7 +467,7 @@ API void cuda_rv32i_set_meip(int core, int level) {
 // span). `data`/`len` are the bytes at guest VA `lo`. Pass len==0 to disable.
 // Must be called after init (writes every core's CoreMem) and before stepping.
 API int cuda_rv32i_set_code(const void* data, unsigned int lo, unsigned int len) {
-    if (g_code) { cudaFree(g_code); g_code = nullptr; }
+    if (g_code) { cudaFree(g_code); g_code = nullptr; g_code_cap = 0; }
     if (len == 0) {
         for (int i = 0; i < g_ncores; i++) { g_mem[i].code = nullptr; g_mem[i].code_lo = 0; g_mem[i].code_hi = 0; }
         return 0;
@@ -431,9 +477,11 @@ API int cuda_rv32i_set_code(const void* data, unsigned int lo, unsigned int len)
     // SEC_BYTES block past the logical end without reading out of bounds.
     size_t cap = (len + SEC_BYTES - 1u) & ~((size_t)SEC_BYTES - 1u);
     if ((e = cudaMallocManaged(&g_code, cap)) != cudaSuccess) return (int)e;
+    g_code_cap = cap;
     memset(g_code, 0, cap);
     memcpy(g_code, data, len);
     for (int i = 0; i < g_ncores; i++) { g_mem[i].code = g_code; g_mem[i].code_lo = lo; g_mem[i].code_hi = lo + len; }
+    g_l2advise_dirty = 1;   // new code image: (re)hint it on the next step_all
     cudaDeviceSynchronize();
     return (int)cudaGetLastError();
 }
@@ -457,9 +505,21 @@ API int  cuda_rv32i_get_pico()       { return g_pico; }
 // (g_state[]) the kernel syncs at launch/exit. The smaller this is, the more
 // cores co-reside at a fixed VRAM budget. Useful for the CudaBench A/B printout.
 API unsigned int cuda_rv32i_corestate_bytes() { return (unsigned int)sizeof(CoreState); }
+// Mott — L2-resident working set. ON (default): hint the CPU working set
+// (state/mem/per-core ram/trap/periph + shared code) device-preferred and
+// prefetch it to the GPU before launches. OFF: original allocation behaviour
+// (baseline). Placement only — results are bit-for-bit identical either way.
+// Hints are re-applied lazily on the next step_all (set_code / set_l2advise
+// dirty the flag) so a toggle or a new code image always takes effect.
+API void cuda_rv32i_set_l2advise(int on) { g_l2advise = on ? 1 : 0; g_l2advise_dirty = 1; }
+API int  cuda_rv32i_get_l2advise()       { return g_l2advise; }
 
 API int cuda_rv32i_step_all(long long budget) {
     if (g_ncores <= 0) return 0;
+    // Mott — materialize the working set device-resident before the launch.
+    // Applied lazily (only when dirtied by set_l2advise / set_code) so the
+    // common many-launch run pays the advise/prefetch cost just once.
+    if (g_l2advise && g_l2advise_dirty) { l2_advise_all(); g_l2advise_dirty = 0; }
     int block = g_block;
     if (block > g_ncores) block = g_ncores;
     if (block < 1) block = 1;
@@ -572,7 +632,8 @@ API void cuda_rv32i_shutdown() {
     else if (g_state) {
         for (int i = 0; i < g_ncores; i++) cudaFree(g_state[i].soft_csr);
     }
-    if (g_code) { cudaFree(g_code); g_code = nullptr; }
+    if (g_code) { cudaFree(g_code); g_code = nullptr; g_code_cap = 0; }
     cudaFree(g_state); g_state = nullptr;
     g_ncores = 0;
+    g_l2advise_dirty = 1;   // next init starts fresh
 }
