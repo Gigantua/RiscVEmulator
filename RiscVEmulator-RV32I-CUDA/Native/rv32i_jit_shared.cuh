@@ -81,9 +81,26 @@ struct Periph {
 static constexpr uint32_t PRIV_U = 0u, PRIV_M = 3u;
 static constexpr uint32_t PIN_MTIP = 1u << 7, PIN_MEIP = 1u << 11;
 
+// Number of soft CSRs (Zicsr index space). Named so the interpreter, the JIT
+// module and the host allocator all size the CSR backing store identically.
+static constexpr uint32_t SOFT_CSR_COUNT = 4096u;
+
 // Per-core state in managed memory. The hot fields are mirrored into a
-// thread-local Hart for the duration of a launch; soft_csr (cold) is read /
-// written in place.
+// thread-local Hart for the duration of a launch; the soft CSR file (cold) is
+// read / written in place through `soft_csr`.
+//
+// PICO (state-minimizer): `soft_csr` used to be an INLINE 4096-word array
+// (16 KiB), which dominated sizeof(CoreState) and made the densely-packed
+// g_state[] array 16 KiB/core. That bloats the per-core resident footprint and
+// the per-launch state region for NO benefit on the throughput path (compute
+// guests never touch a CSR). It is now a POINTER into a separately allocated
+// backing store, dropping sizeof(CoreState) from ~16.4 KiB to ~64 B (≈256×).
+// Semantics are unchanged: trap_system still does cpu.g->soft_csr[fn] exactly as
+// before — `fn` is a full 12-bit index (0..SOFT_CSR_COUNT-1) and the backing
+// store is SOFT_CSR_COUNT words, so every CSR read/write touches the identical
+// word it always did. Where the backing lives (per-core buffers = baseline
+// VRAM, or one contiguous slab = PICO) is an allocation choice ONLY and never
+// changes a computed value — so the result is bit-for-bit identical either way.
 struct CoreState {
     uint32_t regs[32];
     uint32_t pc;
@@ -92,7 +109,7 @@ struct CoreState {
     int32_t  halted;
     int32_t  exitcode;
     int32_t  exited;
-    uint32_t soft_csr[4096];
+    uint32_t* soft_csr;     // → SOFT_CSR_COUNT-word backing store (managed)
 };
 
 struct CoreMem {

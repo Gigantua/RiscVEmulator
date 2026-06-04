@@ -19,7 +19,8 @@
 // halted) into a thread-local `Hart` at launch, runs the whole budget on it
 // (hot path force-inlined → state stays in registers / L1 local memory), and
 // writes it back to the managed CoreState at the end. The cold trap CSR-ish
-// store (soft_csr) stays in the global CoreState.
+// store (soft_csr) is reached through CoreState::soft_csr (a pointer into a
+// separately allocated backing store — see PICO note in rv32i_jit_shared.cuh).
 //
 // Execution model: one GPU thread per core (__launch_bounds__(1,1)). All shared
 // buffers are CUDA managed memory; Windows/WDDM forbids host access while a
@@ -315,6 +316,20 @@ static int        g_block   = MAX_BLOCK;// cores per block (occupancy / packing 
 static int        g_prefetch = 0;       // 1 → double-buffered shared instruction window
 static int        g_fpdispatch = 0;     // 1 → function-pointer opcode dispatch (experiment)
 
+// PICO (state-minimizer) — soft-CSR backing-store allocation strategy. Both
+// strategies are BIT-EXACT (CSR[fn] reads/writes the identical word); they
+// differ only in *where* the SOFT_CSR_COUNT-word file per core lives:
+//   g_pico==1 (default): ONE contiguous slab of nCores*SOFT_CSR_COUNT words.
+//       sizeof(CoreState) is now ~64 B (the old inline 16 KiB array became an
+//       8 B pointer), so the densely-packed g_state[] array is ~256× smaller —
+//       far cheaper per-launch state region and L2-resident. The CSR slab is
+//       cold (compute guests never touch it) and pages in lazily on demand.
+//   g_pico==0 (baseline): per-core cudaMallocManaged buffers, reproducing the
+//       original layout's per-core allocation footprint for A/B comparison.
+// g_csr holds the slab (pico) so shutdown can free it in one call.
+static int        g_pico  = 1;
+static uint32_t*  g_csr   = nullptr;     // pico: contiguous CSR slab; baseline: nullptr
+
 API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsigned int fbH,
                         unsigned int pcmBytes) {
     g_ncores = nCores;
@@ -328,6 +343,16 @@ API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsi
     memset(g_state, 0, (size_t)nCores * sizeof(CoreState));
     memset(g_mem,   0, (size_t)nCores * sizeof(CoreMem));
 
+    // Soft-CSR backing store. PICO: one contiguous slab (the per-core file is a
+    // slice of it); baseline: a private buffer per core (allocated in the loop).
+    // Either way each core gets exactly SOFT_CSR_COUNT zeroed words, so a CSR
+    // read before any CSR write returns 0 just as the old inline array did.
+    g_csr = nullptr;
+    if (g_pico) {
+        if ((e = cudaMallocManaged(&g_csr, (size_t)nCores * SOFT_CSR_COUNT * sizeof(uint32_t))) != cudaSuccess) return (int)e;
+        memset(g_csr, 0, (size_t)nCores * SOFT_CSR_COUNT * sizeof(uint32_t));
+    }
+
     unsigned int fbBytes = fbW * fbH * 4u;
     for (int i = 0; i < nCores; i++) {
         uint8_t* ram = nullptr; uint8_t* trap = nullptr; Periph* per = nullptr;
@@ -339,6 +364,15 @@ API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsi
         if ((e = cudaMallocManaged(&pcm,  pcmBytes))        != cudaSuccess) return (int)e;
         memset(ram, 0, ramSize); memset(trap, 0, TRAP_PAGE_SIZE); memset(per, 0, sizeof(Periph));
         memset(fb, 0, fbBytes);  memset(pcm, 0, pcmBytes);
+        // Wire the per-core CSR file (slab slice in pico, private buffer in baseline).
+        if (g_pico) {
+            g_state[i].soft_csr = g_csr + (size_t)i * SOFT_CSR_COUNT;
+        } else {
+            uint32_t* csr = nullptr;
+            if ((e = cudaMallocManaged(&csr, SOFT_CSR_COUNT * sizeof(uint32_t))) != cudaSuccess) return (int)e;
+            memset(csr, 0, SOFT_CSR_COUNT * sizeof(uint32_t));
+            g_state[i].soft_csr = csr;
+        }
         g_mem[i].ram = ram; g_mem[i].trap = trap; g_mem[i].per = per;
         g_mem[i].fb = fb;   g_mem[i].pcm = pcm;
         g_mem[i].ram_size = ramSize; g_mem[i].fb_bytes = fbBytes; g_mem[i].pcm_bytes = pcmBytes;
@@ -412,6 +446,17 @@ API void cuda_rv32i_set_block(int b) { if (b >= 1 && b <= MAX_BLOCK) g_block = b
 API void cuda_rv32i_set_prefetch(int on) { g_prefetch = on ? 1 : 0; }
 // EXPERIMENT: function-pointer opcode dispatch instead of the switch.
 API void cuda_rv32i_set_fpdispatch(int on) { g_fpdispatch = on ? 1 : 0; }
+
+// PICO (state-minimizer): select the soft-CSR backing-store allocation strategy.
+// Default ON (slab). MUST be called BEFORE cuda_rv32i_init — it only governs how
+// init lays out the CSR file; both layouts are bit-exact. Pass 0 to force the
+// baseline per-core layout for an A/B comparison.
+API void cuda_rv32i_set_pico(int on) { g_pico = on ? 1 : 0; }
+API int  cuda_rv32i_get_pico()       { return g_pico; }
+// Resident-footprint introspection: bytes of densely-packed per-core state
+// (g_state[]) the kernel syncs at launch/exit. The smaller this is, the more
+// cores co-reside at a fixed VRAM budget. Useful for the CudaBench A/B printout.
+API unsigned int cuda_rv32i_corestate_bytes() { return (unsigned int)sizeof(CoreState); }
 
 API int cuda_rv32i_step_all(long long budget) {
     if (g_ncores <= 0) return 0;
@@ -521,6 +566,11 @@ API void cuda_rv32i_shutdown() {
             cudaFree(g_mem[i].fb);  cudaFree(g_mem[i].pcm);
         }
         cudaFree(g_mem); g_mem = nullptr;
+    }
+    // Free the soft-CSR backing: one slab in pico, per-core buffers in baseline.
+    if (g_csr) { cudaFree(g_csr); g_csr = nullptr; }
+    else if (g_state) {
+        for (int i = 0; i < g_ncores; i++) cudaFree(g_state[i].soft_csr);
     }
     if (g_code) { cudaFree(g_code); g_code = nullptr; }
     cudaFree(g_state); g_state = nullptr;

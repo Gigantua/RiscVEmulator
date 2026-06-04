@@ -22,6 +22,8 @@ const string Lib = "rv32i_cuda";
 [DllImport(Lib)] static extern void   cuda_rv32i_set_block(int b);
 [DllImport(Lib)] static extern void   cuda_rv32i_set_prefetch(int on);
 [DllImport(Lib)] static extern void   cuda_rv32i_set_fpdispatch(int on);
+[DllImport(Lib)] static extern void   cuda_rv32i_set_pico(int on);
+[DllImport(Lib)] static extern uint   cuda_rv32i_corestate_bytes();
 [DllImport(Lib)] static extern int    cuda_rv32i_step_all(long budget);
 [DllImport(Lib)] static extern void   cuda_rv32i_shutdown();
 
@@ -229,6 +231,55 @@ foreach (var (fp, name) in new[] { (0, "switch"), (1, "fn-ptr") })
     cuda_rv32i_shutdown();
 }
 Console.WriteLine();
+
+// ── 2c) PICO (state-minimizer): shrunken CoreState + CSR-slab vs per-core ──
+// PICO moves the per-core 16 KiB inline soft-CSR array out of CoreState into a
+// pointer (UNCONDITIONAL, bit-exact): sizeof(CoreState) drops from the old
+// ~16,536 B to ~64 B, so the densely-packed g_state[] array is ~256× smaller —
+// far cheaper per-launch state sync and far more cores per VRAM budget. The
+// runtime toggle then chooses WHERE the CSR file lives: one contiguous slab
+// (pico, default) or per-core buffers (baseline) — an allocation choice only,
+// so the verify word MUST match across both. Columns: sizeof(CoreState) now vs
+// the pre-PICO inline layout, cores that fit a 256 MiB state-array budget for
+// each, and aggregate MIPS at 4096 cores (occupancy effect).
+{
+    const long VramCap   = 256L * 1024 * 1024;   // hypothetical state-array VRAM budget
+    const uint PreCS     = 32u * 4 + 6u * 4 + 4096u * 4;  // pre-PICO sizeof(CoreState): inline 4096-word CSR
+    // One probe init reads the real (post-PICO) sizeof(CoreState).
+    cuda_rv32i_set_pico(1);
+    cuda_rv32i_init(1, RamBytes, 64, 64, 4096);
+    uint nowCS = cuda_rv32i_corestate_bytes();
+    cuda_rv32i_shutdown();
+    Console.WriteLine("[pico] compute guest — shrunken CoreState; CSR slab (pico) vs per-core (baseline)");
+    Console.WriteLine($"  sizeof(CoreState): pre-PICO {PreCS:N0} B  →  PICO {nowCS:N0} B  ({(double)PreCS/nowCS:F0}× smaller)");
+    Console.WriteLine($"  cores fitting a {VramCap/1024/1024} MiB state array: pre-PICO {VramCap/PreCS:N0}  →  PICO {VramCap/nowCS:N0}");
+
+    // Bit-exactness check at 1 core (cheap, always run): slab vs per-core CSR
+    // must produce the identical verify word.
+    cuda_rv32i_set_pico(0);
+    uint baseVerify = Run(bench, 1, 1, true, false, 300_000, 0x4000).verify;
+    cuda_rv32i_set_pico(1);
+    uint picoVerify = Run(bench, 1, 1, true, false, 300_000, 0x4000).verify;
+    bool ok = baseVerify == picoVerify && picoVerify != 0;
+    Console.WriteLine($"  bit-exact (1 core): baseline 0x{baseVerify:X8}, pico 0x{picoVerify:X8}  →  {(ok ? "MATCH ✓" : "MISMATCH ✗")}");
+    if (!ok) { cuda_rv32i_set_pico(1); return 1; }
+
+    // Aggregate-MIPS A/B at 4096 cores is gated behind --sweep (allocs ~0.5 GB
+    // managed; the default path stays at 1 core to avoid any VRAM pressure).
+    if (args.Contains("--sweep"))
+    {
+        Console.WriteLine("  mode       4096-core MIPS   verify");
+        Console.WriteLine("  ────────   ──────────────   ──────────");
+        foreach (var (pico, name) in new[] { (0, "baseline"), (1, "pico") })
+        {
+            cuda_rv32i_set_pico(pico);            // Run() calls cuda_rv32i_init
+            var r = Run(comp, 4096, 256, true, false, 20_000, 0x4000);
+            Console.WriteLine($"  {name,-8}   {r.mips,14:F0}   0x{r.verify:X8}");
+        }
+    }
+    cuda_rv32i_set_pico(1);                        // restore default for later sections
+    Console.WriteLine();
+}
 
 // ── 3) Many-core throughput (packed + shared code, no prefetch) ──
 // Gated behind --sweep and capped at 4096 cores (≤256 MB) so a stray run can

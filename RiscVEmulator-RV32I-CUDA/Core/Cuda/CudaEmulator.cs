@@ -48,6 +48,8 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern int  cuda_rv32i_set_code(byte[] data, uint lo, uint len);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_block(int b);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_prefetch(int on);
+        [DllImport(Lib)] private static extern void cuda_rv32i_set_pico(int on);
+        [DllImport(Lib)] private static extern uint cuda_rv32i_corestate_bytes();
         [DllImport(Lib)] private static extern int  cuda_rv32i_step_all(long budget);
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_state_ptr();
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_mem_ptr();
@@ -118,6 +120,18 @@ namespace RiscVEmulator.Core.Cuda
         /// </summary>
         public bool UseJit { get; set; }
 
+        /// <summary>PICO state-minimizer: when true (default), the per-core soft-CSR
+        /// file is allocated as one contiguous slab so <c>sizeof(CoreState)</c> stays
+        /// ~64 B instead of ~16.4 KiB, letting far more cores co-reside at a fixed
+        /// VRAM budget (occupancy → latency hidden). Bit-exact either way (CSR[fn] is
+        /// the same word). Static because it must be set BEFORE the constructor's
+        /// <c>cuda_rv32i_init</c>; set to false to reproduce the baseline layout.</summary>
+        public static bool PicoStateMin { get; set; } = true;
+
+        /// <summary>Bytes of densely-packed per-core launch/exit state (<c>sizeof(CoreState)</c>).
+        /// Smaller ⇒ more resident cores at fixed VRAM. Reflects <see cref="PicoStateMin"/>.</summary>
+        public uint CoreStateBytes => cuda_rv32i_corestate_bytes();
+
         /// <summary>True if <see cref="UseJit"/> was requested AND the JIT DLL
         /// built+loaded successfully — i.e. StepN is running JIT'd code.</summary>
         public bool JitActive => _jit != null;
@@ -141,6 +155,7 @@ namespace RiscVEmulator.Core.Cuda
             RamBytes = ramBytes;
             _image   = new byte[ramBytes];
 
+            cuda_rv32i_set_pico(PicoStateMin ? 1 : 0);   // must precede init (governs CSR layout)
             int rc = cuda_rv32i_init(nCores, (uint)ramBytes, (uint)fbWidth, (uint)fbHeight, (uint)pcmBytes);
             if (rc != 0)
                 throw new InvalidOperationException($"cuda_rv32i_init failed (CUDA error {rc})");
