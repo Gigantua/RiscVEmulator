@@ -52,6 +52,7 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern uint cuda_rv32i_corestate_bytes();
         [DllImport(Lib)] private static extern void cuda_rv32i_set_l2advise(int on);
         [DllImport(Lib)] private static extern int  cuda_rv32i_get_l2advise();
+        [DllImport(Lib)] private static extern int  cuda_rv32i_set_fastpath(int on);
         [DllImport(Lib)] private static extern int  cuda_rv32i_step_all(long budget);
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_state_ptr();
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_mem_ptr();

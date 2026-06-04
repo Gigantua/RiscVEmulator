@@ -526,6 +526,37 @@ static __device__ __forceinline__ uint32_t alu_bl(uint32_t f3,
     return res;
 }
 
+// ── Frequency-biased predicated fast path (PREDICT experiment) ────────────
+// A tiny branchless-style ladder that handles the ~5 opcodes that dominate the
+// dynamic instruction count (ADDI, ADD/SUB, LW, SW, conditional BRANCH) BEFORE
+// the full opcode switch, so the common case never pays the jump-table
+// dispatch. ptxas folds this straight-line predicated prologue into a handful
+// of compare-and-select ops; within a warp every lane runs the same guest at
+// the same PC so the predicate is uniform and divergence-free.
+//
+// Equivalence with the switch arms it shortcuts (each is the EXACT body of the
+// corresponding `case` below, verified per opcode in PERF_PREDICT.md):
+//   • ADDI  (0x13,f3=0)            regs[rd] = (uint32_t)(s1 + imm)
+//   • ADD   (0x33,f7=0x00,f3=0)    regs[rd] = (uint32_t)(s1 + s2)
+//   • SUB   (0x33,f7=0x20,f3=0)    regs[rd] = (uint32_t)(s1 - s2)
+//   • LW    (0x03,f3=2)            regs[rd] = mem_read<uint32_t>(addr)
+//   • SW    (0x23,f3=2)            mem_write<uint32_t>(addr, u2)
+//   • BRANCH(0x63, all f3)         nextpc = taken ? pc+b_imm : pc+4
+// Every other encoding (including OP-IMM/OP sub-functions, half/byte loads &
+// stores, illegal f7 combos that must trap) is NOT matched here and falls
+// through to the switch unchanged — so the fast path can only ever produce a
+// result identical to the switch. Flag OFF (g_fastpath_on==0) skips the ladder
+// entirely, reproducing the baseline switch bit-for-bit.
+//
+// Defined here (not extern) so EVERY module that compiles cpu_step gets its own
+// definition: both the interpreter DLL (rv32i_cuda.cu) and the runtime JIT DLL
+// (RvJitRuntime's generated .cu, whose jit_interp_step→cpu_step references it)
+// resolve the symbol locally. This block is inside #ifndef RVJIT_MEM_ONLY, so
+// the JIT *part* files (which define RVJIT_MEM_ONLY and skip cpu_step) do not
+// also define it — only the one TU per module that actually compiles cpu_step.
+// The host toggles the interpreter DLL's copy via cudaMemcpyToSymbol.
+__device__ int g_fastpath_on = 1;
+
 template<bool BRANCHLESS = true>
 static __device__ __forceinline__ CpuException cpu_step(Hart& cpu, CoreMem& mm, uint32_t instr) {
     const int      rd    = (instr >>  7) & 0x1F;
@@ -536,8 +567,61 @@ static __device__ __forceinline__ CpuException cpu_step(Hart& cpu, CoreMem& mm, 
     const int32_t  s1    = (int32_t)u1;
     const int32_t  s2    = (int32_t)u2;
     uint32_t nextpc      = cpu.pc + 4;
+    const uint32_t op    = instr & 0x7F;
 
-    switch (instr & 0x7F) {
+    if (g_fastpath_on) {
+        // ADDI / ADD / SUB → register write, nextpc = pc+4. Bitwise predicates
+        // (no short-circuit) so ptxas emits compare-and-select, not branches.
+        //   addi: op==0x13 && f3==0
+        //   add : op==0x33 && f3==0 && f7==0x00
+        //   sub : op==0x33 && f3==0 && f7==0x20
+        const bool isAddi = (op == 0x13) & (f3 == 0);
+        const bool isAdd  = (op == 0x33) & (f3 == 0) & (f7 == 0x00);
+        const bool isSub  = (op == 0x33) & (f3 == 0) & (f7 == 0x20);
+        if (isAddi | isAdd | isSub) {
+            // Compute in unsigned to wrap defined-ly; result is bit-identical to
+            // (uint32_t)(s1+imm) / (s1+s2) / (s1-s2) since two's-complement add
+            // and subtract are the same bit pattern as unsigned add/subtract.
+            const uint32_t b = isAddi ? (uint32_t)i_imm(instr) : u2;
+            cpu.regs[rd] = isSub ? (u1 - b) : (u1 + b);
+            cpu.regs[0]  = 0;
+            cpu.pc       = nextpc;
+            return { EXC_NONE, 0 };
+        }
+        // LW (0x03,f3=2): word load, sign-irrelevant. Identical to case 0x03/f3==2.
+        if ((op == 0x03) & (f3 == 2)) {
+            uint32_t addr = (uint32_t)(s1 + i_imm(instr));
+            cpu.regs[rd]  = mem_read<uint32_t>(cpu, mm, addr);
+            cpu.regs[0]   = 0;
+            cpu.pc        = nextpc;
+            return { EXC_NONE, 0 };
+        }
+        // SW (0x23,f3=2): word store. Identical to case 0x23/f3==2.
+        if ((op == 0x23) & (f3 == 2)) {
+            uint32_t addr = (uint32_t)(s1 + s_imm(instr));
+            mem_write<uint32_t>(cpu, mm, addr, u2);
+            cpu.regs[0]   = 0;   // store never writes rd; keep x0 sink invariant
+            cpu.pc        = nextpc;
+            return { EXC_NONE, 0 };
+        }
+        // BRANCH (0x63, all f3): identical to case 0x63. f3 1/2/3 are illegal
+        // RISC-V encodings but the switch's default `taken=0` falls straight to
+        // pc+4 (no trap), so we reproduce that with taken=0 — bit-exact.
+        if (op == 0x63) {
+            int taken = 0;
+            switch (f3) {
+                case 0: taken = u1 == u2; break;  case 1: taken = u1 != u2; break;
+                case 4: taken = s1 <  s2; break;  case 5: taken = s1 >= s2; break;
+                case 6: taken = u1 <  u2; break;  case 7: taken = u1 >= u2; break;
+            }
+            if (taken) nextpc = cpu.pc + b_imm(instr);
+            cpu.regs[0] = 0;
+            cpu.pc      = nextpc;
+            return { EXC_NONE, 0 };
+        }
+    }
+
+    switch (op) {
     case 0x37: cpu.regs[rd] = instr & 0xFFFFF000u;                        break;  // LUI
     case 0x17: cpu.regs[rd] = cpu.pc + (instr & 0xFFFFF000u);             break;  // AUIPC
     case 0x6F: cpu.regs[rd] = cpu.pc + 4; nextpc = cpu.pc + j_imm(instr); break;  // JAL

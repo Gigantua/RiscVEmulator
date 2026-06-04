@@ -43,6 +43,11 @@
 // against the very same managed CoreState[]/CoreMem[] this DLL allocates.
 #include "rv32i_jit_shared.cuh"
 
+// NOTE: the PREDICT fast-path flag `g_fastpath_on` is DEFINED in the shared
+// header (inside #ifndef RVJIT_MEM_ONLY, next to cpu_step) so each module that
+// compiles cpu_step gets its own copy. This TU just toggles it from the host
+// via cuda_rv32i_set_fastpath → cudaMemcpyToSymbol(g_fastpath_on, …).
+
 // ── Instruction prefetch window (Tier 3, single-/few-guest latency) ──────
 // A single warp cannot hide the ~530-cycle dependent-load latency of an
 // instruction fetch. The prefetch path keeps a double-buffered window of two
@@ -502,6 +507,14 @@ API void cuda_rv32i_set_block(int b) { if (b >= 1 && b <= MAX_BLOCK) g_block = b
 API void cuda_rv32i_set_prefetch(int on) { g_prefetch = on ? 1 : 0; }
 // EXPERIMENT: function-pointer opcode dispatch instead of the switch.
 API void cuda_rv32i_set_fpdispatch(int on) { g_fpdispatch = on ? 1 : 0; }
+// PREDICT: frequency-biased predicated fast path in cpu_step (default ON).
+// Writes the device-side g_fastpath_on symbol. OFF reproduces the switch
+// bit-for-bit; the orchestrator A/Bs this against ON for MIPS + verify.
+API int cuda_rv32i_set_fastpath(int on) {
+    int v = on ? 1 : 0;
+    cudaError_t e = cudaMemcpyToSymbol(g_fastpath_on, &v, sizeof(int));
+    return (int)e;
+}
 
 // PICO (state-minimizer): select the soft-CSR backing-store allocation strategy.
 // Default ON (slab). MUST be called BEFORE cuda_rv32i_init — it only governs how

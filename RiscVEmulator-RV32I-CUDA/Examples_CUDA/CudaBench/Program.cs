@@ -25,6 +25,7 @@ const string Lib = "rv32i_cuda";
 [DllImport(Lib)] static extern void   cuda_rv32i_set_pico(int on);
 [DllImport(Lib)] static extern uint   cuda_rv32i_corestate_bytes();
 [DllImport(Lib)] static extern void   cuda_rv32i_set_l2advise(int on);
+[DllImport(Lib)] static extern int    cuda_rv32i_set_fastpath(int on);
 [DllImport(Lib)] static extern int    cuda_rv32i_step_all(long budget);
 [DllImport(Lib)] static extern void   cuda_rv32i_shutdown();
 
@@ -317,6 +318,30 @@ Console.WriteLine();
     cuda_rv32i_set_pico(1);                        // restore default for later sections
     Console.WriteLine();
 }
+
+// ── 2d) PREDICT: frequency-biased predicated fast path — OFF vs ON ──
+// A/B the hot-opcode predicated prologue in cpu_step. OFF must reproduce the
+// switch bit-for-bit (verify word identical); ON should be faster for guests
+// dominated by ADDI/ADD/SUB/LW/SW/branch. We A/B both guests and assert the
+// verify word matches between OFF and ON (bit-exactness gate).
+Console.WriteLine("[predict] fast path OFF vs ON — 1 core, MIPS + bit-exact verify");
+Console.WriteLine("  guest      fastpath   MIPS/core   speedup   verify");
+Console.WriteLine("  ───────    ────────   ─────────   ───────   ──────");
+bool predictOk = true;
+foreach (var (g, name, vaddr) in new[] { (comp, "compute", 0x3000u), (bench, "data", 0x4000u) })
+{
+    cuda_rv32i_set_fastpath(0);
+    var off = Run(g, 1, 1, true, false, 300_000, vaddr);
+    cuda_rv32i_set_fastpath(1);
+    var on  = Run(g, 1, 1, true, false, 300_000, vaddr);
+    bool match = off.verify == on.verify && off.verify != 0;
+    predictOk &= match;
+    Console.WriteLine($"  {name,-7}      off       {off.mips,9:F2}             0x{off.verify:X8}");
+    Console.WriteLine($"  {name,-7}      on        {on.mips,9:F2}   {on.mips/off.mips,6:F2}x  0x{on.verify:X8}  {(match ? "MATCH" : "MISMATCH")}");
+}
+cuda_rv32i_set_fastpath(1);   // leave the default (ON) in place for later runs
+Console.WriteLine($"  → bit-exact OFF==ON: {(predictOk ? "PASS" : "FAIL")}\n");
+if (!predictOk) return 1;
 
 // ── 3) Many-core throughput (packed + shared code, no prefetch) ──
 // Gated behind --sweep and capped at 4096 cores (≤256 MB) so a stray run can
