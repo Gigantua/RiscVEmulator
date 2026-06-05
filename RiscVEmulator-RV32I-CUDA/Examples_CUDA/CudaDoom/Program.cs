@@ -18,6 +18,8 @@ int cores = 1;
 bool selftest = false;
 bool useJit = false;
 bool usePtxJit = false;
+string? shotPath = null;
+int shotFrame = 10;
 var opts = new SdlWindowOptions { Title = "DOOM — RV32I on CUDA", GrabMouse = true };
 for (int i = 0; i < args.Length; i++)
 {
@@ -25,6 +27,8 @@ for (int i = 0; i < args.Length; i++)
     else if (args[i] == "--selftest") selftest = true;
     else if (args[i] == "--jit")      useJit = true;
     else if (args[i] == "--ptxjit")   { useJit = true; usePtxJit = true; }  // in-process driver-API JIT
+    else if (args[i] == "--shot")     shotPath = args[++i];                 // headless: save frame N as PNG
+    else if (args[i] == "--shot-frame") shotFrame = int.Parse(args[++i]);
     else if (args[i] == "--scale")    opts.Scale = int.Parse(args[++i]);
     else if (args[i] == "--no-grab")  opts.GrabMouse = false;
 }
@@ -68,6 +72,48 @@ Console.WriteLine($"  doom.elf: {new FileInfo(elfPath).Length:N0} bytes");
 
 byte[] elfData = File.ReadAllBytes(elfPath);
 byte[] wadData = File.ReadAllBytes(wadPath);
+
+if (shotPath != null)
+{
+    // ── Headless: run until DOOM has presented `shotFrame` distinct frames, then
+    //    save the framebuffer as a PNG so the render can be eyeballed. Uses the
+    //    selected CPU backend (--ptxjit / --jit / interpreter). ──
+    using var emu = new CudaEmulator(RamMB * 1024 * 1024);
+    emu.UseJit = useJit; emu.UsePtxJit = usePtxJit;
+    emu.OutputHandler = _ => { };
+    uint entry = emu.LoadElf(elfData);
+    emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
+    emu.LoadBytes(WadBaseAddr, wadData);
+    emu.CommitImage();
+    emu.SetReg(2, StackPointer);
+    emu.SetEntry(entry);
+    const int W = 320, H = 200;
+    Console.WriteLine($"Headless: rendering until frame {shotFrame} ({W}x{H}) on " +
+                      (usePtxJit ? "ptx/driver-API JIT" : useJit ? "nvcc-DLL JIT" : "interpreter") + "...");
+    int frames = 0; long steps = 0; ulong last = 0;
+    for (int b = 0; b < 4000 && !emu.IsHalted; b++)
+    {
+        emu.StepN(500_000); steps += 500_000;
+        var px = emu.Framebuffer.PresentedPixels;
+        ulong h = 1469598103934665603UL; int nz = 0;
+        for (int i = 0; i + 3 < px.Length; i += 4)
+        {
+            if ((px[i] | px[i + 1] | px[i + 2]) != 0) nz++;
+            h = (h ^ px[i]) * 1099511628211UL;
+            h = (h ^ px[i + 1]) * 1099511628211UL;
+            h = (h ^ px[i + 2]) * 1099511628211UL;
+        }
+        if (nz > 5000 && h != last) { last = h; frames++; }
+        Console.Write($"\r[{steps / 1_000_000}M steps] presented frames={frames} non-black px={nz}   ");
+        if (frames >= shotFrame)
+        {
+            Png.WriteRgba(shotPath, emu.Framebuffer.PresentedPixels, W, H);
+            Console.WriteLine($"\nwrote {shotPath} (frame {frames}, {nz} non-black px, {steps / 1_000_000}M steps).");
+            return 0;
+        }
+    }
+    Console.Error.WriteLine($"\nonly reached {frames} frames"); return 1;
+}
 
 if (selftest)
 {
@@ -185,4 +231,40 @@ bool Clang(string[] a)
     var p = Process.Start(psi)!; string err = p.StandardError.ReadToEnd(); p.WaitForExit();
     if (p.ExitCode != 0) { Console.Error.WriteLine($"\nclang failed ({p.ExitCode})\n{err}"); return false; }
     return true;
+}
+
+// Minimal PNG writer (RGBA8888, no deps beyond built-in ZLibStream).
+static class Png
+{
+    public static void WriteRgba(string path, byte[] rgba, int w, int h)
+    {
+        using var fs = File.Create(path);
+        fs.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
+        byte[] ihdr = new byte[13];
+        BE(ihdr, 0, (uint)w); BE(ihdr, 4, (uint)h);
+        ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0; // 8-bit RGBA
+        Chunk(fs, "IHDR", ihdr);
+        byte[] raw = new byte[h * (1 + w * 4)];
+        int o = 0;
+        for (int y = 0; y < h; y++) { raw[o++] = 0; Array.Copy(rgba, y * w * 4, raw, o, w * 4); o += w * 4; }
+        byte[] idat;
+        using (var ms = new MemoryStream())
+        {
+            using (var z = new System.IO.Compression.ZLibStream(ms, System.IO.Compression.CompressionLevel.Optimal, true))
+                z.Write(raw, 0, raw.Length);
+            idat = ms.ToArray();
+        }
+        Chunk(fs, "IDAT", idat);
+        Chunk(fs, "IEND", Array.Empty<byte>());
+    }
+    static void Chunk(Stream s, string type, byte[] data)
+    {
+        byte[] len = new byte[4]; BE(len, 0, (uint)data.Length); s.Write(len);
+        byte[] t = System.Text.Encoding.ASCII.GetBytes(type); s.Write(t); s.Write(data);
+        byte[] c = new byte[4]; BE(c, 0, Crc(t, data)); s.Write(c);
+    }
+    static void BE(byte[] b, int o, uint v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
+    static readonly uint[] T = Build();
+    static uint[] Build() { var t = new uint[256]; for (uint n = 0; n < 256; n++) { uint c = n; for (int k = 0; k < 8; k++) c = ((c & 1) != 0) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); t[n] = c; } return t; }
+    static uint Crc(byte[] a, byte[] b) { uint c = 0xFFFFFFFFu; foreach (var x in a) c = T[(c ^ x) & 0xFF] ^ (c >> 8); foreach (var x in b) c = T[(c ^ x) & 0xFF] ^ (c >> 8); return c ^ 0xFFFFFFFFu; }
 }
