@@ -64,6 +64,91 @@ var bench = Build("bench_guest");
 Console.WriteLine($"  compute RO code: 0x{comp.codeLo:X5}..0x{comp.codeHi:X5}  ({comp.codeImg.Length} B)");
 Console.WriteLine($"  bench   RO code: 0x{bench.codeLo:X5}..0x{bench.codeHi:X5}  ({bench.codeImg.Length} B)\n");
 
+// ── PTX JIT: translate the self-halting jit_test guest → PTX directly, write
+//    rvjit.ptx, and validate it by assembling with ptxas -arch=sm_86 (the
+//    correctness gate for the emitter). No nvcc / no DLL. ──
+if (args.Contains("--emitptx"))
+{
+    var g = Build("jit_test");
+    string ptx = RvPtxJit.Emit(g.codeImg, g.codeLo, g.codeHi, g.entry);
+    string ptxPath = Path.Combine(buildDir, "rvjit.ptx");
+    File.WriteAllText(ptxPath, ptx);
+    Console.WriteLine($"  emitted {ptxPath} ({ptx.Length:N0} bytes, {g.codeImg.Length / 4} guest instrs)");
+
+    // Locate ptxas (alongside nvcc); fall back to PATH.
+    string ptxas = "ptxas";
+    foreach (var v in new[] { "v13.2", "v13.1", "v12.8", "v12.4" })
+    {
+        string cand = $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\{v}\bin\ptxas.exe";
+        if (File.Exists(cand)) { ptxas = cand; break; }
+    }
+    string cubin = Path.Combine(buildDir, "rvjit.cubin");
+    var psiA = new ProcessStartInfo(ptxas) { RedirectStandardError = true, UseShellExecute = false };
+    foreach (var a in new[] { "-arch=sm_86", "-O3", ptxPath, "-o", cubin }) psiA.ArgumentList.Add(a);
+    var pa = Process.Start(psiA)!; string aerr = pa.StandardError.ReadToEnd(); pa.WaitForExit();
+    if (pa.ExitCode == 0)
+        Console.WriteLine($"  ptxas: OK → {cubin} ({new FileInfo(cubin).Length:N0} bytes SASS)  ✓ PTX VALID");
+    else
+        Console.WriteLine($"  ptxas FAILED:\n{aerr}");
+    return pa.ExitCode;
+}
+
+// ── PTX JIT end-to-end: emit PTX, JIT-load it in-process via the CUDA Driver
+//    API (cuModuleLoadDataEx — no nvcc, no DLL), run the self-halting guest,
+//    and validate sink + speedup vs the interpreter. ──
+if (args.Contains("--ptxrun"))
+{
+    var jitg = Build("jit_test");
+    long budget = 5_000_000;
+    string ptx = RvPtxJit.Emit(jitg.codeImg, jitg.codeLo, jitg.codeHi, jitg.entry);
+    string ptxPath = Path.Combine(buildDir, "rvjit.ptx");
+    File.WriteAllText(ptxPath, ptx);
+    Console.WriteLine($"  emitted rvjit.ptx ({ptx.Length:N0} bytes, {jitg.codeImg.Length / 4} guest instrs)");
+
+    // Build the tiny driver-API harness once (host-only; compiles in seconds).
+    string vc     = @"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat";
+    string runCu  = Path.Combine(root, "Examples_CUDA", "CudaBench", "ptxrun.cu");
+    string runExe = Path.Combine(buildDir, "ptxrun.exe");
+    if (!File.Exists(runExe) || File.GetLastWriteTimeUtc(runCu) > File.GetLastWriteTimeUtc(runExe))
+    {
+        string bbat = Path.Combine(buildDir, "build_ptxrun.bat");
+        string blog = Path.Combine(buildDir, "ptxrun_build.log");
+        File.WriteAllText(bbat, "@echo off\r\n" + $"call \"{vc}\" >nul 2>&1\r\n" +
+            $"nvcc -O2 -o \"{runExe}\" \"{runCu}\" -lcuda > \"{blog}\" 2>&1\r\n");
+        var bp = new ProcessStartInfo("cmd.exe") { UseShellExecute = false };
+        bp.ArgumentList.Add("/c"); bp.ArgumentList.Add(bbat);
+        var bpp = Process.Start(bp)!; bpp.WaitForExit();
+        if (bpp.ExitCode != 0) { Console.Error.WriteLine("ptxrun build failed:\n" + (File.Exists(blog) ? File.ReadAllText(blog) : "")); return 1; }
+    }
+
+    var rp = new ProcessStartInfo(runExe) { RedirectStandardOutput = true, UseShellExecute = false };
+    foreach (var a in new[] { ptxPath, RamBytes.ToString(), $"0x{Sp:X}", $"0x{jitg.entry:X}", budget.ToString(), "0x3000" })
+        rp.ArgumentList.Add(a);
+    var rpp = Process.Start(rp)!; string jout = rpp.StandardOutput.ReadToEnd(); rpp.WaitForExit();
+    Console.WriteLine("  ptxrun: " + jout.Trim());
+    uint jitSink = 0; double jitMs = 0;
+    var mj = System.Text.RegularExpressions.Regex.Match(jout, "JITSINK=0x([0-9A-Fa-f]+) JITMS=([0-9.]+)");
+    if (mj.Success) { jitSink = Convert.ToUInt32(mj.Groups[1].Value, 16); jitMs = double.Parse(mj.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture); }
+
+    // interpreter reference (same guest, run to halt, timed) — the bit-exact oracle.
+    var img = new byte[RamBytes];
+    ElfLoader.Load(jitg.elf, new ArrayBus(img));
+    cuda_rv32i_init(1, (uint)RamBytes, 64, 64, 4096);
+    Marshal.Copy(img, 0, cuda_rv32i_ram_ptr(0), img.Length);
+    cuda_rv32i_set_reg(0, 2, Sp); cuda_rv32i_set_entry(0, jitg.entry);
+    cuda_rv32i_set_block(1); cuda_rv32i_set_prefetch(0);
+    var iw = Stopwatch.StartNew(); cuda_rv32i_step_all(5_000_000); iw.Stop();
+    double interpMs = iw.Elapsed.TotalMilliseconds;
+    byte[] w = new byte[4]; Marshal.Copy(cuda_rv32i_ram_ptr(0) + 0x3000, w, 0, 4); uint refSink = BitConverter.ToUInt32(w);
+    cuda_rv32i_shutdown();
+
+    bool ok = refSink == jitSink && refSink != 0;
+    Console.WriteLine($"  interpreter: sink=0x{refSink:X8}  {interpMs:F1} ms");
+    Console.WriteLine($"  PTX JIT    : sink=0x{jitSink:X8}  {jitMs:F1} ms");
+    Console.WriteLine($"  → correctness {(ok ? "MATCH ✓" : "MISMATCH ✗")}   speedup {interpMs / Math.Max(jitMs, 0.001):F1}× over interpreter");
+    return ok ? 0 : 1;
+}
+
 // ── JIT validation: translate the compute guest → CUDA C, nvcc-compile, run
 //    one tiny safe launch, check result vs the interpreter + report MIPS. ──
 if (args.Contains("--jit"))
