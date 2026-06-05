@@ -70,6 +70,16 @@
 // module shares them byte-for-byte. The interpreter's prefetch-window fetch
 // and the kernel below are the only interpreter-specific pieces left here.
 
+// ── U11: optional __constant__-memory copy of the RO code image ──────────
+// The instruction fetch is the dominant dependent load. The constant cache is a
+// separate on-chip cache (not L2), broadcast-optimized: a warp whose lanes share
+// a PC fetches in one broadcast, and it survives L2 pressure from other GPU
+// work. Filled by cuda_rv32i_set_code when the image fits; the non-prefetch
+// fetch path consults it when g_codeconst_on is set.
+static constexpr uint32_t CODECONST_CAP = 32u * 1024u;   // < 64 KB constant-mem limit (leave room for the flag)
+__constant__ uint8_t g_codeimg_const[CODECONST_CAP];
+__constant__ int     g_codeconst_on;     // 1 → fetch from constant memory
+
 // ── Instruction fetch ────────────────────────────────────────────────
 // cp.async-copy SEC_WORDS instructions from the shared RO code image into a
 // shared-memory section. 4-byte granularity keeps it alignment-free (the
@@ -88,7 +98,10 @@ static __device__ __forceinline__ void prefetch_section(uint32_t* dst, CoreMem& 
 template<bool PF>
 static __device__ __forceinline__ uint32_t fetch(Hart& c, CoreMem& m) {
     if constexpr (!PF) {
-        return mem_read<uint32_t>(c, m, c.pc);
+        uint32_t pc = c.pc;
+        if (g_codeconst_on && (pc - m.code_lo < m.code_hi - m.code_lo))
+            return *(const uint32_t*)(g_codeimg_const + (pc - m.code_lo));  // PC is 4-aligned
+        return mem_read<uint32_t>(c, m, pc);
     } else {
         uint32_t pc = c.pc;
         // Code not in the shared image (e.g. JIT'd code running from RAM, or no
@@ -496,6 +509,7 @@ API int cuda_rv32i_set_code(const void* data, unsigned int lo, unsigned int len)
     if (g_code) { cudaFree(g_code); g_code = nullptr; g_code_cap = 0; }
     if (len == 0) {
         for (int i = 0; i < g_ncores; i++) { g_mem[i].code = nullptr; g_mem[i].code_lo = 0; g_mem[i].code_hi = 0; }
+        int off0 = 0; cudaMemcpyToSymbol(g_codeconst_on, &off0, sizeof(int));
         return 0;
     }
     cudaError_t e;
@@ -507,6 +521,11 @@ API int cuda_rv32i_set_code(const void* data, unsigned int lo, unsigned int len)
     memset(g_code, 0, cap);
     memcpy(g_code, data, len);
     for (int i = 0; i < g_ncores; i++) { g_mem[i].code = g_code; g_mem[i].code_lo = lo; g_mem[i].code_hi = lo + len; }
+    // U11: also stage the image in constant memory when it fits, and enable the
+    // constant-fetch path (the non-prefetch fetch reads from it).
+    int cc_on = 0;
+    if (len <= CODECONST_CAP) { cudaMemcpyToSymbol(g_codeimg_const, data, len); cc_on = 1; }
+    cudaMemcpyToSymbol(g_codeconst_on, &cc_on, sizeof(int));
     g_l2advise_dirty = 1;   // new code image: (re)hint it on the next step_all
     cudaDeviceSynchronize();
     return (int)cudaGetLastError();
@@ -514,6 +533,10 @@ API int cuda_rv32i_set_code(const void* data, unsigned int lo, unsigned int len)
 
 // Occupancy knob: cores packed per block (1..MAX_BLOCK). 1 = one core/warp.
 API void cuda_rv32i_set_block(int b) { if (b >= 1 && b <= MAX_BLOCK) g_block = b; }
+
+// U11: toggle the __constant__-memory fetch path (only effective once an image
+// that fits CODECONST_CAP has been staged by cuda_rv32i_set_code).
+API void cuda_rv32i_set_codeconst(int on) { int v = on ? 1 : 0; cudaMemcpyToSymbol(g_codeconst_on, &v, sizeof(int)); }
 
 // Tier 3: enable the double-buffered shared instruction window (best for single-
 // /few-guest latency). Off = the original global-fetch path (best occupancy).
