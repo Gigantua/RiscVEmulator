@@ -384,6 +384,28 @@ static constexpr uint32_t FRAME_TVAL   = FRAME_BASE + 33u*4u;
 static constexpr uint32_t FRAME_CAUSE  = FRAME_BASE + 34u*4u;
 static constexpr uint32_t PV_RESUME_GATEWAY = 0xFFFF0004u;
 
+// ── Direct trap-page accessors (UNIT #4) ──────────────────────────────────
+// IE_FLAG (offset 0) and IE_MASK (offset 8) live in the trap page (m.trap).
+// The trap unit and check_interrupts read/write them on *every* step that has a
+// pending pin and on every trap. Routing those through the full mem_read /
+// mem_write dispatch wastes several failed range compares (code, ram, fb, pcm)
+// before falling into the trap-page arm. These constants are fixed, word-
+// aligned offsets into m.trap, so we hit the byte buffer directly with ld_le /
+// st_le — the SAME helper mem_read/mem_write would have called for the trap
+// page, just without the preceding range ladder. Bit-for-bit identical:
+//   IE_FLAG - TRAP_PAGE_BASE == 0,  IE_MASK - TRAP_PAGE_BASE == 8,
+//   both < TRAP_PAGE_SIZE, so mem_read/mem_write always resolved them via
+//   ld_le<uint32_t>(m.trap, off) / st_le<uint32_t>(m.trap, off) anyway.
+static __device__ __forceinline__ uint32_t trap_ie_flag(CoreMem& mm) {
+    return ld_le<uint32_t>(mm.trap, IE_FLAG - TRAP_PAGE_BASE);
+}
+static __device__ __forceinline__ void trap_set_ie_flag(CoreMem& mm, uint32_t v) {
+    st_le<uint32_t>(mm.trap, IE_FLAG - TRAP_PAGE_BASE, v);
+}
+static __device__ __forceinline__ uint32_t trap_ie_mask(CoreMem& mm) {
+    return ld_le<uint32_t>(mm.trap, IE_MASK - TRAP_PAGE_BASE);
+}
+
 static __device__ void do_trap(Hart& cpu, CoreMem& mm, uint32_t cause, uint32_t tval) {
     uint32_t tp = cpu.regs[4];
     cpu.regs[4] = mem_read<uint32_t>(cpu, mm, TRAP_SCRATCH);
@@ -391,15 +413,15 @@ static __device__ void do_trap(Hart& cpu, CoreMem& mm, uint32_t cause, uint32_t 
     mem_write<uint32_t>(cpu, mm, FRAME_BASE, cpu.pc);
     for (uint32_t i = 1; i < 32; i++)
         mem_write<uint32_t>(cpu, mm, FRAME_BASE + i * 4u, cpu.regs[i]);
-    uint32_t pie = (mem_read<uint32_t>(cpu, mm, IE_FLAG) & STATUS_IE) ? STATUS_PIE : 0u;
+    uint32_t pie = (trap_ie_flag(mm) & STATUS_IE) ? STATUS_PIE : 0u;
     uint32_t pp  = (cpu.priv == PRIV_M) ? STATUS_PP : 0u;
     mem_write<uint32_t>(cpu, mm, FRAME_STATUS, pie | pp);
     mem_write<uint32_t>(cpu, mm, FRAME_TVAL,  tval);
     mem_write<uint32_t>(cpu, mm, FRAME_CAUSE, cause);
-    mem_write<uint32_t>(cpu, mm, IE_FLAG, 0u);
+    trap_set_ie_flag(mm, 0u);
     cpu.priv = PRIV_M;
     uint32_t tvec = mem_read<uint32_t>(cpu, mm, TRAP_VECTOR);
-    if (tvec == 0) tvec = mem_read<uint32_t>(cpu, mm, IE_MASK);
+    if (tvec == 0) tvec = trap_ie_mask(mm);
     cpu.pc = tvec;
 }
 
@@ -408,7 +430,7 @@ static __device__ void trap_return(Hart& cpu, CoreMem& mm) {
     uint32_t status = mem_read<uint32_t>(cpu, mm, fb + FRAME_STATUS - FRAME_BASE);
     for (uint32_t i = 1; i < 32; i++)
         cpu.regs[i] = mem_read<uint32_t>(cpu, mm, fb + i * 4u);
-    mem_write<uint32_t>(cpu, mm, IE_FLAG, (status & STATUS_PIE) ? STATUS_IE : 0u);
+    trap_set_ie_flag(mm, (status & STATUS_PIE) ? STATUS_IE : 0u);
     cpu.priv = (status & STATUS_PP) ? PRIV_M : PRIV_U;
     cpu.pc = mem_read<uint32_t>(cpu, mm, fb);
 }
@@ -435,8 +457,8 @@ static __device__ void trap_system(Hart& cpu, CoreMem& mm, uint32_t instr) {
 
 static __device__ __forceinline__ bool check_interrupts(Hart& cpu, CoreMem& mm) {
     if (!cpu.pending) return false;
-    uint32_t pend = cpu.pending & mem_read<uint32_t>(cpu, mm, IE_MASK);
-    if (!pend || !(mem_read<uint32_t>(cpu, mm, IE_FLAG) & STATUS_IE)) return false;
+    uint32_t pend = cpu.pending & trap_ie_mask(mm);
+    if (!pend || !(trap_ie_flag(mm) & STATUS_IE)) return false;
     if (pend & PIN_MEIP) { do_trap(cpu, mm, CAUSE_IRQ_MEIP, 0); return true; }
     if (pend & PIN_MTIP) { do_trap(cpu, mm, CAUSE_IRQ_MTIP, 0); return true; }
     return false;
