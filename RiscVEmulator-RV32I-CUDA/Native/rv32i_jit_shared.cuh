@@ -179,6 +179,23 @@ static __device__ __forceinline__ T ld_le(const uint8_t* p, uint32_t a) {
     }
 }
 
+// Read-only load through the read-only data cache (__ldg). ONLY safe for memory
+// the kernel never writes (the shared RO code image) — __ldg may return stale
+// data for a location the same thread wrote. Used for the instruction fetch.
+template<class T>
+static __device__ __forceinline__ T ld_le_ro(const uint8_t* __restrict__ p, uint32_t a) {
+    if constexpr (sizeof(T) == 1) {
+        return (T)__ldg(p + a);
+    } else if constexpr (sizeof(T) == 2) {
+        if ((a & 1u) == 0) return (T)__ldg((const uint16_t*)(p + a));
+        return (T)((uint16_t)__ldg(p + a) | ((uint16_t)__ldg(p + a + 1) << 8));
+    } else {
+        if ((a & 3u) == 0) return (T)__ldg((const uint32_t*)(p + a));
+        return (T)((uint32_t)__ldg(p + a) | ((uint32_t)__ldg(p + a + 1) << 8)
+                 | ((uint32_t)__ldg(p + a + 2) << 16) | ((uint32_t)__ldg(p + a + 3) << 24));
+    }
+}
+
 template<class T>
 static __device__ __forceinline__ void st_le(uint8_t* p, uint32_t a, T v) {
     if constexpr (sizeof(T) == 1) {
@@ -339,7 +356,7 @@ static __device__ __forceinline__ T mem_read(Hart& h, CoreMem& m, uint32_t a) {
     // Tier 1b: shared RO code first — the instruction fetch (and rodata reads)
     // hit ONE buffer shared by all cores, so same-PC lanes/warps coalesce and
     // stay L2-resident instead of streaming N private copies from DRAM.
-    if (a - m.code_lo < m.code_hi - m.code_lo) return ld_le<T>(m.code, a - m.code_lo);
+    if (a - m.code_lo < m.code_hi - m.code_lo) return ld_le_ro<T>(m.code, a - m.code_lo);
     if (a < m.ram_size)                      return ld_le<T>(m.ram, a);
     if (a - FB_BASE   < m.fb_bytes)          return ld_le<T>(m.fb,  a - FB_BASE);
     if (a - PCM_BASE  < m.pcm_bytes)         return ld_le<T>(m.pcm, a - PCM_BASE);
