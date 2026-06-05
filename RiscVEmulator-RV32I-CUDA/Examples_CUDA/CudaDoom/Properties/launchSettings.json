@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Examples.CudaDoom": {
+      "commandName": "Project",
+      "commandLineArgs": ""
+    },
+    "Examples.CudaDoom (JIT experiment)": {
+      "commandName": "Project",
+      "commandLineArgs": "--jit"
+    }
+  }
+}
