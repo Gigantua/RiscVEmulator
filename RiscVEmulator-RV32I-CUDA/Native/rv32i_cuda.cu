@@ -257,7 +257,7 @@ rv32i_kernel(CoreState* st, CoreMem* mm, int ncores, long long budget) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncores) return;
     CoreState& g = st[id];
-    CoreMem&   m = mm[id];
+    CoreMem    m = mm[id];   // local copy → CoreMem fields live in registers, not re-read from managed global
 
     constexpr int STRIDE = PF ? (33 + 2 * (int)SEC_WORDS) : 33;
     extern __shared__ uint32_t s_state[];  // size = blockDim.x * STRIDE words
@@ -295,7 +295,7 @@ rv32i_kernel_fp(CoreState* st, CoreMem* mm, int ncores, long long budget) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncores) return;
     CoreState& g = st[id];
-    CoreMem&   m = mm[id];
+    CoreMem    m = mm[id];   // local copy → CoreMem fields in registers
 
     extern __shared__ uint32_t s_state[];    // blockDim.x * 33 words (regfile)
     Hart h;
