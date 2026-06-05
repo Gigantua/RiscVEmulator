@@ -361,7 +361,19 @@ static void l2_advise_buf(void* p, size_t bytes, int dev, bool readMostly) {
 static void l2_advise_all() {
     if (!g_l2advise || !g_mem) return;
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return; }
+    // cudaMemAdvise / cudaMemPrefetchAsync on managed memory require
+    // concurrentManagedAccess. Windows/WDDM reports 0 → those calls fail with
+    // cudaErrorInvalidDevice (101) and leave a STICKY error that the next kernel
+    // launch's cudaGetLastError() would surface as a bogus launch failure. On
+    // WDDM the working set is already fully device-resident for the duration of
+    // a launch (the host cannot touch managed memory while a kernel runs), so
+    // the hints are a no-op anyway — skip them and clear any latent error.
+    int cma = 0;
+    if (cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess, dev) != cudaSuccess || !cma) {
+        cudaGetLastError();   // swallow any sticky best-effort-hint error
+        return;
+    }
     l2_advise_buf(g_state, (size_t)g_ncores * sizeof(CoreState), dev, false);
     l2_advise_buf(g_mem,   (size_t)g_ncores * sizeof(CoreMem),   dev, false);
     for (int i = 0; i < g_ncores; i++) {
@@ -373,6 +385,7 @@ static void l2_advise_all() {
     }
     if (g_code) l2_advise_buf(g_code, g_code_cap, dev, /*readMostly=*/true);
     cudaDeviceSynchronize();
+    cudaGetLastError();   // hints are best-effort: never let one leak into the next launch
 }
 
 // PICO (state-minimizer) — soft-CSR backing-store allocation strategy. Both
