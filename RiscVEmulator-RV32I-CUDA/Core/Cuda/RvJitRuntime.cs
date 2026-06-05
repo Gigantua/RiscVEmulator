@@ -31,7 +31,7 @@ namespace RiscVEmulator.Core.Cuda
     /// reconcile passes interchangeably and Doom's framebuffer / exit / traps
     /// all behave exactly as under the interpreter.
     /// </summary>
-    public sealed class RvJitRuntime : IDisposable
+    public sealed class RvJitRuntime : IJitBackend
     {
         private IntPtr _lib;
         private StepAllDelegate? _stepAll;
@@ -39,6 +39,7 @@ namespace RiscVEmulator.Core.Cuda
 
         public string CuPath  { get; private set; } = "";
         public string DllPath { get; private set; } = "";
+        public string Name => Path.GetFileName(DllPath);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int InitDelegate(IntPtr state, IntPtr mem, int ncores);

@@ -137,6 +137,11 @@ namespace RiscVEmulator.Core.Cuda
         /// </summary>
         public bool UseJit { get; set; }
 
+        /// <summary>Use the in-process driver-API JIT (<see cref="PtxJitRuntime"/>:
+        /// CUDA-C → cubin → cuModuleLoadData, no DLL) instead of the nvcc-DLL JIT.
+        /// Implies the JIT path; same Doom-correct codegen.</summary>
+        public bool UsePtxJit { get; set; }
+
         /// <summary>PICO state-minimizer: when true (default), the per-core soft-CSR
         /// file is allocated as one contiguous slab so <c>sizeof(CoreState)</c> stays
         /// ~64 B instead of ~16.4 KiB, letting far more cores co-reside at a fixed
@@ -153,7 +158,7 @@ namespace RiscVEmulator.Core.Cuda
         /// built+loaded successfully — i.e. StepN is running JIT'd code.</summary>
         public bool JitActive => _jit != null;
 
-        private RvJitRuntime? _jit;
+        private IJitBackend? _jit;
 
         public Action<char>? OutputHandler { get; set; }
         /// <summary>Optional raw MIDI sink (offset, value) — set instead of/alongside
@@ -226,7 +231,7 @@ namespace RiscVEmulator.Core.Cuda
         // pointers via cuda_rv32i_state_ptr/mem_ptr), so reconcile keeps working.
         private void BuildJit(int block)
         {
-            if (!UseJit) return;
+            if (!UseJit && !UsePtxJit) return;
             if (_codeHi <= _codeLo)
             {
                 Console.Error.WriteLine("[cuda-jit] no read-only code span; using interpreter.");
@@ -236,8 +241,10 @@ namespace RiscVEmulator.Core.Cuda
             {
                 byte[] code = _image[(int)_codeLo..(int)_codeHi];
                 string buildDir = Path.Combine(AppContext.BaseDirectory, "jit");
-                _jit = RvJitRuntime.Build(code, _codeLo, _codeHi, buildDir, block);
-                Console.WriteLine($"[cuda-jit] active: {Path.GetFileName(_jit.DllPath)} " +
+                _jit = UsePtxJit
+                    ? PtxJitRuntime.Build(code, _codeLo, _codeHi, buildDir, block)
+                    : RvJitRuntime.Build(code, _codeLo, _codeHi, buildDir, block);
+                Console.WriteLine($"[cuda-jit] active ({(UsePtxJit ? "ptx/driver-API" : "nvcc-dll")}): {_jit.Name} " +
                                   $"({code.Length / 4} guest instrs, block={block}).");
             }
             catch (Exception ex)

@@ -17,12 +17,14 @@ const int  RamMB = 16;
 int cores = 1;
 bool selftest = false;
 bool useJit = false;
+bool usePtxJit = false;
 var opts = new SdlWindowOptions { Title = "DOOM — RV32I on CUDA", GrabMouse = true };
 for (int i = 0; i < args.Length; i++)
 {
     if      (args[i] == "--cores")    cores = int.Parse(args[++i]);
     else if (args[i] == "--selftest") selftest = true;
     else if (args[i] == "--jit")      useJit = true;
+    else if (args[i] == "--ptxjit")   { useJit = true; usePtxJit = true; }  // in-process driver-API JIT
     else if (args[i] == "--scale")    opts.Scale = int.Parse(args[++i]);
     else if (args[i] == "--no-grab")  opts.GrabMouse = false;
 }
@@ -75,6 +77,7 @@ if (selftest)
     //  Left off; single-guest speed is interpreter-bound, see CudaBench.)
     using var emu = new CudaEmulator(RamMB * 1024 * 1024);
     emu.UseJit = useJit;                 // --jit: run the native-CUDA JIT'd guest
+    emu.UsePtxJit = usePtxJit;           // --ptxjit: in-process driver-API JIT (cubin)
     emu.OutputHandler = c => Console.Write(c);
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
@@ -109,6 +112,7 @@ if (cores <= 1)
     // ── Single instance: play it ── (prefetch window left off — see selftest note)
     using var emu = new CudaEmulator(RamMB * 1024 * 1024);
     emu.UseJit = useJit;                 // --jit: run the native-CUDA JIT'd guest
+    emu.UsePtxJit = usePtxJit;           // --ptxjit: in-process driver-API JIT (cubin)
     emu.OutputHandler = c => Console.Write(c);
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
