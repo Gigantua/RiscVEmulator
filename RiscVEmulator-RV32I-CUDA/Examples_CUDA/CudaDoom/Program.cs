@@ -117,6 +117,56 @@ if (args.Contains("--bench"))
     return 0;
 }
 
+if (args.Contains("--ttf"))
+{
+    // ── DOOM time-to-first-N-frames (cold boot) — the honest "jumpy code" MIPS
+    //    metric. Unlike the tight compute/data loops in CudaBench, DOOM's cold
+    //    init + early render is branch- and indirection-heavy (WAD parsing, setup,
+    //    the first real render), so this is representative of actual guest code.
+    //    A microbench can look 190x faster yet be slower here — this is the number
+    //    to optimize. Reports M steps, wall time and MIPS to the first N distinct
+    //    non-black frames. `--ttf N` sets N (default 2). ──
+    int want = 2;
+    int fi = Array.IndexOf(args, "--ttf");
+    if (fi >= 0 && fi + 1 < args.Length && int.TryParse(args[fi + 1], out int wn)) want = wn;
+
+    using var emu = new CudaEmulator(RamMB * 1024 * 1024);
+    emu.OutputHandler = _ => { };
+    uint entry = emu.LoadElf(elfData);
+    emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
+    emu.LoadBytes(WadBaseAddr, wadData);
+    emu.CommitImage();
+    emu.SetReg(2, StackPointer); emu.SetEntry(entry);
+
+    Console.WriteLine($"DOOM time-to-first-{want}-frames (cold boot, branchy/indirection-heavy):");
+    const int Batch = 200_000;        // small batches → tight time-to-frame, launch overhead is counted (realistic)
+    var sw = Stopwatch.StartNew();
+    long steps = 0; int frames = 0; ulong last = 0;
+    for (int b = 0; b < 20000 && !emu.IsHalted; b++)
+    {
+        emu.StepN(Batch); steps += Batch;
+        var px = emu.Framebuffer.PresentedPixels;
+        ulong h = 1469598103934665603UL; int nz = 0;
+        for (int i = 0; i + 3 < px.Length; i += 4)
+        {
+            if ((px[i] | px[i + 1] | px[i + 2]) != 0) nz++;
+            h = (h ^ px[i]) * 1099511628211UL; h = (h ^ px[i + 1]) * 1099511628211UL; h = (h ^ px[i + 2]) * 1099511628211UL;
+        }
+        if (nz > 5000 && h != last)
+        {
+            last = h; frames++;
+            double s = sw.Elapsed.TotalSeconds;
+            Console.WriteLine($"  frame {frames}: {steps / 1e6:F1}M steps, {s:F2}s, {steps / s / 1e6:F2} MIPS");
+            if (frames >= want)
+            {
+                Console.WriteLine($"=> time-to-{want}-frames: {steps / 1e6:F1}M steps in {s:F2}s = {steps / s / 1e6:F2} MIPS");
+                return 0;
+            }
+        }
+    }
+    Console.Error.WriteLine($"only reached {frames}/{want} frames after {steps / 1e6:F0}M steps"); return 1;
+}
+
 if (shotPath != null)
 {
     // ── Headless: run until DOOM has presented `shotFrame` distinct frames, then

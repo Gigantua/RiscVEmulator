@@ -164,6 +164,16 @@ template<class T> static __device__ __forceinline__ void mem_write(Hart& h, Core
     mmio_write(h, m, a, (uint32_t)v);
 }
 
+// Instruction fetch: pc is always 4-aligned and (for normal code) in RAM. Read
+// through the non-coherent read-only cache (ld.global.nc / __ldg) — the texture
+// path has higher bandwidth and the read-only cache hides the fetch latency that
+// otherwise dominates the step. Safe because guest .text is never written
+// (non-self-modifying code). Edge / non-RAM fetches fall back to the full path.
+static __device__ __forceinline__ uint32_t fetch(CoreMem& m, uint32_t pc) {
+    if (pc + 4u <= m.ram_size) return __ldg(reinterpret_cast<const uint32_t*>(m.ram + pc));
+    return mem_read<uint32_t>(m, pc);
+}
+
 static __device__ void do_trap(Hart& h, CoreMem& mm, uint32_t cause, uint32_t tval) {
     uint32_t tp = h.regs[4];
     h.regs[4] = mem_read<uint32_t>(mm, TRAP_SCRATCH);
@@ -206,8 +216,29 @@ static __device__ bool check_interrupts(Hart& h, CoreMem& mm) {
     return true;
 }
 
+// Branchless OP / OP-IMM ALU: compute every arm, index-select the live one, so
+// ptxas emits selects (no divergent switch) and a warp running mixed f3 stays
+// converged. Bit-identical to the switch arms. arg2 is rs2 (OP) or imm (OP-IMM);
+// sub picks SUB over ADD (only selected when f3==0); sra picks SRA over SRL.
+static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, int32_t s1,
+        uint32_t a2u, int32_t a2s, uint32_t sh, bool sub, bool sra) {
+    uint32_t add  = sub ? (u1 - a2u) : (u1 + a2u);
+    uint32_t sll  = u1 << sh;
+    uint32_t slt  = (uint32_t)(s1 < a2s);
+    uint32_t sltu = (uint32_t)(u1 < a2u);
+    uint32_t xr   = u1 ^ a2u;
+    uint32_t sr   = sra ? (uint32_t)(s1 >> sh) : (u1 >> sh);
+    uint32_t orr  = u1 | a2u;
+    uint32_t andr = u1 & a2u;
+    uint32_t e0 = (f3 & 4u) ? xr   : add;
+    uint32_t e1 = (f3 & 4u) ? sr   : sll;
+    uint32_t e2 = (f3 & 4u) ? orr  : slt;
+    uint32_t e3 = (f3 & 4u) ? andr : sltu;
+    return (f3 & 1u) ? ((f3 & 2u) ? e3 : e1) : ((f3 & 2u) ? e2 : e0);
+}
+
 static __device__ void do_step(Hart& cpu, CoreMem& mm) {
-    const uint32_t instr = mem_read<uint32_t>(mm, cpu.pc);
+    const uint32_t instr = fetch(mm, cpu.pc);
     const int      rd = (instr >> 7) & 0x1F;
     const uint32_t f3 = (instr >> 12) & 0x7, f7 = (instr >> 25) & 0x7F;
     const uint32_t u1 = cpu.regs[(instr >> 15) & 0x1F], u2 = cpu.regs[(instr >> 20) & 0x1F];
@@ -253,16 +284,7 @@ static __device__ void do_step(Hart& cpu, CoreMem& mm) {
         if ((int32_t)cpu.pc >= 0) cpu.pc = nextpc; return;
     }
     case 0x13:
-        switch (f3) {
-            case 0: r = (uint32_t)(s1 + iimm); break;
-            case 1: r = u1 << sh; break;
-            case 2: r = s1 < iimm ? 1u : 0u; break;
-            case 3: r = u1 < (uint32_t)iimm ? 1u : 0u; break;
-            case 4: r = u1 ^ (uint32_t)iimm; break;
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> sh) : u1 >> sh; break;
-            case 6: r = u1 | (uint32_t)iimm; break;
-            case 7: r = u1 & (uint32_t)iimm; break;
-        }
+        r = alu(f3, u1, s1, (uint32_t)iimm, iimm, (uint32_t)sh, false, f7 == 0x20);
         break;
     case 0x33:
         if (f7 == 0x01) switch (f3) {
@@ -274,15 +296,8 @@ static __device__ void do_step(Hart& cpu, CoreMem& mm) {
             case 5: r = (u2==0) ? 0xFFFFFFFFu : (u1/u2); break;
             case 6: r = (s2==0) ? u1 : (s1==(int32_t)0x80000000 && s2==-1) ? 0u : (uint32_t)(s1%s2); break;
             case 7: r = (u2==0) ? u1 : (u1%u2); break;
-        } else switch (f3) {
-            case 0: r = f7 == 0x20 ? (uint32_t)(s1 - s2) : (uint32_t)(s1 + s2); break;
-            case 1: r = u1 << (s2 & 0x1F); break;
-            case 2: r = s1 < s2 ? 1u : 0u; break;
-            case 3: r = u1 < u2 ? 1u : 0u; break;
-            case 4: r = u1 ^ u2; break;
-            case 5: r = f7 == 0x20 ? (uint32_t)(s1 >> (s2 & 0x1F)) : u1 >> (s2 & 0x1F); break;
-            case 6: r = u1 | u2; break;
-            case 7: r = u1 & u2; break;
+        } else {
+            r = alu(f3, u1, s1, u2, s2, (uint32_t)(s2 & 0x1F), f7 == 0x20, f7 == 0x20);
         }
         break;
     case 0x2F: {
@@ -313,7 +328,7 @@ rv32i_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
     CoreState& g = st[id];
     CoreMem    m = mm[id];
     extern __shared__ uint32_t s_regs[];
-    Hart h; h.regs = &s_regs[threadIdx.x * 32];
+    Hart h; h.regs = &s_regs[threadIdx.x * 33];   // stride 33: per-lane regfile, bank-conflict-free
     #pragma unroll
     for (int i = 0; i < 32; i++) h.regs[i] = g.regs[i];
     h.pc = g.pc; h.priv = g.priv;
@@ -388,7 +403,7 @@ API int cuda_rv32i_step_all(int budget) {
     if (g_ncores <= 0) return 0;
     int block = g_ncores < 256 ? g_ncores : 256;
     int    grid  = (g_ncores + block - 1) / block;
-    size_t shmem = (size_t)block * 32 * sizeof(uint32_t);
+    size_t shmem = (size_t)block * 33 * sizeof(uint32_t);
     rv32i_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;

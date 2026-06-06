@@ -101,7 +101,7 @@ if (args.Contains("--sweep"))
     Console.WriteLine("[fill] compute guest, block=256, shared code — scaling core count");
     Console.WriteLine("  cores    aggregate MIPS   per-core MIPS");
     Console.WriteLine("  ─────    ──────────────   ─────────────");
-    foreach (int n in new[] { 1024, 4096, 16384, 32768 })
+    foreach (int n in new[] { 256, 1024, 4096 })
     {
         int budget = Math.Clamp(40_000_000 / n, 20_000, 100_000);
         double agg = Run(comp, n, budget, 0).mips;
