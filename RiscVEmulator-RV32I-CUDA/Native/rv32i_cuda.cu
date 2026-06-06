@@ -206,20 +206,12 @@ static __device__ void trap_system(Hart& h, CoreMem& mm, uint32_t instr) {
     do_trap(h, mm, CAUSE_ILLEGAL, instr);
 }
 
-static __device__ bool check_interrupts(Hart& h, CoreMem& mm) {
-    if (!(mem_read<uint32_t>(mm, IE_FLAG) & STATUS_IE)) return false;
-    if (!(mem_read<uint32_t>(mm, IE_MASK) & PIN_MTIP)) return false;
-    uint64_t mt  = ((uint64_t)mm.per->mtime_hi << 32) | mm.per->mtime_lo;
-    uint64_t cmp = ((uint64_t)mm.per->mtimecmp_hi << 32) | mm.per->mtimecmp_lo;
-    if (mt < cmp) return false;
-    do_trap(h, mm, CAUSE_IRQ_MTIP, 0);
-    return true;
-}
-
-// Branchless OP / OP-IMM ALU: compute every arm, index-select the live one, so
-// ptxas emits selects (no divergent switch) and a warp running mixed f3 stays
-// converged. Bit-identical to the switch arms. arg2 is rs2 (OP) or imm (OP-IMM);
-// sub picks SUB over ADD (only selected when f3==0); sra picks SRA over SRL.
+// Branchless OP / OP-IMM ALU: compute every arm, index-select the live one. On a
+// single warp this is FASTER than a switch (profiled): the 8 independent arms
+// give the scheduler eligible instructions to issue while dependent results bake,
+// hiding the fixed-latency execution-dependency stall that dominates one warp.
+// Bit-identical to the switch arms. sub picks SUB over ADD (selected only when
+// f3==0); sra picks SRA over SRL.
 static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, int32_t s1,
         uint32_t a2u, int32_t a2s, uint32_t sh, bool sub, bool sra) {
     uint32_t add  = sub ? (u1 - a2u) : (u1 + a2u);
@@ -235,6 +227,16 @@ static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, int32_t
     uint32_t e2 = (f3 & 4u) ? orr  : slt;
     uint32_t e3 = (f3 & 4u) ? andr : sltu;
     return (f3 & 1u) ? ((f3 & 2u) ? e3 : e1) : ((f3 & 2u) ? e2 : e0);
+}
+
+static __device__ bool check_interrupts(Hart& h, CoreMem& mm) {
+    if (!(mem_read<uint32_t>(mm, IE_FLAG) & STATUS_IE)) return false;
+    if (!(mem_read<uint32_t>(mm, IE_MASK) & PIN_MTIP)) return false;
+    uint64_t mt  = ((uint64_t)mm.per->mtime_hi << 32) | mm.per->mtime_lo;
+    uint64_t cmp = ((uint64_t)mm.per->mtimecmp_hi << 32) | mm.per->mtimecmp_lo;
+    if (mt < cmp) return false;
+    do_trap(h, mm, CAUSE_IRQ_MTIP, 0);
+    return true;
 }
 
 static __device__ void do_step(Hart& cpu, CoreMem& mm) {
