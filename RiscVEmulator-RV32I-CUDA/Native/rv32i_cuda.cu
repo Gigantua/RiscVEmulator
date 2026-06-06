@@ -351,7 +351,11 @@ rv32i_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
 //    [1025]=AUIPC+ADDI(same), [1026]=AUIPC+LW(same), [1027]=total steps. ──
 static constexpr int PROFN = 1024 + 8;
 
-__global__ void rv32i_profile_kernel(CoreState* st, CoreMem* mm, unsigned long long* prof, int budget) {
+// jump[o*64 + ...]: per control-op o (0=BRANCH taken, 1=JAL, 2=JALR), bucket b =
+// 31-clz(|target-pc| bytes): [0..24]=forward, [25..49]=backward, [50]=count,
+// [51]=sum|dist| bytes (for the average). Sequential (not-taken) flow excluded.
+__global__ void rv32i_profile_kernel(CoreState* st, CoreMem* mm,
+                                     unsigned long long* prof, unsigned long long* jump, int budget) {
     CoreState& g = st[0];
     CoreMem    m = mm[0];
     extern __shared__ uint32_t s_regs[];
@@ -372,7 +376,17 @@ __global__ void rv32i_profile_kernel(CoreState* st, CoreMem* mm, unsigned long l
             prof[1024 + (pop == 0x17 ? 1u : 0u)]++;
         if (pop == 0x17 && op == 0x03 && crs1 == prd && crd == prd && crd != 0) prof[1026]++;
         prof[1027]++;
+        uint32_t old_pc = h.pc;
         do_step(h, m);
+        if ((op == 0x63 || op == 0x6F || op == 0x67) && (int32_t)h.pc >= 0 && h.pc != old_pc + 4u) {
+            int o = (op == 0x63) ? 0 : (op == 0x6F) ? 1 : 2;
+            int32_t  dist = (int32_t)(h.pc - old_pc);
+            uint32_t mag  = dist < 0 ? (uint32_t)(-dist) : (uint32_t)dist;
+            int b = mag ? 31 - __clz((int)mag) : 0; if (b > 24) b = 24;
+            jump[o * 64 + (dist < 0 ? 25 : 0) + b]++;
+            jump[o * 64 + 50]++;
+            jump[o * 64 + 51] += mag;
+        }
         previnstr = instr; previdx = (int)idx;
     }
     #pragma unroll
@@ -510,9 +524,11 @@ rv32i_warp_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
 
 #define API extern "C" __declspec(dllexport)
 
+static constexpr int JUMPN = 3 * 64;
 static CoreState* g_state  = nullptr;
 static CoreMem*   g_mem    = nullptr;
 static unsigned long long* g_prof = nullptr;
+static unsigned long long* g_jump = nullptr;
 static int        g_ncores = 0;
 
 API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsigned int fbH, unsigned int pcmBytes) {
@@ -524,6 +540,8 @@ API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsi
     memset(g_mem,   0, (size_t)nCores * sizeof(CoreMem));
     if (cudaMallocManaged(&g_prof, PROFN * sizeof(unsigned long long)) == cudaSuccess)
         memset(g_prof, 0, PROFN * sizeof(unsigned long long));
+    if (cudaMallocManaged(&g_jump, JUMPN * sizeof(unsigned long long)) == cudaSuccess)
+        memset(g_jump, 0, JUMPN * sizeof(unsigned long long));
 
     unsigned int fbBytes = fbW * fbH * 4u;
     for (int i = 0; i < nCores; i++) {
@@ -588,11 +606,15 @@ API int cuda_rv32i_step_all(int budget) {
     return le != cudaSuccess ? (int)le : (int)se;
 }
 
-API void  cuda_rv32i_prof_reset() { if (g_prof) memset(g_prof, 0, PROFN * sizeof(unsigned long long)); }
+API void  cuda_rv32i_prof_reset() {
+    if (g_prof) memset(g_prof, 0, PROFN * sizeof(unsigned long long));
+    if (g_jump) memset(g_jump, 0, JUMPN * sizeof(unsigned long long));
+}
 API void* cuda_rv32i_prof_ptr()   { return g_prof; }
+API void* cuda_rv32i_jump_ptr()   { return g_jump; }
 API int   cuda_rv32i_profile(int budget) {
     if (!g_prof || g_ncores <= 0) return 0;
-    rv32i_profile_kernel<<<1, 1, 33 * sizeof(uint32_t)>>>(g_state, g_mem, g_prof, budget);
+    rv32i_profile_kernel<<<1, 1, 33 * sizeof(uint32_t)>>>(g_state, g_mem, g_prof, g_jump, budget);
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
 }
@@ -645,5 +667,6 @@ API void cuda_rv32i_shutdown() {
     }
     if (g_state) { cudaFree(g_state); g_state = nullptr; }
     if (g_prof) { cudaFree(g_prof); g_prof = nullptr; }
+    if (g_jump) { cudaFree(g_jump); g_jump = nullptr; }
     g_ncores = 0;
 }

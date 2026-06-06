@@ -155,6 +155,33 @@ if (args.Contains("--isaprof"))
     Console.WriteLine($"  LUI+ADDI (li)   {100.0*p[1024]/total,6:F2}%  ({p[1024]/1e6:F1}M)");
     Console.WriteLine($"  AUIPC+ADDI (la) {100.0*p[1025]/total,6:F2}%  ({p[1025]/1e6:F1}M)");
     Console.WriteLine($"  AUIPC+LW (GOT)  {100.0*p[1026]/total,6:F2}%  ({p[1026]/1e6:F1}M)");
+
+    ulong[] j = emu.JumpRead();
+    string[] jn = { "BRANCH (taken)", "JAL", "JALR" };
+    Console.WriteLine("\n== Taken control-flow jump-length distribution ==");
+    ulong jtot = 0; double jsum = 0;
+    for (int o = 0; o < 3; o++) { jtot += j[o*64+50]; jsum += j[o*64+51]; }
+    for (int o = 0; o < 3; o++)
+    {
+        ulong cnt = j[o*64+50]; if (cnt == 0) continue;
+        double avg = (double)j[o*64+51] / cnt;
+        Console.WriteLine($"  {jn[o],-14} {100.0*cnt/jtot,5:F1}% of jumps   avg |dist| = {avg:F0} B (~{avg/4:F0} instr)");
+        // bucket histogram: bytes in [2^b, 2^(b+1)); fwd then bwd
+        for (int dir = 0; dir < 2; dir++)
+        {
+            var sb = new System.Text.StringBuilder($"      {(dir==0?"fwd":"bwd")}: ");
+            for (int b = 0; b <= 24; b++)
+            {
+                ulong c = j[o*64 + (dir==0?0:25) + b];
+                if (c == 0) continue;
+                int lo = 1 << b;
+                sb.Append(lo >= 1024 ? $"{lo/1024}K:" : $"{lo}B:").Append($"{100.0*c/cnt:F0}% ");
+            }
+            Console.WriteLine(sb.ToString());
+        }
+    }
+    double allavg = jtot > 0 ? jsum / jtot : 0;
+    Console.WriteLine($"  ALL taken jumps: {jtot/1e6:F1}M ({100.0*jtot/total:F1}% of instrs)  avg |dist| = {allavg:F0} B (~{allavg/4:F0} instr)");
     return 0;
 }
 

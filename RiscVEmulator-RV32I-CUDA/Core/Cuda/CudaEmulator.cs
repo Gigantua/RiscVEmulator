@@ -42,6 +42,7 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern int  cuda_rv32i_step_all(int budget);
         [DllImport(Lib)] private static extern void cuda_rv32i_prof_reset();
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_prof_ptr();
+        [DllImport(Lib)] private static extern IntPtr cuda_rv32i_jump_ptr();
         [DllImport(Lib)] private static extern int  cuda_rv32i_profile(int budget);
         [DllImport(Lib)] private static extern int  cuda_rv32i_uart_drain(int core, byte[] dst, int maxlen);
         [DllImport(Lib)] private static extern void cuda_rv32i_kbd_feed(int core, uint entry);
@@ -159,6 +160,15 @@ namespace RiscVEmulator.Core.Cuda
             const int n = 1024 + 8;
             var t = new long[n];
             Marshal.Copy(cuda_rv32i_prof_ptr(), t, 0, n);
+            var u = new ulong[n];
+            for (int i = 0; i < n; i++) u[i] = (ulong)t[i];
+            return u;
+        }
+        public ulong[] JumpRead()
+        {
+            const int n = 3 * 64;
+            var t = new long[n];
+            Marshal.Copy(cuda_rv32i_jump_ptr(), t, 0, n);
             var u = new ulong[n];
             for (int i = 0; i < n; i++) u[i] = (ulong)t[i];
             return u;
