@@ -45,6 +45,8 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_prof_ptr();
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_jump_ptr();
         [DllImport(Lib)] private static extern int  cuda_rv32i_profile(int budget);
+        [DllImport(Lib)] private static extern int  cuda_rv32i_pchist(int budget, uint lo, uint words);
+        [DllImport(Lib)] private static extern IntPtr cuda_rv32i_pchist_ptr();
         [DllImport(Lib)] private static extern int  cuda_rv32i_uart_drain(int core, byte[] dst, int maxlen);
         [DllImport(Lib)] private static extern void cuda_rv32i_kbd_feed(int core, uint entry);
         [DllImport(Lib)] private static extern void cuda_rv32i_kbd_set_mod(int core, uint mod);
@@ -68,6 +70,12 @@ namespace RiscVEmulator.Core.Cuda
         public int  CoreId   { get; }
         public int  NumCores { get; }
         public int  RamBytes { get; }
+
+        /// <summary>Read-only (code/rodata) span [lo, hi) of the loaded ELF, as
+        /// computed by <see cref="LoadElf"/>. Used by profiling tooling to window
+        /// the per-PC histogram over the guest .text. (0, 0) before LoadElf or when
+        /// the ELF has no shareable RO region.</summary>
+        public (uint lo, uint hi) CodeSpan => (_schedLo, _schedHi);
 
         private readonly byte[] _image;
         private uint _schedLo, _schedHi;     // executable span for the bundle schedule
@@ -222,6 +230,25 @@ namespace RiscVEmulator.Core.Cuda
             var u = new ulong[n];
             for (int i = 0; i < n; i++) u[i] = (ulong)t[i];
             return u;
+        }
+
+        /// <summary>Run the (single-guest) profiler binning one counter PER EXECUTED
+        /// PC over the window [lo, lo + words*4), and return the hit counts (one per
+        /// PC word). The actual PC of bucket <c>i</c> is <c>lo + i*4</c>. PCs outside
+        /// the window are dropped — pass the guest .text span. Read-only profiling
+        /// (guest semantics identical to a normal run); mirrors <see cref="ProfRead"/>.</summary>
+        public ulong[] PcHist(int budget, uint lo, uint words)
+        {
+            int rc = cuda_rv32i_pchist(budget, lo, words);
+            if (rc != 0)
+                throw new InvalidOperationException($"cuda_rv32i_pchist failed (CUDA error {rc})");
+            var ptr = cuda_rv32i_pchist_ptr();
+            var result = new ulong[words];
+            if (ptr == IntPtr.Zero || words == 0) return result;
+            var t = new long[words];
+            Marshal.Copy(ptr, t, 0, (int)words);
+            for (int i = 0; i < words; i++) result[i] = (ulong)t[i];
+            return result;
         }
 
         // ── Run ──────────────────────────────────────────────────────────────
