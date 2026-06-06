@@ -516,6 +516,8 @@ static unsigned long long* g_prof = nullptr;
 static unsigned long long* g_jump = nullptr;
 static uint8_t*   g_sched = nullptr;        // precomputed bundle length per PC word
 static uint32_t   g_sched_lo = 0, g_sched_words = 0;
+static unsigned long long* g_pchist = nullptr;   // per-PC exec histogram (see end of file)
+static uint32_t   g_pchist_lo = 0, g_pchist_words = 0;
 static int        g_ncores = 0;
 
 API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsigned int fbH, unsigned int pcmBytes) {
@@ -667,5 +669,68 @@ API void cuda_rv32i_shutdown() {
     if (g_prof) { cudaFree(g_prof); g_prof = nullptr; }
     if (g_jump) { cudaFree(g_jump); g_jump = nullptr; }
     if (g_sched) { cudaFree(g_sched); g_sched = nullptr; g_sched_words = 0; }
+    if (g_pchist) { cudaFree(g_pchist); g_pchist = nullptr; g_pchist_words = 0; }
     g_ncores = 0;
+}
+
+// ── Per-PC execution histogram (cold-init benchmark profiling) ───────────────
+//   Runs the single guest exactly like rv32i_profile_kernel but, instead of an
+//   opcode/pair matrix, bins one counter PER EXECUTED PC into a host-windowed
+//   array indexed by (pc - lo)/4 over [lo, lo + words*4). PCs outside the window
+//   (rare: trap-vector, gateway, MMIO regions) are dropped — the window is meant
+//   to be the guest .text span. The resulting hit-count curve answers "how many
+//   distinct PCs cover X% of executed instructions" — i.e. whether a hot-region
+//   JIT is feasible. Read-only profiling: guest semantics are identical to
+//   do_step (no extra writes to guest state). g_pchist is managed memory so the
+//   host reads it directly after the launch (mirrors g_prof/g_jump). The
+//   g_pchist globals are declared up top alongside g_prof/g_sched.
+
+__global__ void rv32i_pchist_kernel(CoreState* st, CoreMem* mm,
+                                    unsigned long long* hist, uint32_t lo, uint32_t words, int budget) {
+    CoreState& g = st[0];
+    CoreMem    m = mm[0];
+    extern __shared__ uint32_t s_regs[];
+    Hart h; h.regs = s_regs;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) h.regs[i] = g.regs[i];
+    h.pc = g.pc; h.priv = g.priv;
+    for (int i = 0; i < budget && (int32_t)h.pc >= 0; i++) {
+        if ((i & (IRQ_CHECK - 1)) == 0 && check_interrupts(h, m)) continue;
+        if (h.pc == PV_RESUME_GATEWAY) { trap_return(h, m); continue; }
+        uint32_t pc = h.pc;
+        uint32_t idx = (pc - lo) >> 2;        // window-relative word index (wraps if pc < lo)
+        if (idx < words) hist[idx]++;
+        do_step(h, m);
+    }
+    #pragma unroll
+    for (int i = 0; i < 32; i++) g.regs[i] = h.regs[i];
+    g.pc = h.pc; g.priv = h.priv;
+}
+
+// Allocate (or resize) the PC-hist window and zero it. lo/words define the
+// [lo, lo+words*4) span (typically the guest .text). Call before profiling.
+API int cuda_rv32i_pchist_reset(unsigned int lo, unsigned int words) {
+    if (g_pchist && g_pchist_words != words) { cudaFree(g_pchist); g_pchist = nullptr; g_pchist_words = 0; }
+    if (words == 0) { g_pchist_lo = lo; return 0; }
+    if (!g_pchist) {
+        cudaError_t e = cudaMallocManaged(&g_pchist, (size_t)words * sizeof(unsigned long long));
+        if (e != cudaSuccess) { g_pchist = nullptr; g_pchist_words = 0; return (int)e; }
+        g_pchist_words = words;
+    }
+    memset(g_pchist, 0, (size_t)words * sizeof(unsigned long long));
+    g_pchist_lo = lo;
+    return 0;
+}
+API void* cuda_rv32i_pchist_ptr() { return g_pchist; }
+
+// Run the guest for `budget` steps, binning per-PC execution counts over
+// [lo, lo+words*4). Resets/sizes the window first, so a single call is enough.
+API int cuda_rv32i_pchist(int budget, unsigned int lo, unsigned int words) {
+    if (g_ncores <= 0) return 0;
+    int rc = cuda_rv32i_pchist_reset(lo, words);
+    if (rc != 0) return rc;
+    if (!g_pchist || g_pchist_words == 0) return 0;
+    rv32i_pchist_kernel<<<1, 1, 33 * sizeof(uint32_t)>>>(g_state, g_mem, g_pchist, g_pchist_lo, g_pchist_words, budget);
+    cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
+    return le != cudaSuccess ? (int)le : (int)se;
 }
