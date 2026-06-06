@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 static constexpr uint32_t CLINT_BASE  = 0x02000000u, CLINT_SIZE  = 0x10000u;
@@ -379,6 +380,134 @@ __global__ void rv32i_profile_kernel(CoreState* st, CoreMem* mm, unsigned long l
     g.pc = h.pc; g.priv = h.priv;
 }
 
+// ── Warp chunk executor (single guest, 32 lanes, regfile in shared). Each step
+//    the 32 lanes speculatively decode+execute pc..pc+124 in parallel
+//    (convergent → warp fully active). Resolve the chunk with warp intrinsics:
+//      firstBarrier = ffs(ballot(!simpleALU))            -- O(1)
+//      WAW          = match.any(rd) & lanes-below-me      -- O(1)
+//      RAW          = shfl_up(rd) scan, BOUNDED by firstBarrier (~2-3 iters on
+//                     DOOM, not 32 — this is what killed the naive version).
+//    Retire the independent ALU prefix [0,L) in one shot; lane 0 runs ONE serial
+//    do_step for the boundary instruction (load/store/branch/JALR/SYSTEM/M/A). ──
+__global__ void __launch_bounds__(32)
+rv32i_warp_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
+    int gid = blockIdx.x;
+    if (gid >= ncores) return;
+    int lane = threadIdx.x;
+    const unsigned FULL = 0xFFFFFFFFu;
+    CoreState& g = st[gid];
+    CoreMem    m = mm[gid];
+    extern __shared__ uint32_t regs[];          // [32], shared by the warp
+    regs[lane] = g.regs[lane];
+    __syncwarp();
+    uint32_t pc = g.pc, priv = g.priv;
+
+    for (int i = 0; i < budget && (int32_t)pc >= 0; ) {
+        int trapped = 0;
+        if (lane == 0) {
+            Hart h; h.regs = regs; h.pc = pc; h.priv = priv;
+            if (check_interrupts(h, m)) trapped = 1;
+            else if (pc == PV_RESUME_GATEWAY) { trap_return(h, m); trapped = 1; }
+            pc = h.pc; priv = h.priv;
+        }
+        trapped = __shfl_sync(FULL, trapped, 0);
+        pc      = __shfl_sync(FULL, pc, 0);
+        priv    = __shfl_sync(FULL, priv, 0);
+        if (trapped) { i++; continue; }
+
+        // Parallel speculative decode + ALU of the 32-instruction window.
+        uint32_t ipc   = pc + (uint32_t)(lane * 4);
+        uint32_t instr = (ipc + 4u <= m.ram_size) ? __ldg((const uint32_t*)(m.ram + ipc)) : 0u;
+        uint32_t op = instr & 0x7F, rd = (instr >> 7) & 0x1F;
+        uint32_t rs1i = (instr >> 15) & 0x1F, rs2i = (instr >> 20) & 0x1F;
+        uint32_t f3 = (instr >> 12) & 7, f7 = (instr >> 25) & 0x7F;
+        bool simple   = (op == 0x37) || (op == 0x17) || (op == 0x13) || (op == 0x33 && f7 != 0x01);
+        bool readsRs1 = (op == 0x13) || (op == 0x33);
+        bool readsRs2 = (op == 0x33);
+        uint32_t u1 = regs[rs1i], u2 = regs[rs2i];
+        int32_t  s1 = (int32_t)u1, s2 = (int32_t)u2;
+        int32_t  iimm = (int32_t)instr >> 20; uint32_t sh = (instr >> 20) & 0x1F;
+        uint32_t res = 0;
+        if      (op == 0x37) res = instr & 0xFFFFF000u;
+        else if (op == 0x17) res = ipc + (instr & 0xFFFFF000u);
+        else if (op == 0x13) res = alu(f3, u1, s1, (uint32_t)iimm, iimm, sh, false, f7 == 0x20);
+        else if (op == 0x33) res = alu(f3, u1, s1, u2, s2, (uint32_t)(s2 & 0x1F), f7 == 0x20, f7 == 0x20);
+
+        unsigned bm = __ballot_sync(FULL, !simple);
+        int fb = bm ? __ffs((int)bm) - 1 : 32;                 // first barrier (O(1))
+
+        unsigned same = __match_any_sync(FULL, rd);            // lanes sharing my rd
+        bool waw = (rd != 0) && ((same & ((1u << lane) - 1u)) != 0u);
+
+        bool raw = false;                                      // RAW scan, bounded by fb
+        for (int d = 1; d < fb; d++) {
+            uint32_t rdj = __shfl_up_sync(FULL, rd, d);
+            if (d <= lane && rdj != 0 && ((readsRs1 && rdj == rs1i) || (readsRs2 && rdj == rs2i))) raw = true;
+        }
+        bool dep = (lane < fb) && (raw || waw);
+        unsigned dm = __ballot_sync(FULL, dep);
+        int fd = dm ? __ffs((int)dm) - 1 : 32;
+        int L  = fb < fd ? fb : fd;
+
+        if (lane < L && rd != 0) regs[rd] = res;
+        __syncwarp();
+        pc += (uint32_t)(L * 4); i += L;
+
+        // Boundary instruction (the first barrier, at lane L) executed inline by
+        // lane L using its decoded fields + post-retire operands. Common cases
+        // (branch/jal/jalr/load/store) avoid the full do_step machinery; rare ops
+        // (SYSTEM/M/A/FENCE) fall back to do_step.
+        if (L < 32 && i < budget && (int32_t)pc >= 0) {
+            if (lane == L) {
+                uint32_t a1 = regs[rs1i], a2 = regs[rs2i];   // operands AFTER the prefix retired
+                uint32_t npc = pc + 4u;
+                if (op == 0x63) {                            // BRANCH
+                    int taken = 0;
+                    switch (f3) { case 0: taken = a1==a2; break; case 1: taken = a1!=a2; break;
+                                  case 4: taken = (int32_t)a1<(int32_t)a2; break; case 5: taken = (int32_t)a1>=(int32_t)a2; break;
+                                  case 6: taken = a1<a2; break; case 7: taken = a1>=a2; break; }
+                    uint32_t bimm = (((instr>>31)&1u)<<12 | ((instr>>7)&1u)<<11 | ((instr>>25)&0x3Fu)<<5 | ((instr>>8)&0xFu)<<1)
+                                  | ((instr & 0x80000000u) ? 0xFFFFE000u : 0u);
+                    if (taken) npc = pc + bimm;
+                } else if (op == 0x6F) {                     // JAL
+                    uint32_t jimm = (((instr>>31)&1u)<<20 | ((instr>>12)&0xFFu)<<12 | ((instr>>20)&1u)<<11 | ((instr>>21)&0x3FFu)<<1)
+                                  | ((instr & 0x80000000u) ? 0xFFE00000u : 0u);
+                    if (rd) regs[rd] = pc + 4u; npc = pc + jimm;
+                } else if (op == 0x67) {                     // JALR
+                    uint32_t t = (uint32_t)((int32_t)a1 + iimm) & ~1u; if (rd) regs[rd] = pc + 4u; npc = t;
+                } else if (op == 0x03) {                     // LOAD
+                    uint32_t addr = (uint32_t)((int32_t)a1 + iimm), v = 0;
+                    switch (f3) { case 0: v = (uint32_t)(int8_t) mem_read<uint8_t> (m, addr); break;
+                                  case 1: v = (uint32_t)(int16_t)mem_read<uint16_t>(m, addr); break;
+                                  case 2: v =                    mem_read<uint32_t>(m, addr); break;
+                                  case 4: v =                    mem_read<uint8_t> (m, addr); break;
+                                  case 5: v =                    mem_read<uint16_t>(m, addr); break; }
+                    if (rd) regs[rd] = v;
+                } else if (op == 0x23) {                     // STORE
+                    int32_t simm = ((int32_t)(instr & 0xFE000000) >> 20) | (int32_t)((instr >> 7) & 0x1F);
+                    uint32_t addr = (uint32_t)((int32_t)a1 + simm);
+                    Hart h; h.regs = regs; h.pc = pc; h.priv = priv;
+                    switch (f3) { case 0: mem_write<uint8_t> (h, m, addr, (uint8_t) a2); break;
+                                  case 1: mem_write<uint16_t>(h, m, addr, (uint16_t)a2); break;
+                                  case 2: mem_write<uint32_t>(h, m, addr,           a2); break; }
+                    npc = (int32_t)h.pc < 0 ? h.pc : pc + 4u;     // exit device may set pc<0
+                } else {                                     // SYSTEM / M / A / FENCE
+                    Hart h; h.regs = regs; h.pc = pc; h.priv = priv;
+                    do_step(h, m); npc = h.pc; priv = h.priv;
+                }
+                regs[0] = 0; pc = npc;
+            }
+            __syncwarp();
+            pc   = __shfl_sync(FULL, pc, L);
+            priv = __shfl_sync(FULL, priv, L);
+            i += 1;
+        }
+    }
+    __syncwarp();
+    g.regs[lane] = regs[lane];
+    if (lane == 0) { g.pc = pc; g.priv = priv; }
+}
+
 #define API extern "C" __declspec(dllexport)
 
 static CoreState* g_state  = nullptr;
@@ -441,10 +570,20 @@ API void cuda_rv32i_set_mtime(int core, unsigned int lo, unsigned int hi) {
 
 API int cuda_rv32i_step_all(int budget) {
     if (g_ncores <= 0) return 0;
-    int block = g_ncores < 256 ? g_ncores : 256;
-    int    grid  = (g_ncores + block - 1) / block;
-    size_t shmem = (size_t)block * 33 * sizeof(uint32_t);
-    rv32i_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
+    // Default: single-thread kernel (fastest on jumpy guests). RVEMU_WARP=1 opts
+    // into the warp chunk executor (32 decoded/step, chains solved via ballot/
+    // match/shfl) — correct, but ~2x slower on DOOM: the per-step warp-sync
+    // coordination overhead exceeds the ~2-3 instructions of ILP it extracts.
+    static int warp = -1;
+    if (warp < 0) { const char* e = getenv("RVEMU_WARP"); warp = (e && e[0] == '1') ? 1 : 0; }
+    if (warp) {
+        rv32i_warp_kernel<<<g_ncores, 32, 32 * sizeof(uint32_t)>>>(g_state, g_mem, g_ncores, budget);
+    } else {
+        int block = g_ncores < 256 ? g_ncores : 256;
+        int grid  = (g_ncores + block - 1) / block;
+        size_t shmem = (size_t)block * 33 * sizeof(uint32_t);
+        rv32i_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
+    }
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
 }
