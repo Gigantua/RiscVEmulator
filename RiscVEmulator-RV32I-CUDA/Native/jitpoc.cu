@@ -43,7 +43,7 @@ __global__ void interp_kernel(const Uop* __restrict__ prog, int n, long iters,
 
 // ── runtime PTX codegen: emit a trace (load regs → loop body → store regs) ──
 // param0 = &regs[32], param1 = iters, param2 = guest mem base.
-static std::string gen_ptx(const Uop* p, int n) {
+static std::string gen_ptx(const Uop* p, int n, bool spill = false) {
     std::ostringstream o;
     o << ".version 7.8\n.target sm_86\n.address_size 64\n"
       << ".visible .entry jit_trace(.param .u64 pr, .param .u64 pit, .param .u64 pm) {\n"
@@ -70,6 +70,10 @@ static std::string gen_ptx(const Uop* p, int n) {
                   << "  st.global.u32 [%rd6], %x"<<b<<";\n"; break;
         }
     }
+    if (spill) {  // model a dynamic-dispatch (JALR) boundary: spill+reload all 32 regs per trace
+        for (int i = 0; i < 32; i++) o << "  st.global.u32 [%rd1+" << i*4 << "], %x" << i << ";\n";
+        for (int i = 0; i < 32; i++) o << "  ld.global.u32 %x" << i << ", [%rd1+" << i*4 << "];\n";
+    }
     o << "  add.u64 %rd3, %rd3, 1;\n  bra $L;\n$D:\n";
     for (int i = 0; i < 32; i++) o << "  st.global.u32 [%rd1+" << i*4 << "], %x" << i << ";\n";
     o << "  ret;\n}\n";
@@ -78,7 +82,7 @@ static std::string gen_ptx(const Uop* p, int n) {
 
 struct Bench { const char* name; Uop* hprog; int n; long iters; };
 
-static void run(const char* name, Uop* hprog, int n, long iters) {
+static void run(const char* name, Uop* hprog, int n, long iters, bool spill = false) {
     Uop* dprog; cudaMalloc(&dprog, n*sizeof(Uop)); cudaMemcpy(dprog, hprog, n*sizeof(Uop), cudaMemcpyHostToDevice);
     uint32_t *oa, *oc, *mem; cudaMalloc(&oa,128); cudaMalloc(&oc,128); cudaMalloc(&mem, MEMW*4);
     uint32_t init[32]; for (int i=0;i<32;i++) init[i]=i+1;
@@ -95,7 +99,7 @@ static void run(const char* name, Uop* hprog, int n, long iters) {
     ai = timeit([&]{ interp_kernel<<<1,1>>>(dprog,n,iters,mem,oa); });
 
     cudaFree(0);
-    std::string ptx = gen_ptx(hprog, n);
+    std::string ptx = gen_ptx(hprog, n, spill);
     CUmodule mod; CUfunction fn;
     char log[8192]; CUjit_option opt[2]={CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
     void* ov[2]={log,(void*)sizeof(log)}; log[0]=0;
@@ -147,5 +151,10 @@ int main() {
         {3,5,10,0,7},    // r5 = r10 + 7  (feeds next iter's first load addr)
     };
     run("(B) DOOM-like load/store/ALU mix (8 ops)", mix8, 8, 2'000'000);
+
+    // (C) same mix, but model a DYNAMIC-DISPATCH (JALR) boundary every 8 instrs: spill +
+    // reload all 32 regs per trace. This is the pessimistic bound (real DOOM: ~2.5% JALR,
+    // most boundaries are static/chainable → no spill). Shows how much dispatch erodes (B).
+    run("(C) mix + full 32-reg spill/reload per trace (JALR-dispatch floor)", mix8, 8, 2'000'000, true);
     return 0;
 }
