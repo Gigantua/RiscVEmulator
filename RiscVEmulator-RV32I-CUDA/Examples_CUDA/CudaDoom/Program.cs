@@ -117,6 +117,47 @@ if (args.Contains("--bench"))
     return 0;
 }
 
+if (args.Contains("--isaprof"))
+{
+    // ── Dynamic ISA profile of DOOM: which opcodes dominate, which instruction
+    //    follows which, and how often the fusible idioms (li/la/GOT) actually
+    //    occur — to focus optimization on the hot instructions/pairs. ──
+    using var emu = new CudaEmulator(RamMB * 1024 * 1024);
+    emu.OutputHandler = _ => { };
+    uint entry = emu.LoadElf(elfData);
+    emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
+    emu.LoadBytes(WadBaseAddr, wadData);
+    emu.CommitImage();
+    emu.SetReg(2, StackPointer); emu.SetEntry(entry);
+    Console.WriteLine("isaprof: warming into gameplay...");
+    for (int b = 0; b < 40 && !emu.IsHalted; b++) emu.StepN(1_000_000);   // past init into render
+    Console.WriteLine("isaprof: profiling 40M steps (TDR-safe chunks)...");
+    emu.ProfReset();
+    for (int b = 0; b < 20 && !emu.IsHalted; b++) emu.Profile(2_000_000);
+    ulong[] p = emu.ProfRead();
+
+    string[] name = new string[32];
+    for (int i = 0; i < 32; i++) name[i] = $"op{i*4+3:X2}";
+    name[0]="LOAD"; name[3]="FENCE"; name[4]="OP-IMM"; name[5]="AUIPC"; name[8]="STORE";
+    name[11]="AMO"; name[12]="OP"; name[13]="LUI"; name[24]="BRANCH"; name[25]="JALR"; name[27]="JAL"; name[28]="SYSTEM";
+
+    ulong total = p[1027]; if (total == 0) { Console.Error.WriteLine("no steps profiled"); return 1; }
+    var op = new ulong[32];
+    var pairs = new List<(ulong c, int a, int b)>();
+    for (int a = 0; a < 32; a++) for (int b = 0; b < 32; b++) { ulong c = p[a*32+b]; op[a]+=c; if (c>0) pairs.Add((c,a,b)); }
+    Console.WriteLine($"\n== Dynamic opcode mix ({total/1e6:F0}M instrs) ==");
+    foreach (var (c,i) in op.Select((c,i)=>(c,i)).OrderByDescending(x=>x.c).Take(12))
+        if (c>0) Console.WriteLine($"  {name[i],-8} {100.0*c/total,6:F2}%  ({c/1e6:F1}M)");
+    Console.WriteLine("\n== Top adjacent pairs (prev -> cur) ==");
+    foreach (var (c,a,b) in pairs.OrderByDescending(x=>x.c).Take(15))
+        Console.WriteLine($"  {name[a],-8} -> {name[b],-8} {100.0*c/total,6:F2}%  ({c/1e6:F1}M)");
+    Console.WriteLine("\n== Fusible idioms (exact, same-reg) ==");
+    Console.WriteLine($"  LUI+ADDI (li)   {100.0*p[1024]/total,6:F2}%  ({p[1024]/1e6:F1}M)");
+    Console.WriteLine($"  AUIPC+ADDI (la) {100.0*p[1025]/total,6:F2}%  ({p[1025]/1e6:F1}M)");
+    Console.WriteLine($"  AUIPC+LW (GOT)  {100.0*p[1026]/total,6:F2}%  ({p[1026]/1e6:F1}M)");
+    return 0;
+}
+
 if (args.Contains("--prof"))
 {
     // ── Nsight Compute harness: warm into representative DOOM code, then issue a

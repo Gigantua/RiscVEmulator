@@ -344,10 +344,46 @@ rv32i_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
     g.pc = h.pc; g.priv = h.priv;
 }
 
+// ── ISA profiler: dynamic opcode histogram + adjacent-pair matrix + exact
+//    fusion-pattern hit counts, for one guest. idx = (instr>>2)&0x1F (32 buckets).
+//    prof[prev*32+cur] = dynamic pair count; prof[1024]=LUI+ADDI(same rd) fusions,
+//    [1025]=AUIPC+ADDI(same), [1026]=AUIPC+LW(same), [1027]=total steps. ──
+static constexpr int PROFN = 1024 + 8;
+
+__global__ void rv32i_profile_kernel(CoreState* st, CoreMem* mm, unsigned long long* prof, int budget) {
+    CoreState& g = st[0];
+    CoreMem    m = mm[0];
+    extern __shared__ uint32_t s_regs[];
+    Hart h; h.regs = s_regs;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) h.regs[i] = g.regs[i];
+    h.pc = g.pc; h.priv = g.priv;
+    uint32_t previnstr = 0; int previdx = 32;
+    for (int i = 0; i < budget && (int32_t)h.pc >= 0; i++) {
+        if ((i & (IRQ_CHECK - 1)) == 0 && check_interrupts(h, m)) { previdx = 32; continue; }
+        if (h.pc == PV_RESUME_GATEWAY) { trap_return(h, m); previdx = 32; continue; }
+        uint32_t instr = fetch(m, h.pc);
+        uint32_t idx = (instr >> 2) & 0x1F;
+        if (previdx < 32) prof[previdx * 32 + idx]++;
+        uint32_t op = instr & 0x7F, pop = previnstr & 0x7F;
+        uint32_t prd = (previnstr >> 7) & 0x1F, crs1 = (instr >> 15) & 0x1F, crd = (instr >> 7) & 0x1F, cf3 = (instr >> 12) & 7;
+        if ((pop == 0x37 || pop == 0x17) && op == 0x13 && cf3 == 0 && crs1 == prd && crd == prd && crd != 0)
+            prof[1024 + (pop == 0x17 ? 1u : 0u)]++;
+        if (pop == 0x17 && op == 0x03 && crs1 == prd && crd == prd && crd != 0) prof[1026]++;
+        prof[1027]++;
+        do_step(h, m);
+        previnstr = instr; previdx = (int)idx;
+    }
+    #pragma unroll
+    for (int i = 0; i < 32; i++) g.regs[i] = h.regs[i];
+    g.pc = h.pc; g.priv = h.priv;
+}
+
 #define API extern "C" __declspec(dllexport)
 
 static CoreState* g_state  = nullptr;
 static CoreMem*   g_mem    = nullptr;
+static unsigned long long* g_prof = nullptr;
 static int        g_ncores = 0;
 
 API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsigned int fbH, unsigned int pcmBytes) {
@@ -357,6 +393,8 @@ API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsi
     if ((e = cudaMallocManaged(&g_mem,   (size_t)nCores * sizeof(CoreMem)))   != cudaSuccess) return (int)e;
     memset(g_state, 0, (size_t)nCores * sizeof(CoreState));
     memset(g_mem,   0, (size_t)nCores * sizeof(CoreMem));
+    if (cudaMallocManaged(&g_prof, PROFN * sizeof(unsigned long long)) == cudaSuccess)
+        memset(g_prof, 0, PROFN * sizeof(unsigned long long));
 
     unsigned int fbBytes = fbW * fbH * 4u;
     for (int i = 0; i < nCores; i++) {
@@ -411,6 +449,15 @@ API int cuda_rv32i_step_all(int budget) {
     return le != cudaSuccess ? (int)le : (int)se;
 }
 
+API void  cuda_rv32i_prof_reset() { if (g_prof) memset(g_prof, 0, PROFN * sizeof(unsigned long long)); }
+API void* cuda_rv32i_prof_ptr()   { return g_prof; }
+API int   cuda_rv32i_profile(int budget) {
+    if (!g_prof || g_ncores <= 0) return 0;
+    rv32i_profile_kernel<<<1, 1, 33 * sizeof(uint32_t)>>>(g_state, g_mem, g_prof, budget);
+    cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
+    return le != cudaSuccess ? (int)le : (int)se;
+}
+
 API int cuda_rv32i_uart_drain(int core, unsigned char* dst, int maxlen) {
     Periph* p = g_mem[core].per; int n = 0;
     while (p->tx_tail != p->tx_head && n < maxlen) { dst[n++] = p->tx[p->tx_tail & TXM]; p->tx_tail++; }
@@ -458,5 +505,6 @@ API void cuda_rv32i_shutdown() {
         cudaFree(g_mem); g_mem = nullptr;
     }
     if (g_state) { cudaFree(g_state); g_state = nullptr; }
+    if (g_prof) { cudaFree(g_prof); g_prof = nullptr; }
     g_ncores = 0;
 }
