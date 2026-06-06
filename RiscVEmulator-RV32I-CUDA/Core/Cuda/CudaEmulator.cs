@@ -33,6 +33,7 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern int  cuda_rv32i_read_fb(int core, byte[] dst, uint len);
         [DllImport(Lib)] private static extern int  cuda_rv32i_read_pcm(int core, IntPtr dst, uint len);
         [DllImport(Lib)] private static extern int  cuda_rv32i_set_schedule(byte[] data, uint lo, uint words);
+        [DllImport(Lib)] private static extern int  cuda_rv32i_set_shared_ro(byte[] data, uint lo, uint hi);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_reg(int core, int i, uint v);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_entry(int core, uint pc);
         [DllImport(Lib)] private static extern uint cuda_rv32i_get_pc(int core);
@@ -185,7 +186,11 @@ namespace RiscVEmulator.Core.Cuda
         }
 
         /// <summary>Broadcast the staged RAM image to ALL cores and set their sp/entry
-        /// — used to run N independent copies of the same guest (throughput demo).</summary>
+        /// — used to run N independent copies of the same guest (throughput demo).
+        /// For N &gt; 1 it also installs the shared read-only image so all cores'
+        /// instruction fetches / rodata reads converge on one cache-resident
+        /// device copy of the guest's .text+rodata span (the dominant per-step
+        /// cost), instead of N duplicate per-core working sets.</summary>
         public void CommitImageToAllCores(uint sp, uint entry)
         {
             for (int c = 0; c < NumCores; c++)
@@ -195,7 +200,35 @@ namespace RiscVEmulator.Core.Cuda
                 cuda_rv32i_set_entry(c, entry);
             }
             BuildSchedule();
+            if (NumCores > 1) CommitSharedRo();   // single-core stays on the per-core-RAM path (bit-identical)
             _committed = true;
+        }
+
+        /// <summary>Number of bytes in the shared read-only image (0 if none / not
+        /// installed). Reported by the throughput benchmark as the per-core VRAM
+        /// avoided by deduplicating the RO segment across cores.</summary>
+        public int SharedRoBytes { get; private set; }
+
+        // Install (or clear) the shared RO image from the staged guest image. The
+        // page-aligned RO span [lo, hi) comes from the ELF program headers
+        // (ReadOnlyCodeSpan); the device gets ONE copy that all cores alias for
+        // fetches + RO-range reads. Returns the byte count installed.
+        public int CommitSharedRo()
+        {
+            uint lo = _schedLo & ~0xFFFu, hi = (_schedHi + 0xFFFu) & ~0xFFFu;
+            if (hi <= lo || hi > (uint)_image.Length)
+            {
+                cuda_rv32i_set_shared_ro(Array.Empty<byte>(), 0, 0);
+                SharedRoBytes = 0;
+                return 0;
+            }
+            int bytes = (int)(hi - lo);
+            var ro = new byte[bytes];
+            Array.Copy(_image, (int)lo, ro, 0, bytes);
+            int rc = cuda_rv32i_set_shared_ro(ro, lo, hi);
+            if (rc != 0) throw new InvalidOperationException($"cuda_rv32i_set_shared_ro failed (CUDA error {rc})");
+            SharedRoBytes = bytes;
+            return bytes;
         }
 
         public void SetReg(int index, uint value) => cuda_rv32i_set_reg(CoreId, index, value);

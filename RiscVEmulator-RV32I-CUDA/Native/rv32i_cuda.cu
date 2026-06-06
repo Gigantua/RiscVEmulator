@@ -58,6 +58,13 @@ struct CoreState { uint32_t regs[32], pc, priv; };
 struct CoreMem {
     uint8_t* ram; uint8_t* fb; uint8_t* pcm; uint8_t* trap; Periph* per;
     uint32_t ram_size, fb_bytes, pcm_bytes, fb_w, fb_h;
+    // Shared read-only image (throughput unit). One device copy of the guest's
+    // RO span [ro_lo, ro_hi) (.text + rodata) backs ALL cores. Fetches and reads
+    // in that range hit this one cache-resident buffer instead of each core's own
+    // RAM copy, so N cores share a single instruction-fetch working set. ro == 0
+    // disables sharing — the single-core path then routes everything to per-core
+    // RAM exactly as before (bit-identical).
+    const uint8_t* ro; uint32_t ro_lo, ro_hi;
 };
 struct Hart { uint32_t* regs; uint32_t pc, priv; };
 
@@ -151,6 +158,15 @@ static __device__ void mmio_write(Hart& h, CoreMem& m, uint32_t a, uint32_t val)
 }
 
 template<class T> static __device__ __forceinline__ T mem_read(CoreMem& m, uint32_t a) {
+    // Reads fully inside the shared RO span come from the one shared image (all
+    // cores alias it). The RO span is a sub-range of [0, ram_size); writes to it
+    // never happen in correct guest code, so the per-core RAM copy of that range
+    // is never observed. The whole access [a, a+sizeof(T)) must fit so a
+    // misaligned load straddling ro_hi doesn't read past the (hi-lo)-byte buffer
+    // — such a straddling read falls through to per-core RAM, which holds the
+    // identical bytes. With ro == 0 (single core) span==0, so this branch is dead.
+    uint32_t roff = a - m.ro_lo, rspan = m.ro_hi - m.ro_lo;
+    if (roff < rspan && roff + sizeof(T) <= rspan) return ld_le<T>(m.ro, roff);
     if (a < m.ram_size)             return ld_le<T>(m.ram, a);
     if (a - FB_BASE  < m.fb_bytes)  return ld_le<T>(m.fb,  a - FB_BASE);
     if (a - PCM_BASE < m.pcm_bytes) return ld_le<T>(m.pcm, a - PCM_BASE);
@@ -171,6 +187,13 @@ template<class T> static __device__ __forceinline__ void mem_write(Hart& h, Core
 // otherwise dominates the step. Safe because guest .text is never written
 // (non-self-modifying code). Edge / non-RAM fetches fall back to the full path.
 static __device__ __forceinline__ uint32_t fetch(CoreMem& m, uint32_t pc) {
+    // Shared RO image first: all cores' fetches converge on one cache-resident
+    // copy of .text, which is the whole point of the throughput model. The span
+    // is 4-aligned and pc is always 4-aligned, so pc+4 <= ro_hi is the in-range
+    // test. With ro == 0 the subtraction underflows to a huge value and this is
+    // skipped (single-core falls through to per-core RAM, bit-identical).
+    if (pc - m.ro_lo < m.ro_hi - m.ro_lo)
+        return __ldg(reinterpret_cast<const uint32_t*>(m.ro + (pc - m.ro_lo)));
     if (pc + 4u <= m.ram_size) return __ldg(reinterpret_cast<const uint32_t*>(m.ram + pc));
     return mem_read<uint32_t>(m, pc);
 }
@@ -519,6 +542,7 @@ static uint32_t   g_sched_lo = 0, g_sched_words = 0;
 static unsigned long long* g_pchist = nullptr;   // per-PC exec histogram (see end of file)
 static uint32_t   g_pchist_lo = 0, g_pchist_words = 0;
 static int        g_ncores = 0;
+static uint8_t*   g_ro = nullptr;           // shared read-only image (one copy, all cores)
 
 API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsigned int fbH, unsigned int pcmBytes) {
     g_ncores = nCores;
@@ -670,6 +694,7 @@ API void cuda_rv32i_shutdown() {
     if (g_jump) { cudaFree(g_jump); g_jump = nullptr; }
     if (g_sched) { cudaFree(g_sched); g_sched = nullptr; g_sched_words = 0; }
     if (g_pchist) { cudaFree(g_pchist); g_pchist = nullptr; g_pchist_words = 0; }
+    if (g_ro) { cudaFree(g_ro); g_ro = nullptr; }
     g_ncores = 0;
 }
 
@@ -733,4 +758,34 @@ API int cuda_rv32i_pchist(int budget, unsigned int lo, unsigned int words) {
     rv32i_pchist_kernel<<<1, 1, 33 * sizeof(uint32_t)>>>(g_state, g_mem, g_pchist, g_pchist_lo, g_pchist_words, budget);
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
+}
+
+// ── Shared read-only image (throughput model) ───────────────────────────────
+// Allocate ONE device copy of the guest's RO span [lo, hi) and point every
+// core's CoreMem at it. After this, fetches and reads in [lo, hi) hit the one
+// shared, cache-resident buffer instead of N duplicate per-core RAM copies — so
+// N independent guests share a single instruction-fetch working set, which is
+// the dominant per-step cost. `data` holds (hi-lo) bytes (the host slices it
+// from the committed image). Passing words==0 / lo>=hi disables sharing on all
+// cores (clears ro), which restores the per-core-RAM path (bit-identical).
+//
+// Correctness: writes are NEVER routed here (mem_write always targets per-core
+// RAM); correct guest code never writes its own .text/rodata, so the per-core
+// RAM copy of [lo, hi) is write-dead and the shared read is authoritative. The
+// span must lie wholly within [0, ram_size) and be 4-aligned (it is — the host
+// page-aligns it). Idempotent: re-commits free the previous buffer first.
+API int cuda_rv32i_set_shared_ro(const void* data, unsigned int lo, unsigned int hi) {
+    if (g_ro) { cudaFree(g_ro); g_ro = nullptr; }
+    if (hi <= lo) {                              // disable sharing on every core
+        for (int i = 0; i < g_ncores; i++) { g_mem[i].ro = nullptr; g_mem[i].ro_lo = 0; g_mem[i].ro_hi = 0; }
+        cudaDeviceSynchronize();
+        return (int)cudaGetLastError();
+    }
+    unsigned int bytes = hi - lo;
+    cudaError_t e;
+    if ((e = cudaMalloc(&g_ro, bytes)) != cudaSuccess) return (int)e;
+    if ((e = cudaMemcpy(g_ro, data, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) return (int)e;
+    for (int i = 0; i < g_ncores; i++) { g_mem[i].ro = g_ro; g_mem[i].ro_lo = lo; g_mem[i].ro_hi = hi; }
+    cudaDeviceSynchronize();
+    return (int)cudaGetLastError();
 }
