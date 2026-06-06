@@ -84,6 +84,13 @@ namespace RiscVEmulator.Core.Cuda
         private bool _committed, _halted, _disposed;
         private int  _exitCode;
 
+        /// <summary>When true, the guest clock (RTC + CLINT mtime) advances from the
+        /// cumulative guest-step count instead of the host wall clock, so a fixed
+        /// step budget executes a reproducible instruction stream regardless of how
+        /// fast the host runs it. Used by the perf benchmark for clean A/B.</summary>
+        public bool DeterministicTime { get; set; }
+        private ulong _totalSteps;
+
         public Action<char>? OutputHandler { get; set; }
         /// <summary>Optional raw MIDI sink (offset, value) — set instead of/alongside
         /// <see cref="Midi"/> to observe messages without winmm playback (used by tests).</summary>
@@ -224,6 +231,7 @@ namespace RiscVEmulator.Core.Cuda
             if (_halted) return 0;
             if (!_committed) throw new InvalidOperationException("CommitImage() must be called before StepN().");
 
+            _totalSteps += (ulong)n;
             StageInputs();
             int rc = cuda_rv32i_step_all(n);
             if (rc != 0)
@@ -257,20 +265,28 @@ namespace RiscVEmulator.Core.Cuda
             if (dx != 0 || dy != 0 || btn != 0)
                 cuda_rv32i_mouse_feed(CoreId, dx, dy, btn);
 
-            // Wall-clock time for the RTC.
-            ulong us  = (ulong)_clock.Elapsed.TotalMicroseconds;
-            ulong ms  = (ulong)_clock.ElapsedMilliseconds;
-            ulong ep  = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            uint  sec = (uint)_clock.Elapsed.TotalSeconds;
+            // Guest clock: wall-clock by default, or derived from the cumulative
+            // step count when DeterministicTime is set (reproducible benchmark).
+            ulong us, ms, ep, mtime; uint sec;
+            if (DeterministicTime)
+            {
+                us  = _totalSteps / 3UL;                 // ~3 guest steps per virtual µs
+                ms  = us / 1000UL;
+                sec = (uint)(us / 1_000_000UL);
+                ep  = 1_700_000_000UL + sec;             // fixed deterministic epoch base
+                mtime = us * (TimebaseHz / 1_000_000UL); // CLINT ticks (60 MHz timebase)
+            }
+            else
+            {
+                us  = (ulong)_clock.Elapsed.TotalMicroseconds;
+                ms  = (ulong)_clock.ElapsedMilliseconds;
+                ep  = (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                sec = (uint)_clock.Elapsed.TotalSeconds;
+                ulong ticks = (ulong)_clock.ElapsedTicks, freq = (ulong)Stopwatch.Frequency;
+                mtime = (ticks / freq) * TimebaseHz + (ticks % freq) * TimebaseHz / freq;
+            }
             cuda_rv32i_set_time(CoreId, (uint)us, (uint)(us >> 32), (uint)ms, (uint)(ms >> 32),
                                 (uint)ep, (uint)(ep >> 32), sec, (uint)(us % 1_000_000UL));
-
-            // CLINT mtime (drives the device-side timer-interrupt compare). Set
-            // between launches — a timer interrupt is taken at the next launch
-            // boundary after mtime crosses the guest's mtimecmp.
-            ulong ticks = (ulong)_clock.ElapsedTicks;
-            ulong freq  = (ulong)Stopwatch.Frequency;
-            ulong mtime = (ticks / freq) * TimebaseHz + (ticks % freq) * TimebaseHz / freq;
             cuda_rv32i_set_mtime(CoreId, (uint)mtime, (uint)(mtime >> 32));
         }
 
