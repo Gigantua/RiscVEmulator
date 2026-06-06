@@ -117,6 +117,26 @@ if (args.Contains("--bench"))
     return 0;
 }
 
+if (args.Contains("--prof"))
+{
+    // ── Nsight Compute harness: warm into representative DOOM code, then issue a
+    //    few steady single-core launches and exit immediately, so ncu can profile
+    //    one steady kernel without dragging through all ~170 cold-boot launches.
+    //    Run: ncu --launch-skip 15 --launch-count 1 ... CudaDoom.dll --prof ──
+    using var emu = new CudaEmulator(RamMB * 1024 * 1024);
+    emu.OutputHandler = _ => { };
+    uint entry = emu.LoadElf(elfData);
+    emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
+    emu.LoadBytes(WadBaseAddr, wadData);
+    emu.CommitImage();
+    emu.SetReg(2, StackPointer); emu.SetEntry(entry);
+    Console.WriteLine("prof: warming 15 launches then 3 steady launches (single core)...");
+    for (int b = 0; b < 15 && !emu.IsHalted; b++) emu.StepN(2_000_000);   // warm to past init
+    for (int b = 0; b < 3 && !emu.IsHalted; b++)  emu.StepN(2_000_000);   // steady — profile one of these
+    Console.WriteLine("prof: done");
+    return 0;
+}
+
 if (args.Contains("--ttf"))
 {
     // ── DOOM time-to-first-N-frames (cold boot) — the honest "jumpy code" MIPS
