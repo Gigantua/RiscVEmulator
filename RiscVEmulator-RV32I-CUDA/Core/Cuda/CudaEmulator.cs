@@ -195,6 +195,12 @@ namespace RiscVEmulator.Core.Cuda
 
         /// <summary>Copy the device framebuffer (or PCM) to a host buffer (between launches).</summary>
         public void ReadFramebuffer(byte[] dst, int len) => cuda_rv32i_read_fb(CoreId, dst, (uint)len);
+
+        /// <summary>Copy a span of guest RAM <c>[off, off+len)</c> D2H into <paramref name="dst"/>
+        /// (read-only; valid between launches). Used by the perf benchmark to compute a
+        /// bit-exact RAM state-hash regression signature.</summary>
+        public void ReadRam(byte[] dst, uint off, uint len) => cuda_rv32i_read_ram(CoreId, dst, off, len);
+
         public void ReadPcm(byte[] dst, int len)
         {
             var h = GCHandle.Alloc(dst, GCHandleType.Pinned);
