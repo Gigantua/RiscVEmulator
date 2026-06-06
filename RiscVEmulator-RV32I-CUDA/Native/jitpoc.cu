@@ -4,9 +4,13 @@
 // run it, match the interpreter. Single guest <<<1,1>>>. Two regimes:
 //   (A) pure dependent ALU loop      — the JIT best case (regs are the bottleneck)
 //   (B) Doom-like load/store/ALU mix — the honest case (guest loads are a floor)
-//   nvcc -O3 -std=c++17 -arch=sm_86 -lcuda -o jitpoc.exe jitpoc.cu && ./jitpoc.exe
+//   nvcc -O3 -std=c++17 -arch=sm_86 -lcuda -o jitpoc.exe jitpoc.cu
+//   jitpoc.exe [--iters N] [--regime a|b|c|all] [--dump-ptx]
+//     e.g.  jitpoc.exe --regime b --iters 4000000
+//           jitpoc.exe --regime c --dump-ptx
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <sstream>
 #include <cuda_runtime.h>
@@ -80,7 +84,7 @@ static std::string gen_ptx(const Uop* p, int n, bool spill = false) {
     return o.str();
 }
 
-struct Bench { const char* name; Uop* hprog; int n; long iters; };
+static bool g_dump_ptx = false;   // --dump-ptx: print generated PTX for each regime
 
 static void run(const char* name, Uop* hprog, int n, long iters, bool spill = false) {
     Uop* dprog; cudaMalloc(&dprog, n*sizeof(Uop)); cudaMemcpy(dprog, hprog, n*sizeof(Uop), cudaMemcpyHostToDevice);
@@ -100,6 +104,7 @@ static void run(const char* name, Uop* hprog, int n, long iters, bool spill = fa
 
     cudaFree(0);
     std::string ptx = gen_ptx(hprog, n, spill);
+    if (g_dump_ptx) printf("---- PTX for %s ----\n%s--------\n", name, ptx.c_str());
     CUmodule mod; CUfunction fn;
     char log[8192]; CUjit_option opt[2]={CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
     void* ov[2]={log,(void*)sizeof(log)}; log[0]=0;
@@ -129,14 +134,34 @@ static void run(const char* name, Uop* hprog, int n, long iters, bool spill = fa
     cudaFree(dprog); cudaFree(oa); cudaFree(oc); cudaFree(mem); cuModuleUnload(mod);
 }
 
-int main() {
+static void usage(const char* p) {
+    printf("usage: %s [--iters N] [--regime a|b|c|all] [--dump-ptx] [-h]\n"
+           "  --iters N      guest-loop iterations per regime (default 2000000)\n"
+           "  --regime R     a=pure ALU (JIT best case), b=DOOM-like load/store mix,\n"
+           "                 c=mix + full 32-reg spill/reload per trace (JALR floor),\n"
+           "                 all=run a,b,c (default)\n"
+           "  --dump-ptx     print the runtime-generated PTX for each regime\n", p);
+}
+
+int main(int argc, char** argv) {
+    long iters = 2'000'000;
+    std::string regime = "all";
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if      (a == "--iters"  && i+1 < argc) iters  = atol(argv[++i]);
+        else if (a == "--regime" && i+1 < argc) regime = argv[++i];
+        else if (a == "-r"       && i+1 < argc) regime = argv[++i];
+        else if (a == "--dump-ptx") g_dump_ptx = true;
+        else if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
+        else { printf("unknown arg: %s\n", a.c_str()); usage(argv[0]); return 1; }
+    }
+    bool all = (regime == "all");
+
     // (A) pure dependent ALU loop — JIT best case.
     Uop alu8[8] = {
         {0,5,5,6,0}, {1,6,6,5,0}, {0,7,7,5,0}, {2,8,8,6,0},
         {1,9,9,7,0}, {0,10,10,8,0}, {5,11,11,9,0}, {0,5,5,11,0},
     };
-    run("(A) pure dependent ALU loop (8 ops)", alu8, 8, 2'000'000);
-
     // (B) DOOM-like mix: 3 dependent loads + 1 store + 4 ALU (load-chase, addr depends on
     // previous load → the latency floor both paths share). ~37% load, ~12% store: heavier
     // on memory than real DOOM (28% load / 7% store) so this is a conservative JIT floor.
@@ -150,11 +175,11 @@ int main() {
         {7,0,10,9,0},    // mem[r10] = r9
         {3,5,10,0,7},    // r5 = r10 + 7  (feeds next iter's first load addr)
     };
-    run("(B) DOOM-like load/store/ALU mix (8 ops)", mix8, 8, 2'000'000);
 
-    // (C) same mix, but model a DYNAMIC-DISPATCH (JALR) boundary every 8 instrs: spill +
-    // reload all 32 regs per trace. This is the pessimistic bound (real DOOM: ~2.5% JALR,
-    // most boundaries are static/chainable → no spill). Shows how much dispatch erodes (B).
-    run("(C) mix + full 32-reg spill/reload per trace (JALR-dispatch floor)", mix8, 8, 2'000'000, true);
+    if (all || regime == "a") run("(A) pure dependent ALU loop (8 ops)", alu8, 8, iters);
+    if (all || regime == "b") run("(B) DOOM-like load/store/ALU mix (8 ops)", mix8, 8, iters);
+    // (C) model a DYNAMIC-DISPATCH (JALR) boundary every 8 instrs: spill + reload all 32 regs
+    // per trace. Pessimistic bound (real DOOM ~2.5% JALR; most boundaries chain → no spill).
+    if (all || regime == "c") run("(C) mix + full 32-reg spill/reload per trace (JALR-dispatch floor)", mix8, 8, iters, true);
     return 0;
 }

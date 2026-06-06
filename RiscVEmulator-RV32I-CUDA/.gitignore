@@ -156,6 +156,10 @@ Thumbs.db
 # Others
 ClientBin/
 orleans.codegen.cs
+# Standalone CUDA PoC build output
+Native/jitpoc.exe
+Native/*.exp
+Native/*.lib
 # Claude Code personal settings (transient hooks, not team-wide)
 .claude/settings.local.json
 .plans-complete
