@@ -16,8 +16,6 @@ const int  RamMB = 16;
 
 int cores = 1;
 bool selftest = false;
-bool useJit = false;
-bool usePtxJit = false;
 string? shotPath = null;
 int shotFrame = 10;
 var opts = new SdlWindowOptions { Title = "DOOM — RV32I on CUDA", GrabMouse = true };
@@ -25,8 +23,6 @@ for (int i = 0; i < args.Length; i++)
 {
     if      (args[i] == "--cores")    cores = int.Parse(args[++i]);
     else if (args[i] == "--selftest") selftest = true;
-    else if (args[i] == "--jit")      useJit = true;
-    else if (args[i] == "--ptxjit")   { useJit = true; usePtxJit = true; }  // in-process driver-API JIT
     else if (args[i] == "--shot")     shotPath = args[++i];                 // headless: save frame N as PNG
     else if (args[i] == "--shot-frame") shotFrame = int.Parse(args[++i]);
     else if (args[i] == "--scale")    opts.Scale = int.Parse(args[++i]);
@@ -73,13 +69,59 @@ Console.WriteLine($"  doom.elf: {new FileInfo(elfPath).Length:N0} bytes");
 byte[] elfData = File.ReadAllBytes(elfPath);
 byte[] wadData = File.ReadAllBytes(wadPath);
 
+if (args.Contains("--bench"))
+{
+    // Steady-state DOOM MIPS: warm up to the first rendered frame (skip cold
+    // init), then time a fixed number of guest steps in-game on the interpreter.
+    using var emu = new CudaEmulator(RamMB * 1024 * 1024);
+    emu.OutputHandler = _ => { };
+    uint entry = emu.LoadElf(elfData);
+    emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
+    emu.LoadBytes(WadBaseAddr, wadData);
+    emu.CommitImage();
+    emu.SetReg(2, StackPointer); emu.SetEntry(entry);
+    Console.WriteLine("DOOM bench on interpreter (warming PAST the static title into demo playback)...");
+    static ulong FbHash(byte[] px)
+    {
+        ulong h = 1469598103934665603UL;
+        for (int i = 0; i + 3 < px.Length; i += 4)
+        { h = (h ^ px[i]) * 1099511628211UL; h = (h ^ px[i + 1]) * 1099511628211UL; h = (h ^ px[i + 2]) * 1099511628211UL; }
+        return h;
+    }
+    // Warm until the framebuffer is actually CHANGING (demo rendering, not the
+    // static title where DOOM just spins on the timer doing no real work).
+    long warm = 0; int wf = 0; ulong lastH = 0;
+    for (int b = 0; b < 250 && !emu.IsHalted; b++)
+    {
+        emu.StepN(1_000_000); warm += 1_000_000;
+        ulong hsh = FbHash(emu.Framebuffer.PresentedPixels);
+        if (hsh != lastH) { lastH = hsh; wf++; }
+        if (wf >= 20) break;
+    }
+    // Measure: time to render a batch of demo frames; report MIPS + FPS (FPS is
+    // the honest DOOM metric — render work, not timer spin).
+    var sw = Stopwatch.StartNew();
+    long m = 0; int mf = 0; lastH = FbHash(emu.Framebuffer.PresentedPixels);
+    for (int b = 0; b < 4000 && !emu.IsHalted; b++)
+    {
+        emu.StepN(2_000_000); m += 2_000_000;
+        ulong hsh = FbHash(emu.Framebuffer.PresentedPixels);
+        if (hsh != lastH) { lastH = hsh; mf++; }
+        if (mf >= 30) break;
+    }
+    sw.Stop();
+    double sec = sw.Elapsed.TotalSeconds;
+    Console.WriteLine($"  warm={warm / 1_000_000}M steps ({wf} frames); measured {m / 1_000_000}M steps, " +
+                      $"{mf} frames in {sec:F2}s");
+    Console.WriteLine($"  => {m / sec / 1e6:F2} MIPS, {mf / sec:F2} FPS  [interpreter]");
+    return 0;
+}
+
 if (shotPath != null)
 {
     // ── Headless: run until DOOM has presented `shotFrame` distinct frames, then
-    //    save the framebuffer as a PNG so the render can be eyeballed. Uses the
-    //    selected CPU backend (--ptxjit / --jit / interpreter). ──
+    //    save the framebuffer as a PNG so the render can be eyeballed. ──
     using var emu = new CudaEmulator(RamMB * 1024 * 1024);
-    emu.UseJit = useJit; emu.UsePtxJit = usePtxJit;
     emu.OutputHandler = _ => { };
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
@@ -88,8 +130,7 @@ if (shotPath != null)
     emu.SetReg(2, StackPointer);
     emu.SetEntry(entry);
     const int W = 320, H = 200;
-    Console.WriteLine($"Headless: rendering until frame {shotFrame} ({W}x{H}) on " +
-                      (usePtxJit ? "ptx/driver-API JIT" : useJit ? "nvcc-DLL JIT" : "interpreter") + "...");
+    Console.WriteLine($"Headless: rendering until frame {shotFrame} ({W}x{H}) on interpreter...");
     int frames = 0; long steps = 0; ulong last = 0;
     for (int b = 0; b < 4000 && !emu.IsHalted; b++)
     {
@@ -122,8 +163,6 @@ if (selftest)
     //  code is already L1-resident, so it adds bookkeeping for no latency win.
     //  Left off; single-guest speed is interpreter-bound, see CudaBench.)
     using var emu = new CudaEmulator(RamMB * 1024 * 1024);
-    emu.UseJit = useJit;                 // --jit: run the native-CUDA JIT'd guest
-    emu.UsePtxJit = usePtxJit;           // --ptxjit: in-process driver-API JIT (cubin)
     emu.OutputHandler = c => Console.Write(c);
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
@@ -157,8 +196,6 @@ if (cores <= 1)
 {
     // ── Single instance: play it ── (prefetch window left off — see selftest note)
     using var emu = new CudaEmulator(RamMB * 1024 * 1024);
-    emu.UseJit = useJit;                 // --jit: run the native-CUDA JIT'd guest
-    emu.UsePtxJit = usePtxJit;           // --ptxjit: in-process driver-API JIT (cubin)
     emu.OutputHandler = c => Console.Write(c);
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
@@ -167,9 +204,7 @@ if (cores <= 1)
     emu.SetReg(2, StackPointer);
     emu.SetEntry(entry);
     Console.WriteLine($"  WAD: {wadData.Length:N0} bytes @ 0x{WadBaseAddr:X8}");
-    Console.WriteLine(useJit
-        ? $"Starting DOOM on the CUDA JIT core (JIT {(emu.JitActive ? "active" : "FAILED → interpreter")})."
-        : "Starting DOOM on the CUDA core (single GPU thread ~2.6 MIPS → a few FPS).");
+    Console.WriteLine("Starting DOOM on the CUDA core (single GPU thread).");
     var window = new SdlWindow(emu.Framebuffer, emu.Display, emu.Keyboard, emu.Mouse,
                                emu.AudioBuffer, emu.AudioControl, emu, opts, emu.Midi);
     return window.Run();
@@ -190,7 +225,6 @@ if (totalRamMB > 2048)
 Console.WriteLine($"Running {cores} DOOM instances headless for aggregate MIPS...");
 using (var emu = new CudaEmulator(RamMB * 1024 * 1024, nCores: cores))
 {
-    emu.UseSharedCode = true;                // coalesced, L2-resident fetch
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));
     emu.LoadBytes(WadBaseAddr, wadData);

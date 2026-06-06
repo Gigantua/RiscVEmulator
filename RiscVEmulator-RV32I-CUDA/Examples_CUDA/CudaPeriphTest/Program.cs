@@ -66,8 +66,8 @@ Check("mouse dy=-3",               o.Contains("dy=0xfffffffd"));
 Check("mouse button left",         o.Contains("b=0x00000001"));
 Check("rtc advanced",              !o.Contains("RTC_ms=0x00000000"));
 
-// Framebuffer pattern (managed buffer, readable now that the kernel is idle).
-var fb = new byte[16]; Marshal.Copy(emu.FramebufferPtr, fb, 0, 16);
+// Framebuffer pattern (device buffer, read back D2H now that the kernel is idle).
+var fb = new byte[16]; emu.ReadFramebuffer(fb, 16);
 uint P(int i) => (uint)(fb[i] | fb[i+1]<<8 | fb[i+2]<<16 | fb[i+3]<<24);
 Check("framebuffer pixel 0", P(0)  == 0x11223344);
 Check("framebuffer pixel 1", P(4)  == 0x55667788);
@@ -80,8 +80,8 @@ foreach (int i in new[] { 0, 1, 100, 1000, 320*200 - 1 })
     if (Q(i) != (uint)(i * 7 + 0x100)) presOk = false;
 Check("framebuffer presented (fbaddr→RAM)", presOk);
 
-// Audio PCM payload (managed) + control snapshot (reconciled to AudioControl).
-var pcm = new byte[16]; Marshal.Copy(emu.PcmPtr, pcm, 0, 16);
+// Audio PCM payload (device) + control snapshot (reconciled to AudioControl).
+var pcm = new byte[16]; emu.ReadPcm(pcm, 16);
 bool pcmOk = true; for (int i = 0; i < 16; i++) if (pcm[i] != (byte)(0x40 + i)) pcmOk = false;
 Check("audio PCM payload", pcmOk);
 Check("audio rate 44100",  emu.AudioControl.SampleRate == 44100);

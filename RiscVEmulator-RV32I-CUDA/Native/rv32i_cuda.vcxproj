@@ -45,13 +45,19 @@
     <NMakeReBuildCommandLine>$(NMakeBuildCommandLine)</NMakeReBuildCommandLine>
     <NMakeCleanCommandLine>if exist "$(OutDir)rv32i_cuda.dll" del /q "$(OutDir)rv32i_cuda.dll"</NMakeCleanCommandLine>
     <NMakeOutput>$(OutDir)rv32i_cuda.dll</NMakeOutput>
+    <!-- IntelliSense (VS editor) ONLY. nvcc finds the CUDA headers itself during the
+         NMakeBuildCommandLine, but the MSVC IntelliSense engine does not, so opening
+         a .cu/.cuh reports "cannot find or open file cuda_runtime.h". Point it at the
+         toolkit include dir + define __CUDACC__ so __device__/__global__/etc resolve.
+         Does NOT affect the build. CUDA_PATH falls back to the installed v13.2. -->
+    <CudaInc Condition="'$(CUDA_PATH)'!=''">$(CUDA_PATH)\include</CudaInc>
+    <CudaInc Condition="'$(CudaInc)'==''">C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\include</CudaInc>
+    <NMakeIncludeSearchPath>$(CudaInc);$(ProjectDir);$(IncludePath);$(NMakeIncludeSearchPath)</NMakeIncludeSearchPath>
+    <NMakePreprocessorDefinitions>__CUDACC__;$(NMakePreprocessorDefinitions)</NMakePreprocessorDefinitions>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="rv32i_cuda.cu" />
-    <!-- Shared memory model + trap unit, #included by rv32i_cuda.cu and by the
-         runtime-generated JIT module (Core/Cuda/RvJitRuntime.cs). -->
-    <None Include="rv32i_jit_shared.cuh" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
