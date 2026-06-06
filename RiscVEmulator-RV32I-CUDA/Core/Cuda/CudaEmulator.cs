@@ -32,6 +32,7 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern int  cuda_rv32i_read_ram(int core, byte[] dst, uint off, uint len);
         [DllImport(Lib)] private static extern int  cuda_rv32i_read_fb(int core, byte[] dst, uint len);
         [DllImport(Lib)] private static extern int  cuda_rv32i_read_pcm(int core, IntPtr dst, uint len);
+        [DllImport(Lib)] private static extern int  cuda_rv32i_set_schedule(byte[] data, uint lo, uint words);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_reg(int core, int i, uint v);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_entry(int core, uint pc);
         [DllImport(Lib)] private static extern uint cuda_rv32i_get_pc(int core);
@@ -69,6 +70,7 @@ namespace RiscVEmulator.Core.Cuda
         public int  RamBytes { get; }
 
         private readonly byte[] _image;
+        private uint _schedLo, _schedHi;     // executable span for the bundle schedule
         private readonly byte[] _drainBuf = new byte[8192];
         private readonly uint[] _midiBuf  = new uint[1024];
         private readonly uint[] _au       = new uint[8];
@@ -118,13 +120,53 @@ namespace RiscVEmulator.Core.Cuda
 
         // ── Image loading (host side, before the first launch) ───────────────
 
-        public uint LoadElf(byte[] elf) => ElfLoader.Load(elf, new ArrayBus(_image));
+        public uint LoadElf(byte[] elf)
+        {
+            (_schedLo, _schedHi) = ElfLoader.ReadOnlyCodeSpan(elf);
+            return ElfLoader.Load(elf, new ArrayBus(_image));
+        }
         public void LoadBytes(uint addr, byte[] data) => Array.Copy(data, 0, _image, (int)addr, data.Length);
 
         public void CommitImage()
         {
             cuda_rv32i_load_ram(CoreId, _image, 0, (uint)_image.Length);
+            BuildSchedule();
             _committed = true;
+        }
+
+        // Precompute the static bundle length per PC over the executable span: the
+        // number of consecutive independent ALU instructions (no barrier, no
+        // intra-run RAW/WAW), capped at 32. The warp executor reads this instead of
+        // computing dependencies at runtime. Must match the device's simple/RAW/WAW.
+        private void BuildSchedule()
+        {
+            uint lo = _schedLo & ~3u, hi = (_schedHi + 3u) & ~3u;
+            if (hi <= lo || hi > (uint)_image.Length) { cuda_rv32i_set_schedule(Array.Empty<byte>(), 0, 0); return; }
+            int words = (int)((hi - lo) / 4);
+            var sched = new byte[words];
+            for (int w = 0; w < words; w++)
+            {
+                int p = (int)lo + w * 4;
+                uint written = 0; int L = 0;
+                for (int k = 0; k < 32; k++)
+                {
+                    int q = p + 4 * k;
+                    if (q + 4 > _image.Length) break;
+                    uint instr = (uint)(_image[q] | _image[q+1] << 8 | _image[q+2] << 16 | _image[q+3] << 24);
+                    uint op = instr & 0x7F, rd = (instr>>7)&0x1F, rs1 = (instr>>15)&0x1F, rs2 = (instr>>20)&0x1F, f7 = (instr>>25)&0x7F;
+                    bool simple = op==0x37 || op==0x17 || op==0x13 || (op==0x33 && f7!=0x01);
+                    if (!simple) break;
+                    bool readsRs1 = op==0x13 || op==0x33;
+                    bool readsRs2 = op==0x33;
+                    if (readsRs1 && rs1!=0 && (written & (1u<<(int)rs1))!=0) break;
+                    if (readsRs2 && rs2!=0 && (written & (1u<<(int)rs2))!=0) break;
+                    if (rd!=0 && (written & (1u<<(int)rd))!=0) break;
+                    if (rd!=0) written |= 1u<<(int)rd;
+                    L++;
+                }
+                sched[w] = (byte)L;
+            }
+            cuda_rv32i_set_schedule(sched, lo, (uint)words);
         }
 
         /// <summary>Broadcast the staged RAM image to ALL cores and set their sp/entry
@@ -137,6 +179,7 @@ namespace RiscVEmulator.Core.Cuda
                 cuda_rv32i_set_reg(c, 2, sp);
                 cuda_rv32i_set_entry(c, entry);
             }
+            BuildSchedule();
             _committed = true;
         }
 

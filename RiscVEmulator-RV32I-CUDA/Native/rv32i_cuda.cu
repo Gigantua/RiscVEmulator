@@ -396,15 +396,15 @@ __global__ void rv32i_profile_kernel(CoreState* st, CoreMem* mm,
 
 // ── Warp chunk executor (single guest, 32 lanes, regfile in shared). Each step
 //    the 32 lanes speculatively decode+execute pc..pc+124 in parallel
-//    (convergent → warp fully active). Resolve the chunk with warp intrinsics:
-//      firstBarrier = ffs(ballot(!simpleALU))            -- O(1)
-//      WAW          = match.any(rd) & lanes-below-me      -- O(1)
-//      RAW          = shfl_up(rd) scan, BOUNDED by firstBarrier (~2-3 iters on
-//                     DOOM, not 32 — this is what killed the naive version).
-//    Retire the independent ALU prefix [0,L) in one shot; lane 0 runs ONE serial
-//    do_step for the boundary instruction (load/store/branch/JALR/SYSTEM/M/A). ──
+//    (convergent → warp fully active). The independent ALU bundle length L for
+//    each PC is PRECOMPUTED on the host (static schedule, sched[]) — so the warp
+//    just reads L = sched[pc] instead of computing it at runtime with ballot/
+//    match/shfl (which was the coordination overhead that made the naive version
+//    2x slower). Retire the bundle [0,L) in one shot; the boundary instruction
+//    (load/store/branch/JALR/SYSTEM/M/A) runs inline on lane L. ──
 __global__ void __launch_bounds__(32)
-rv32i_warp_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
+rv32i_warp_kernel(CoreState* st, CoreMem* mm, const uint8_t* sched, uint32_t schedLo, uint32_t schedWords,
+                  int ncores, int budget) {
     int gid = blockIdx.x;
     if (gid >= ncores) return;
     int lane = threadIdx.x;
@@ -429,15 +429,16 @@ rv32i_warp_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
         priv    = __shfl_sync(FULL, priv, 0);
         if (trapped) { i++; continue; }
 
-        // Parallel speculative decode + ALU of the 32-instruction window.
+        // Precomputed bundle length for this PC (independent ALU prefix).
+        uint32_t soff = (pc - schedLo) >> 2;
+        int L = soff < schedWords ? (int)__ldg(sched + soff) : 0;
+
+        // Parallel decode + ALU of the bundle (lanes 0..L-1) + the boundary lane.
         uint32_t ipc   = pc + (uint32_t)(lane * 4);
         uint32_t instr = (ipc + 4u <= m.ram_size) ? __ldg((const uint32_t*)(m.ram + ipc)) : 0u;
         uint32_t op = instr & 0x7F, rd = (instr >> 7) & 0x1F;
         uint32_t rs1i = (instr >> 15) & 0x1F, rs2i = (instr >> 20) & 0x1F;
         uint32_t f3 = (instr >> 12) & 7, f7 = (instr >> 25) & 0x7F;
-        bool simple   = (op == 0x37) || (op == 0x17) || (op == 0x13) || (op == 0x33 && f7 != 0x01);
-        bool readsRs1 = (op == 0x13) || (op == 0x33);
-        bool readsRs2 = (op == 0x33);
         uint32_t u1 = regs[rs1i], u2 = regs[rs2i];
         int32_t  s1 = (int32_t)u1, s2 = (int32_t)u2;
         int32_t  iimm = (int32_t)instr >> 20; uint32_t sh = (instr >> 20) & 0x1F;
@@ -446,22 +447,6 @@ rv32i_warp_kernel(CoreState* st, CoreMem* mm, int ncores, int budget) {
         else if (op == 0x17) res = ipc + (instr & 0xFFFFF000u);
         else if (op == 0x13) res = alu(f3, u1, s1, (uint32_t)iimm, iimm, sh, false, f7 == 0x20);
         else if (op == 0x33) res = alu(f3, u1, s1, u2, s2, (uint32_t)(s2 & 0x1F), f7 == 0x20, f7 == 0x20);
-
-        unsigned bm = __ballot_sync(FULL, !simple);
-        int fb = bm ? __ffs((int)bm) - 1 : 32;                 // first barrier (O(1))
-
-        unsigned same = __match_any_sync(FULL, rd);            // lanes sharing my rd
-        bool waw = (rd != 0) && ((same & ((1u << lane) - 1u)) != 0u);
-
-        bool raw = false;                                      // RAW scan, bounded by fb
-        for (int d = 1; d < fb; d++) {
-            uint32_t rdj = __shfl_up_sync(FULL, rd, d);
-            if (d <= lane && rdj != 0 && ((readsRs1 && rdj == rs1i) || (readsRs2 && rdj == rs2i))) raw = true;
-        }
-        bool dep = (lane < fb) && (raw || waw);
-        unsigned dm = __ballot_sync(FULL, dep);
-        int fd = dm ? __ffs((int)dm) - 1 : 32;
-        int L  = fb < fd ? fb : fd;
 
         if (lane < L && rd != 0) regs[rd] = res;
         __syncwarp();
@@ -529,6 +514,8 @@ static CoreState* g_state  = nullptr;
 static CoreMem*   g_mem    = nullptr;
 static unsigned long long* g_prof = nullptr;
 static unsigned long long* g_jump = nullptr;
+static uint8_t*   g_sched = nullptr;        // precomputed bundle length per PC word
+static uint32_t   g_sched_lo = 0, g_sched_words = 0;
 static int        g_ncores = 0;
 
 API int cuda_rv32i_init(int nCores, unsigned int ramSize, unsigned int fbW, unsigned int fbH, unsigned int pcmBytes) {
@@ -595,7 +582,8 @@ API int cuda_rv32i_step_all(int budget) {
     static int warp = -1;
     if (warp < 0) { const char* e = getenv("RVEMU_WARP"); warp = (e && e[0] == '1') ? 1 : 0; }
     if (warp) {
-        rv32i_warp_kernel<<<g_ncores, 32, 32 * sizeof(uint32_t)>>>(g_state, g_mem, g_ncores, budget);
+        rv32i_warp_kernel<<<g_ncores, 32, 32 * sizeof(uint32_t)>>>(
+            g_state, g_mem, g_sched, g_sched_lo, g_sched_words, g_ncores, budget);
     } else {
         int block = g_ncores < 256 ? g_ncores : 256;
         int grid  = (g_ncores + block - 1) / block;
@@ -604,6 +592,16 @@ API int cuda_rv32i_step_all(int budget) {
     }
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
+}
+
+API int cuda_rv32i_set_schedule(const void* data, unsigned int lo, unsigned int words) {
+    if (g_sched) { cudaFree(g_sched); g_sched = nullptr; g_sched_words = 0; }
+    if (words == 0) return 0;
+    cudaError_t e;
+    if ((e = cudaMalloc(&g_sched, words)) != cudaSuccess) return (int)e;
+    cudaMemcpy(g_sched, data, words, cudaMemcpyHostToDevice);
+    g_sched_lo = lo; g_sched_words = words;
+    return (int)cudaGetLastError();
 }
 
 API void  cuda_rv32i_prof_reset() {
@@ -668,5 +666,6 @@ API void cuda_rv32i_shutdown() {
     if (g_state) { cudaFree(g_state); g_state = nullptr; }
     if (g_prof) { cudaFree(g_prof); g_prof = nullptr; }
     if (g_jump) { cudaFree(g_jump); g_jump = nullptr; }
+    if (g_sched) { cudaFree(g_sched); g_sched = nullptr; g_sched_words = 0; }
     g_ncores = 0;
 }
