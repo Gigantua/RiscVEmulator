@@ -4,13 +4,9 @@
       "commandName": "Project",
       "commandLineArgs": ""
     },
-    "Examples.CudaDoom (JIT experiment)": {
+    "Examples.CudaDoom (time-to-first-frames)": {
       "commandName": "Project",
-      "commandLineArgs": "--jit"
-    },
-    "Examples.CudaDoom (PTX JIT, driver-API)": {
-      "commandName": "Project",
-      "commandLineArgs": "--ptxjit"
+      "commandLineArgs": "--ttf 2"
     }
   }
 }
