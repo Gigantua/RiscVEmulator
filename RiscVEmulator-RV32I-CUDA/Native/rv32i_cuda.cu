@@ -274,45 +274,17 @@ static __device__ void do_step(Hart& cpu, CoreMem& mm) {
     const int      sh = (instr >> 20) & 0x1F;
     uint32_t nextpc = cpu.pc + 4, r = 0;
 
-    switch (instr & 0x7F) {
-    case 0x37: r = instr & 0xFFFFF000u; break;
-    case 0x17: r = cpu.pc + (instr & 0xFFFFF000u); break;
-    case 0x6F: r = cpu.pc + 4;
-        nextpc = cpu.pc + ((((instr>>31)&1u)<<20 | ((instr>>12)&0xFFu)<<12 | ((instr>>20)&1u)<<11 | ((instr>>21)&0x3FFu)<<1)
-                          | ((instr & 0x80000000u) ? 0xFFE00000u : 0u)); break;
-    case 0x67: r = cpu.pc + 4; nextpc = (uint32_t)(s1 + iimm) & ~1u; break;
-    case 0x63: {
-        uint32_t bimm = (((instr>>31)&1u)<<12 | ((instr>>7)&1u)<<11 | ((instr>>25)&0x3Fu)<<5 | ((instr>>8)&0xFu)<<1)
-                      | ((instr & 0x80000000u) ? 0xFFFFE000u : 0u);
-        int taken = 0;
-        switch (f3) { case 0: taken = u1==u2; break; case 1: taken = u1!=u2; break;
-                      case 4: taken = s1<s2; break;  case 5: taken = s1>=s2; break;
-                      case 6: taken = u1<u2; break;  case 7: taken = u1>=u2; break; }
-        if (taken) nextpc = cpu.pc + bimm;
-        cpu.pc = nextpc; return;
-    }
-    case 0x03: {
-        uint32_t addr = (uint32_t)(s1 + iimm);
-        switch (f3) {
-            case 0: r = (uint32_t)(int8_t) mem_read<uint8_t> (mm, addr); break;
-            case 1: r = (uint32_t)(int16_t)mem_read<uint16_t>(mm, addr); break;
-            case 2: r =                    mem_read<uint32_t>(mm, addr); break;
-            case 4: r =                    mem_read<uint8_t> (mm, addr); break;
-            case 5: r =                    mem_read<uint16_t>(mm, addr); break;
-        }
-        break;
-    }
-    case 0x23: {
-        uint32_t addr = (uint32_t)(s1 + simm);
-        switch (f3) { case 0: mem_write<uint8_t>(cpu,mm,addr,(uint8_t)u2); break;
-                      case 1: mem_write<uint16_t>(cpu,mm,addr,(uint16_t)u2); break;
-                      case 2: mem_write<uint32_t>(cpu,mm,addr,u2); break; }
-        if ((int32_t)cpu.pc >= 0) cpu.pc = nextpc; return;
-    }
-    case 0x13:
+    // Frequency-ordered dispatch ladder (this workload's dynamic opcode mix,
+    // confirmed via --prof): OP-IMM > OP > LOAD > BRANCH > STORE > JAL > JALR >
+    // LUI > AUIPC, then the rare AMO/SYSTEM/FENCE/illegal tail. The most common
+    // opcodes are tested first so the common path is the shortest compare chain;
+    // every arm's body is byte-identical to the prior switch case — only the
+    // dispatch order changes, so this stays bit-exact.
+    const uint32_t op = instr & 0x7F;
+    if (op == 0x13) {
         r = alu(f3, u1, s1, (uint32_t)iimm, iimm, (uint32_t)sh, false, f7 == 0x20);
-        break;
-    case 0x33:
+    }
+    else if (op == 0x33) {
         if (f7 == 0x01) switch (f3) {
             case 0: r = (uint32_t)(u1 * u2); break;
             case 1: r = (uint32_t)(((int64_t)s1 * (int64_t)s2) >> 32); break;
@@ -325,8 +297,49 @@ static __device__ void do_step(Hart& cpu, CoreMem& mm) {
         } else {
             r = alu(f3, u1, s1, u2, s2, (uint32_t)(s2 & 0x1F), f7 == 0x20, f7 == 0x20);
         }
-        break;
-    case 0x2F: {
+    }
+    else if (op == 0x03) {
+        uint32_t addr = (uint32_t)(s1 + iimm);
+        switch (f3) {
+            case 0: r = (uint32_t)(int8_t) mem_read<uint8_t> (mm, addr); break;
+            case 1: r = (uint32_t)(int16_t)mem_read<uint16_t>(mm, addr); break;
+            case 2: r =                    mem_read<uint32_t>(mm, addr); break;
+            case 4: r =                    mem_read<uint8_t> (mm, addr); break;
+            case 5: r =                    mem_read<uint16_t>(mm, addr); break;
+        }
+    }
+    else if (op == 0x63) {
+        uint32_t bimm = (((instr>>31)&1u)<<12 | ((instr>>7)&1u)<<11 | ((instr>>25)&0x3Fu)<<5 | ((instr>>8)&0xFu)<<1)
+                      | ((instr & 0x80000000u) ? 0xFFFFE000u : 0u);
+        int taken = 0;
+        switch (f3) { case 0: taken = u1==u2; break; case 1: taken = u1!=u2; break;
+                      case 4: taken = s1<s2; break;  case 5: taken = s1>=s2; break;
+                      case 6: taken = u1<u2; break;  case 7: taken = u1>=u2; break; }
+        if (taken) nextpc = cpu.pc + bimm;
+        cpu.pc = nextpc; return;
+    }
+    else if (op == 0x23) {
+        uint32_t addr = (uint32_t)(s1 + simm);
+        switch (f3) { case 0: mem_write<uint8_t>(cpu,mm,addr,(uint8_t)u2); break;
+                      case 1: mem_write<uint16_t>(cpu,mm,addr,(uint16_t)u2); break;
+                      case 2: mem_write<uint32_t>(cpu,mm,addr,u2); break; }
+        if ((int32_t)cpu.pc >= 0) cpu.pc = nextpc; return;
+    }
+    else if (op == 0x6F) {
+        r = cpu.pc + 4;
+        nextpc = cpu.pc + ((((instr>>31)&1u)<<20 | ((instr>>12)&0xFFu)<<12 | ((instr>>20)&1u)<<11 | ((instr>>21)&0x3FFu)<<1)
+                          | ((instr & 0x80000000u) ? 0xFFE00000u : 0u));
+    }
+    else if (op == 0x67) {
+        r = cpu.pc + 4; nextpc = (uint32_t)(s1 + iimm) & ~1u;
+    }
+    else if (op == 0x37) {
+        r = instr & 0xFFFFF000u;
+    }
+    else if (op == 0x17) {
+        r = cpu.pc + (instr & 0xFFFFF000u);
+    }
+    else if (op == 0x2F) {
         uint32_t addr = u1, f5 = (instr >> 27) & 0x1F, t = mem_read<uint32_t>(mm, addr), w = t;
         switch (f5) {
             case 0x02: r = t; if (rd) cpu.regs[rd] = r; cpu.regs[0] = 0; cpu.pc = nextpc; return;
@@ -336,12 +349,11 @@ static __device__ void do_step(Hart& cpu, CoreMem& mm) {
             case 0x10: w = ((int32_t)t < (int32_t)u2) ? t : u2; break;  case 0x14: w = ((int32_t)t > (int32_t)u2) ? t : u2; break;
             case 0x18: w = (t < u2) ? t : u2; break;  case 0x1C: w = (t > u2) ? t : u2; break;
         }
-        mem_write<uint32_t>(cpu, mm, addr, w); r = t; break;
+        mem_write<uint32_t>(cpu, mm, addr, w); r = t;
     }
-    case 0x0F: cpu.pc = nextpc; return;
-    case 0x73: trap_system(cpu, mm, instr); return;
-    default:   do_trap(cpu, mm, CAUSE_ILLEGAL, instr); return;
-    }
+    else if (op == 0x0F) { cpu.pc = nextpc; return; }
+    else if (op == 0x73) { trap_system(cpu, mm, instr); return; }
+    else { do_trap(cpu, mm, CAUSE_ILLEGAL, instr); return; }
 
     if (rd) cpu.regs[rd] = r;
     if ((int32_t)cpu.pc >= 0) cpu.pc = nextpc;
