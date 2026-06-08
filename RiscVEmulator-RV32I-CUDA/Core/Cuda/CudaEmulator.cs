@@ -30,6 +30,7 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern void cuda_rv32i_set_reg(int core, int i, uint v);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_entry(int core, uint pc);
         [DllImport(Lib)] private static extern void cuda_rv32i_set_halted(int core, int v);
+        [DllImport(Lib)] private static extern int  cuda_rv32i_set_code(byte[] src, uint len);
         [DllImport(Lib)] private static extern int  cuda_rv32i_step_all(int budget);
         [DllImport(Lib)] private static extern void cuda_rv32i_shutdown();
         // rvcud: RV32I→CUDA-uarch translator. set_code translates a code image (base..base+len)
@@ -143,18 +144,22 @@ namespace RiscVEmulator.Core.Cuda
         }
         public void LoadBytes(uint addr, byte[] data) => Array.Copy(data, 0, _image, (int)addr, data.Length);
 
-        // Translate the guest code into the rvcud uop stream (call after the image is staged).
-        private void RvcudTranslate()
+        // Stage the guest code for whichever core to execute it. The per-instruction kernel fetches
+        // from a predecoded code image (built by cuda_rv32i_set_code → predecode_kernel); the rvcud
+        // kernel fetches from a uop stream (built by cuda_rvcud_set_code). Either MUST be set up
+        // before stepping, or the kernel fetches zeros and halts on the first instruction.
+        private void SetupCode()
         {
-            int rc = cuda_rvcud_set_code(_image, _codeHi != 0 ? _codeHi : (uint)_image.Length, 0, _entry);
-            if (rc != 0) throw new InvalidOperationException($"cuda_rvcud_set_code failed (CUDA error {rc})");
+            int rc = UseRvcud ? cuda_rvcud_set_code(_image, _codeHi != 0 ? _codeHi : (uint)_image.Length, 0, _entry)
+                              : cuda_rv32i_set_code(_image, (uint)_image.Length);
+            if (rc != 0) throw new InvalidOperationException($"cuda_{(UseRvcud ? "rvcud" : "rv32i")}_set_code failed (CUDA error {rc})");
         }
 
         public void CommitImage()
         {
             cuda_rv32i_write_mem(CoreId, _image, 0, (uint)_image.Length);
             ArmExit(CoreId);
-            if (UseRvcud) RvcudTranslate();   // one shared uop stream for all cores
+            SetupCode();   // one shared code image / uop stream for all cores
             _committed = true;
         }
 
@@ -168,7 +173,7 @@ namespace RiscVEmulator.Core.Cuda
                 cuda_rv32i_set_entry(c, entry);
                 ArmExit(c);
             }
-            if (UseRvcud) RvcudTranslate();
+            SetupCode();
             _committed = true;
         }
 
