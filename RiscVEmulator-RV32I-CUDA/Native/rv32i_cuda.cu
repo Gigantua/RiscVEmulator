@@ -384,6 +384,7 @@ static uint8_t*   g_uw      = nullptr;  // guest-instruction weight per uop
 static uint32_t*  g_pc2uop  = nullptr;  // guest-word → uop index (or RC_BADUOP)
 static uint32_t*  g_uop2pc  = nullptr;  // uop index → guest pc
 static int        g_nuops   = 0;
+static int        g_pc2words = 0;       // length of pc2uop[] = translated code words (NOT total memory words)
 static uint32_t   g_base    = 0;
 static unsigned long long* g_ret = nullptr;  // core-0 retired guest-instruction count (verify gate)
 
@@ -1050,7 +1051,7 @@ API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base
     memcpy(words.data(), src, (size_t)N * 4);
     B.img = words.data();
     rvcud_build(B);
-    g_nuops = (int)B.w0.size(); g_base = base;
+    g_nuops = (int)B.w0.size(); g_base = base; g_pc2words = N;
     std::vector<uint2> uops(g_nuops);
     for (int i = 0; i < g_nuops; i++) uops[i] = make_uint2(B.w0[i], B.w1[i]);
 
@@ -1101,7 +1102,7 @@ API int cuda_rvcud_step_all(int budget) {
         cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &av); }
 #endif
     rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc,
-                                         g_ncores, g_words, g_base, budget, g_ret);
+                                         g_ncores, g_pc2words, g_base, budget, g_ret);   // nwords = pc2uop length (code words)
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
 }

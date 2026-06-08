@@ -13,16 +13,16 @@ typedef unsigned long long u64;
 typedef int                s32;
 typedef long long          s64;
 
-/* ── 32-bit multiply: emit a single hardware MUL ─────────────────── *
- * The guest is built -march=rv32i, so clang calls this for every `*`. Rather
- * than a 32-iteration shift-add loop, force a single M-extension MUL via an
- * inline-asm arch override (the emulator implements MUL). This collapses every
- * software multiply to one instruction — the imul the translator can also use. */
+/* ── 32-bit multiply: shift-add (pure RV32I) ─────────────────────── *
+ * The guest is built -march=rv32i, so clang calls this for every variable `*`.
+ * It MUST stay pure RV32I (add/shift/branch only): the default GPU core is a pure
+ * RV32I CPU with NO M-extension, so emitting a hardware `mul` here would HALT it
+ * on any guest that multiplies (e.g. DOOM). Constant multiplies are strength-
+ * reduced inline by clang and never reach this routine. */
 u32 __mulsi3(u32 a, u32 b)
 {
-    u32 r;
-    __asm__ (".option push\n\t.option arch, +m\n\tmul %0, %1, %2\n\t.option pop"
-             : "=r"(r) : "r"(a), "r"(b));
+    u32 r = 0;
+    while (b) { if (b & 1u) r += a; a <<= 1; b >>= 1; }
     return r;
 }
 
