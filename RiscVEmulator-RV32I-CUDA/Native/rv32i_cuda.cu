@@ -214,6 +214,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
            ui = (pw < (uint32_t)nwords) ? __ldg(&pc2uop[pw]) : HALT_BIT;
            if (ui & 0x80000000u) ui = HALT_BIT; }
     uint32_t P = 0;                      // if-conversion predicate
+    uint32_t resume_pc = HALT_BIT;       // set to a guest pc if we stop at an untranslated JALR target
 
     int gi = 0;
     for (; gi < budget && (int32_t)ui >= 0; ) {
@@ -283,7 +284,11 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t tw = (tgt - base) >> 2;
             uint32_t n2 = (tw < (uint32_t)nwords) ? __ldg(&pc2uop[tw]) : RC_BADUOP;
             if (rd && live) regs[rd] = __ldg(&uop2pc[ui]) + 4;   // skip link load for indirect jump `jalr x0` (rd==0)
-            ui = (n2 & 0x80000000u) ? HALT_BIT : n2; gi += wt; continue; }       // single broadcast pc2uop lookup, not brx.idx
+            gi += wt;
+            // Indirect target with no uop: stop AT tgt so the host can translate that block on
+            // demand (translate-on-miss), then resume. tgt itself is a valid in-range code address.
+            if (n2 & 0x80000000u) { resume_pc = (tw < (uint32_t)nwords) ? tgt : HALT_BIT; break; }
+            ui = n2; continue; }
         else if (cls == RC_NOP)  { ui += 1; gi += wt; continue; }
         else { ui |= HALT_BIT; continue; }                                       // RC_ILL
 
@@ -292,7 +297,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
     }
     #pragma unroll
     for (int i = 0; i < 32; i++) g.regs[i] = regs[i];
-    g.pc = ((int32_t)ui >= 0) ? __ldg(&uop2pc[ui]) : HALT_BIT;   // guest pc for read-back (guests don't halt here)
+    // Resume pc: a missed JALR target (→ host translates it), else the current uop's pc, else halt.
+    g.pc = (resume_pc != HALT_BIT) ? resume_pc : (((int32_t)ui >= 0) ? __ldg(&uop2pc[ui]) : HALT_BIT);
     if (id == 0 && retd) *retd = (unsigned long long)gi;          // retired guest-instructions (for the verify gate)
 }
 
@@ -311,6 +317,13 @@ static int        g_nuops   = 0;
 static int        g_pc2words = 0;       // length of pc2uop[] = translated code words (NOT total memory words)
 static uint32_t   g_base    = 0;
 static unsigned long long* g_ret = nullptr;  // core-0 retired guest-instruction count (verify gate)
+// Translate-on-miss state (host mirrors, so an untranslated indirect-jump target can be translated
+// lazily and appended without re-doing the whole image). g_uopcap = device capacity in uops.
+static std::vector<uint32_t> g_img;          // guest code words (persisted)
+static std::vector<uint32_t> g_pc2uop_h;     // host mirror of pc2uop[]
+static std::vector<uint32_t> g_w0h, g_w1h, g_u2pch;  // host mirrors of the uop arrays
+static std::vector<uint8_t>  g_uwh;
+static int        g_uopcap  = 0;
 
 API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     g_ncores = nCores;
@@ -483,6 +496,25 @@ static int rvcud_try_incbr(RvcudBuild& B, int w, uint32_t& ui) {
     return bj - w + 1;
 }
 
+// Host mirror of the device alu() — used to self-verify the affine fold against the original block.
+static uint32_t host_alu(uint32_t f3, uint32_t u1, uint32_t a2u, uint32_t sh, bool sub, bool sra) {
+    int32_t s1=(int32_t)u1, a2s=(int32_t)a2u;
+    uint32_t add=sub?(u1-a2u):(u1+a2u), sll=u1<<(sh&31), slt=(uint32_t)(s1<a2s), sltu=(uint32_t)(u1<a2u);
+    uint32_t xr=u1^a2u, sr=sra?(uint32_t)(s1>>(sh&31)):(u1>>(sh&31)), orr=u1|a2u, andr=u1&a2u;
+    uint32_t e0=(f3&4)?xr:add, e1=(f3&4)?sr:sll, e2=(f3&4)?orr:slt, e3=(f3&4)?andr:sltu;
+    return (f3&1)?((f3&2)?e3:e1):((f3&2)?e2:e0);
+}
+// Apply one guest ALU instruction (op 0x13 / 0x33) to a register file (true RV32I semantics).
+static void host_applyALU(uint32_t instr, uint32_t* regs) {
+    uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, r;
+    if (op==0x13) { uint32_t iimm=(uint32_t)((int32_t)instr>>20);
+        bool sra=(f3==5)&&((instr>>30)&1); r=host_alu(f3, regs[rs1], iimm, iimm&0x1F, false, sra); }
+    else { uint32_t rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
+        bool sub=(f7==0x20&&f3==0), sra=(f7==0x20&&f3==5); r=host_alu(f3, regs[rs1], regs[rs2], regs[rs2]&0x1F, sub, sra); }
+    if (rd) regs[rd]=r;
+    regs[0]=0;
+}
+
 // AFFINE ×CONST FOLD. A straight-line run of slli/add/sub/addi computes, for its result
 // register, a multi-variable affine form  res = imm + Σ_b C_b·(live-in reg b). This is the
 // strength-reduced ×constant tree clang emits for `x*K` on rv32i — and it captures the case
@@ -578,6 +610,26 @@ static int rvcud_try_affine(RvcudBuild& B, int w, uint32_t& ui) {
             if (a==(uint32_t)res || (op==0x33 && b2==(uint32_t)res)) ok=false;
         }
         if (!ok) continue;
+        // SELF-VERIFY: emulate the original block vs the planned fold on pseudo-random register
+        // vectors; only fold if every live-out register matches. Auto-rejects any pattern the fold
+        // would miscompile (the 3-guest gate can't cover everything; this guarantees correctness).
+        {
+            uint32_t lo = B.liveout[runEnd]; bool verified = true; uint32_t seed = 0x9E3779B9u ^ (uint32_t)w;
+            for (int trial = 0; trial < 6 && verified; trial++) {
+                uint32_t o[32], f[32];
+                for (int b = 0; b < 32; b++) { seed = seed*1664525u + 1013904223u; o[b] = f[b] = seed; }
+                o[0] = f[0] = 0;
+                for (int t = 0; t < m; t++) host_applyALU(img[w+t], o);          // original block
+                for (int t = 0; t < m; t++) {                                    // planned fold
+                    if (w+t == runEnd) { uint32_t v = f[rootv]*C + (uint32_t)K;
+                        for (int k=0;k<nu;k++) v += f[cd.unit[k]];
+                        f[res] = v; f[0] = 0; }
+                    else if (surv[t]) host_applyALU(img[w+t], f);
+                }
+                for (int b = 1; b < 32 && verified; b++) if (((lo>>b)&1u) && o[b] != f[b]) verified = false;
+            }
+            if (!verified) continue;   // fold would miscompile this block → leave it to the 1:1 path
+        }
         int first = -1; for (int k=0;k<nu;k++) if (cd.unit[k]==res) { first=k; break; }
         if (first < 0 && nu > 0) first = 0;
         int nuops = 1 + (nu>0 ? nu-1 : 0) + (K!=0 ? 1 : 0);
@@ -727,7 +779,7 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) {
             B.pc2uop[w] = ui;
             uint32_t a0, a1, t; uint8_t wt;
-            consumed = rvcud_try_fuse(B, w, a0, a1, wt, t);   // ≥1; swallowed words stay BADUOP
+            consumed = rvcud_try_fuse(B, w, a0, a1, wt, t);   // ≥1; swallowed words stay BADUOP (LEA/CONST/XSH)
             B.w0.push_back(a0); B.w1.push_back(a1); B.uw.push_back(wt);
             B.u2pc.push_back(B.base + (uint32_t)w*4); B.tgt.push_back(t);
             ui++;
@@ -754,7 +806,8 @@ static void rvcud_free() {
     if (g_uw)     { cudaFree(g_uw);     g_uw     = nullptr; }
     if (g_pc2uop) { cudaFree(g_pc2uop); g_pc2uop = nullptr; }
     if (g_uop2pc) { cudaFree(g_uop2pc); g_uop2pc = nullptr; }
-    g_nuops = 0;
+    g_nuops = 0; g_uopcap = 0;
+    g_img.clear(); g_pc2uop_h.clear(); g_w0h.clear(); g_w1h.clear(); g_u2pch.clear(); g_uwh.clear();
 }
 
 // Translate the guest image into the rvcud uop stream and upload it. `base` is the
@@ -762,25 +815,68 @@ static void rvcud_free() {
 API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base, unsigned int entry) {
     rvcud_free();
     int N = (int)(len >> 2);
-    RvcudBuild B; B.nwords = N; B.base = base; B.entry = entry;
-    std::vector<uint32_t> words(N);
-    memcpy(words.data(), src, (size_t)N * 4);
-    B.img = words.data();
+    g_img.assign(N, 0);
+    memcpy(g_img.data(), src, (size_t)N * 4);
+    RvcudBuild B; B.nwords = N; B.base = base; B.entry = entry; B.img = g_img.data();
     rvcud_build(B);
     g_nuops = (int)B.w0.size(); g_base = base; g_pc2words = N;
+    // Persist host mirrors so missed (indirect) targets can be translated lazily and appended.
+    g_w0h = B.w0; g_w1h = B.w1; g_uwh = B.uw; g_u2pch = B.u2pc; g_pc2uop_h = B.pc2uop;
+    // Device capacity has headroom for translate-on-miss: each code word can be re-emitted once as a
+    // 1:1 uop, plus up to one rejoin-JAL per block → ≤ 2N appended.
+    g_uopcap = g_nuops + 2 * N + 16;
     std::vector<uint2> uops(g_nuops);
-    for (int i = 0; i < g_nuops; i++) uops[i] = make_uint2(B.w0[i], B.w1[i]);
+    for (int i = 0; i < g_nuops; i++) uops[i] = make_uint2(g_w0h[i], g_w1h[i]);
 
     cudaError_t e;
-    if ((e = cudaMalloc(&g_uops,   (size_t)g_nuops * sizeof(uint2)))   != cudaSuccess) return (int)e;
-    if ((e = cudaMalloc(&g_uw,     (size_t)g_nuops))                   != cudaSuccess) return (int)e;
-    if ((e = cudaMalloc(&g_uop2pc, (size_t)g_nuops * 4))              != cudaSuccess) return (int)e;
+    if ((e = cudaMalloc(&g_uops,   (size_t)g_uopcap * sizeof(uint2)))  != cudaSuccess) return (int)e;
+    if ((e = cudaMalloc(&g_uw,     (size_t)g_uopcap))                  != cudaSuccess) return (int)e;
+    if ((e = cudaMalloc(&g_uop2pc, (size_t)g_uopcap * 4))             != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_pc2uop, (size_t)N * 4))                    != cudaSuccess) return (int)e;
     cudaMemcpy(g_uops,   uops.data(),     (size_t)g_nuops * sizeof(uint2), cudaMemcpyHostToDevice);
-    cudaMemcpy(g_uw,     B.uw.data(),     (size_t)g_nuops,                cudaMemcpyHostToDevice);
-    cudaMemcpy(g_uop2pc, B.u2pc.data(),   (size_t)g_nuops * 4,            cudaMemcpyHostToDevice);
-    cudaMemcpy(g_pc2uop, B.pc2uop.data(), (size_t)N * 4,                  cudaMemcpyHostToDevice);
+    cudaMemcpy(g_uw,     g_uwh.data(),    (size_t)g_nuops,                cudaMemcpyHostToDevice);
+    cudaMemcpy(g_uop2pc, g_u2pch.data(),  (size_t)g_nuops * 4,            cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pc2uop, g_pc2uop_h.data(), (size_t)N * 4,               cudaMemcpyHostToDevice);
     return (int)cudaDeviceSynchronize();
+}
+
+// Translate-on-miss: an indirect (JALR) jump landed on code with no uop. Lazily translate from `pc`
+// as a straight-line 1:1 run — continuing through conditional branches (their fall-through is the
+// next appended uop) and stopping at an unconditional jal/jalr, code end, or where it rejoins an
+// already-translated word (emit a jump to it). Direct targets are baked against the live pc2uop.
+// Appends to the (capacity-reserved) device buffers and patches the changed pc2uop range.
+static bool rvcud_translate_miss(uint32_t pc) {
+    if (pc < g_base) return false;
+    int w = (int)((pc - g_base) >> 2), N = g_pc2words;
+    if (w < 0 || w >= N || g_pc2uop_h[w] != RC_BADUOP) return false;
+    RvcudBuild tb; tb.img = g_img.data(); tb.nwords = N; tb.base = g_base;
+    int firstNew = g_nuops, j = w;
+    for (; j < N && g_nuops < g_uopcap - 1; j++) {
+        if (j != w && g_pc2uop_h[j] != RC_BADUOP) {        // rejoin existing translation
+            g_w0h.push_back(RCW0(RC_JAL,0,0,0,0,0,RP_UNC,0));
+            g_w1h.push_back(g_pc2uop_h[j]); g_uwh.push_back(0); g_u2pch.push_back(g_base+(uint32_t)j*4);
+            g_nuops++; break;
+        }
+        uint32_t a0,a1,t; uint8_t wt; rvcud_classify(tb, j, a0,a1,wt,t);
+        g_pc2uop_h[j] = (uint32_t)g_nuops;
+        g_w0h.push_back(a0); g_w1h.push_back(a1); g_uwh.push_back(wt); g_u2pch.push_back(g_base+(uint32_t)j*4);
+        uint32_t cls = a0 & 0x7F;
+        if (cls == RC_BR || cls == RC_JAL)                 // bake direct target against the live map
+            g_w1h[g_nuops] = ((int)t < N && g_pc2uop_h[t] != RC_BADUOP) ? g_pc2uop_h[t] : 0xFFFFFFFFu;
+        g_nuops++;
+        uint32_t op = g_img[j] & 0x7F;
+        if (op == 0x6F || op == 0x67) { j++; break; }      // jal/jalr: unconditional → block ends
+    }
+    int cnt = g_nuops - firstNew;
+    if (cnt <= 0) return false;
+    std::vector<uint2> nu(cnt);
+    for (int i = 0; i < cnt; i++) nu[i] = make_uint2(g_w0h[firstNew+i], g_w1h[firstNew+i]);
+    cudaMemcpy(g_uops   + firstNew, nu.data(),            (size_t)cnt * sizeof(uint2), cudaMemcpyHostToDevice);
+    cudaMemcpy(g_uw     + firstNew, g_uwh.data()+firstNew,(size_t)cnt,                 cudaMemcpyHostToDevice);
+    cudaMemcpy(g_uop2pc + firstNew, g_u2pch.data()+firstNew,(size_t)cnt * 4,           cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pc2uop + w, g_pc2uop_h.data()+w, (size_t)(j - w) * 4, cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    return true;
 }
 
 // Budget is a GUEST-INSTRUCTION budget (the kernel accumulates per-uop weights), so the
@@ -791,10 +887,29 @@ API int cuda_rvcud_step_all(int budget) {
     int block = g_ncores < 64 ? g_ncores : 64;       // 2-warp blocks (SM coverage)
     int grid  = (g_ncores + block - 1) / block;
     size_t shmem = (size_t)block * 33 * sizeof(uint32_t);   // 33-stride regfile
-    rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc,
-                                         g_ncores, g_pc2words, g_base, budget, g_ret);   // nwords = pc2uop length (code words)
-    cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
-    return le != cudaSuccess ? (int)le : (int)se;
+    // Translate-on-miss driver: run; if core 0 stopped at an untranslated indirect target, translate
+    // that block and resume — until the budget is spent or the guest halts. Static fully-translated
+    // guests (the benchmarks) never miss, so this runs exactly once for them.
+    long long total = 0;
+    for (int guard = 0; guard < 1 << 20; guard++) {
+        int rem = budget - (int)total;
+        if (rem <= 0) break;
+        rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc,
+                                             g_ncores, g_pc2words, g_base, rem, g_ret);
+        cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
+        if (le != cudaSuccess) return (int)le;
+        if (se != cudaSuccess) return (int)se;
+        total += (long long)*g_ret;                  // core 0 retired this launch
+        uint32_t pc = g_state[0].pc;                 // managed memory → host-readable
+        if (pc & 0x80000000u) break;                 // halted (illegal instr / guest done)
+        int w = (pc >= g_base) ? (int)((pc - g_base) >> 2) : -1;
+        if (w >= 0 && w < g_pc2words && g_pc2uop_h[w] == RC_BADUOP) {
+            if (rvcud_translate_miss(pc)) continue;   // translated the missed block → resume
+        }
+        break;                                        // normal: budget spent at a translated pc
+    }
+    *g_ret = (unsigned long long)total;               // report TOTAL retired (verify gate reads this)
+    return 0;
 }
 
 // Guest-instructions retired by core 0 in the last cuda_rvcud_step_all (≈ budget + overshoot,
