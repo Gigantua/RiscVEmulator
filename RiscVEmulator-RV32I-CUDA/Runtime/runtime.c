@@ -13,16 +13,17 @@ typedef unsigned long long u64;
 typedef int                s32;
 typedef long long          s64;
 
-/* ── 32-bit unsigned multiply: shift-and-add ─────────────────────── */
+/* ── 32-bit multiply: emit a single hardware MUL ─────────────────── *
+ * The guest is built -march=rv32i, so clang calls this for every `*`. Rather
+ * than a 32-iteration shift-add loop, force a single M-extension MUL via an
+ * inline-asm arch override (the emulator implements MUL). This collapses every
+ * software multiply to one instruction — the imul the translator can also use. */
 u32 __mulsi3(u32 a, u32 b)
 {
-    u32 result = 0;
-    while (a) {
-        if (a & 1u) result += b;
-        a >>= 1;
-        b <<= 1;
-    }
-    return result;
+    u32 r;
+    __asm__ (".option push\n\t.option arch, +m\n\tmul %0, %1, %2\n\t.option pop"
+             : "=r"(r) : "r"(a), "r"(b));
+    return r;
 }
 
 /* ── 32-bit unsigned divide: bit-by-bit long division ────────────── *
