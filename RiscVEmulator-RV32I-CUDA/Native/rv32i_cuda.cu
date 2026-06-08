@@ -184,35 +184,15 @@ __global__ void predecode_kernel(const uint32_t* code, uint2* dec, int nwords) {
 //  Sibling arrays (read-only, broadcast): uw[] guest-instr weight per uop,
 //  pc2uop[] guest-word→uop index (entry + JALR), uop2pc[] uop→guest pc.
 // ===================================================================
-// Translator transform toggles (grind A/B switches). T1 switch-flatten inlines
-// all switch arms as predicated uops → makes the divergent guest WORSE; default off.
-#ifndef RVCUD_T1
-#define RVCUD_T1 0
-#endif
-#ifndef RVCUD_T2
-#define RVCUD_T2 1
-#endif
-#ifndef REGSTRIDE
-#define REGSTRIDE 33          // shared-regfile stride (33 = bank-conflict-free for 32 banks)
-#endif
-// KEEP: counted-loop addi+branch → INCBR fusion. Measured +19% on the compute guest (159.6k vs
-// 133.8k MIPS), neutral on data/diverge, bit-identical. Folded into the default build.
-#ifndef RVCUD_NO_INCBR
-#define IDEA_INCBR 1
-#endif
-#ifndef RVCUD_LB
-#define RVCUD_LB 256          // __launch_bounds__ max threads/block hint
-#endif
-// ===================================================================
 // Class codes are SPARSE (opcode-like), NOT a dense 0..N — a dense switch makes ptxas
 // emit BRX (an indirect jump), which measured -35%. Sparse values keep the dispatch a
 // frequency-ordered predicated compare-ladder, exactly like rv32i_kernel's op-ladder.
+//   RC_MULADD: r = root*C + reg (one IMAD). RC_XSH: r = rs ^ (rs<<|>>k) (xorshift step).
+//   RC_INCBR: rc += K; if (rc cmp rX) goto T (counted-loop addi+branch → 1 uop).
 enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST=0x23,
        RC_CONST=0x37, RC_LEA=0x1B, RC_ADDC=0x2B, RC_JAL=0x6F, RC_JALR=0x67, RC_NOP=0x0F,
-       RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B, RC_ROT=0x6B,
-       RC_XSHADD=0x77, RC_ANDSH=0x57, RC_ILL=0x00 };
-       // RC_MULADD: r=root*C+reg (one IMAD). RC_XSH: r=rs^(rs<<|>>k). RC_INCBR: rc+=K; if(rc cmp rX) goto T. RC_ROT: r=rotl(rs,s) (slli+srli+or → 1 uop)
-enum { RP_UNC=0, RP_GP=1, RP_GNP=2, RP_SETP=3, RP_SETSEL=4, RP_GSEL=5 };
+       RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B, RC_ILL=0x00 };
+enum { RP_UNC=0, RP_GP=1, RP_GNP=2, RP_SETP=3 };   // uop predicate: unconditional / guard-P / guard-!P / set-P
 static constexpr uint32_t RC_BADUOP = 0x80000000u;   // pc2uop sentinel: not a uop leader → halt on landing
 
 // w0: class[6:0] rd[11:7] rs1[16:12] rs2[21:17] f3[24:22] sra[25] pred[28:26] selc[31:29]
@@ -221,7 +201,7 @@ static constexpr uint32_t RC_BADUOP = 0x80000000u;   // pc2uop sentinel: not a u
      | ((uint32_t)(f3)<<22) | ((uint32_t)(sra)<<25) \
      | ((uint32_t)(pred)<<26) | ((uint32_t)(selc)<<29))
 
-__global__ void __launch_bounds__(RVCUD_LB)
+__global__ void __launch_bounds__(256)
 rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2* __restrict__ uops, const uint8_t* __restrict__ uw,
              const uint32_t* __restrict__ pc2uop, const uint32_t* __restrict__ uop2pc,
              int ncores, int nwords, uint32_t base, int budget, unsigned long long* __restrict__ retd) {
@@ -229,7 +209,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
     if (id >= ncores) return;
     CoreState& g = st[id];
     extern __shared__ uint32_t s_regs[];
-    uint32_t* const regs = &s_regs[threadIdx.x * REGSTRIDE];
+    uint32_t* const regs = &s_regs[threadIdx.x * 33];   // 33-stride: bank-conflict-free for 32 banks
     #pragma unroll
     for (int i = 0; i < 32; i++) regs[i] = g.regs[i];
     uint32_t pc = g.pc;
@@ -239,36 +219,12 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
     else { uint32_t pw = (pc - base) >> 2;
            ui = (pw < (uint32_t)nwords) ? __ldg(&pc2uop[pw]) : HALT_BIT;
            if (ui & 0x80000000u) ui = HALT_BIT; }
-    uint32_t P = 0, SEL = 0;             // predicate + selector (if-conversion / switch-flatten)
+    uint32_t P = 0;                      // if-conversion predicate
 
     int gi = 0;
-#ifdef RVCUD_UNROLL
-    #pragma unroll RVCUD_UNROLL
-#endif
     for (; gi < budget && (int32_t)ui >= 0; ) {
-#ifdef IDEA_FETCH64
-        const uint2 _uw = __ldg(&uops[ui]); const uint32_t w0 = _uw.x, w1 = _uw.y;   // one 64-bit load
-#elif defined(IDEA_LDG_CS)
-        uint32_t w0, w1;                             // streaming-cache-hint loads (.cs)
-        asm("ld.global.cs.u32 %0, [%1];" : "=r"(w0) : "l"(&uops[ui].x));
-        asm("ld.global.cs.u32 %0, [%1];" : "=r"(w1) : "l"(&uops[ui].y));
-#elif defined(IDEA_LDG_LU)
-        uint32_t w0, w1;                             // last-use cache hint (.lu)
-        asm("ld.global.lu.u32 %0, [%1];" : "=r"(w0) : "l"(&uops[ui].x));
-        asm("ld.global.lu.u32 %0, [%1];" : "=r"(w1) : "l"(&uops[ui].y));
-#else
         const uint32_t w0 = __ldg(&uops[ui].x);     // two 32-bit loads, one cache line (never LDG.E.64)
         const uint32_t w1 = __ldg(&uops[ui].y);
-#endif
-#ifdef IDEA_PREFETCH
-        asm volatile("prefetch.global.L1 [%0];" :: "l"(uops + ui + 1));   // pull the next uop into L1 early
-#endif
-#ifdef IDEA_PREFETCH2
-        asm volatile("prefetch.global.L1 [%0];" :: "l"(uops + ui + 2));   // prefetch two uops ahead
-#endif
-#ifdef IDEA_PREFETCH_L2
-        asm volatile("prefetch.global.L2 [%0];" :: "l"(uops + ui + 1));   // prefetch next uop into L2
-#endif
         const uint32_t cls  = w0 & 0x7F;
         const int      rd   = (w0 >> 7) & 0x1F;
         const uint32_t u1   = regs[(w0 >> 12) & 0x1F];
@@ -287,15 +243,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             P = (selc & 1) ? (uint32_t)(!t) : (uint32_t)t;   // selc bit0 = invert (body-live polarity)
             ui += 1; gi += wt; continue;
         }
-#if RVCUD_T1
-        if (pred == RP_SETSEL) { SEL = (u1 >> (w1 & 31)) & ((w1 >> 8) & 0xFFu); ui += 1; gi += wt; continue; }  // w1 = shift | mask<<8
-#endif
         uint32_t live = 1;
-#if RVCUD_T1
-        if (pred) live = (pred==RP_GP) ? P : (pred==RP_GNP) ? (P ^ 1u) : (uint32_t)(SEL == selc);
-#else
-        if (pred) live = (pred==RP_GP) ? P : (P ^ 1u);   // T1 off → pred ∈ {GP,GNP} here (GSEL/SETSEL never emitted)
-#endif
+        if (pred) live = (pred==RP_GP) ? P : (P ^ 1u);   // pred ∈ {GP,GNP} for if-converted body uops
 
         // Frequency-ordered dispatch ladder (hottest classes first → fewest predicted compares on
         // the common path). SUB/MULR are rare (never fire on these guests) → pushed to the tail.
@@ -304,23 +253,12 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_ALUR)  r = alu(f3, u1, u2, (uint32_t)(s2 & 0x1F), false, sra);
         else if (cls == RC_MULADD) r = u1 * w1 + u2;                             // affine ×const tree + live const-reg → 1 IMAD
         else if (cls == RC_XSH)   r = u1 ^ (sra ? (u1 >> (w1 & 31)) : (u1 << (w1 & 31)));  // xorshift step: rs ^ (rs<<|>>k)
-#ifdef IDEA_ROT
-        else if (cls == RC_ROT)   r = (u1 << (w1 & 31)) | (u1 >> ((32 - (w1 & 31)) & 31)); // rotate-left by w1
-#endif
-#ifdef IDEA_XSHADD
-        else if (cls == RC_XSHADD) r = (u1 ^ (sra ? (u1 >> (w1 & 31)) : (u1 << (w1 & 31)))) + u2;  // xorshift step + add
-#endif
-#ifdef IDEA_ANDSH
-        else if (cls == RC_ANDSH) { uint32_t tmp = sra ? (u1 >> (w1 & 31)) : (u1 << (w1 & 31));    // (rs<<|>>k) <logic> rt
-                                    r = (f3==7) ? (tmp & u2) : (f3==6) ? (tmp | u2) : (tmp ^ u2); }
-#endif
         else if (cls == RC_ADDC)  r = u1 + w1;
         else if (cls == RC_BR) {
             int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
                                  case 5:t=s1>=s2;break; case 6:t=u1<u2;break; default:t=u1>=u2; }
             ui = t ? w1 : ui + 1; gi += wt; continue;                            // w1 = baked target uop-index
         }
-#ifdef IDEA_INCBR
         else if (cls == RC_INCBR) {                                             // counted loop: rc += K; if (rc cmp rX) goto T
             int32_t inc = (int32_t)w1 >> 24;                                     // signed high byte = increment
             uint32_t tgt = w1 & 0x00FFFFFFu;                                     // low 24 = baked target uop-index (0xFFFFFF = unresolved → halt)
@@ -330,7 +268,6 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                                  case 5:t=sv>=s2;break; case 6:t=nv<u2;break; default:t=nv>=u2; }
             ui = t ? (tgt==0x00FFFFFFu ? HALT_BIT : tgt) : ui + 1; gi += wt; continue;
         }
-#endif
         else if (cls == RC_LOAD) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
             switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
                           case 1: r=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,a); break;
@@ -356,11 +293,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_NOP)  { ui += 1; gi += wt; continue; }
         else { ui |= HALT_BIT; continue; }                                       // RC_ILL
 
-#ifdef IDEA_WB_SELP
-        if (rd) regs[rd] = live ? r : regs[rd];      // selp form (reads regs[rd]) — for comparison
-#else
         if (rd && live) regs[rd] = r;                // predicated store (@p st.shared) — no regs[rd] read-back
-#endif
         ui = nui; gi += live ? wt : 0;               // a predicated-off body uop retires 0 guest instrs
     }
     #pragma unroll
@@ -533,7 +466,6 @@ static int rvcud_classify(const RvcudBuild& B, int w,
     return 1;
 }
 
-#ifdef IDEA_INCBR
 // COUNTED-LOOP FUSION. `addi rc,rc,K` … `b<cc> rc,rX,T` in one block (independent instrs may sit
 // between — they must not read/write rc nor write rX, and no jump/foreign-entry between) → emit the
 // between-instrs 1:1 then ONE INCBR uop that increments rc and branches on the new rc. The increment
@@ -574,7 +506,6 @@ static int rvcud_try_incbr(RvcudBuild& B, int w, uint32_t& ui) {
     B.uw.push_back(2); B.u2pc.push_back(B.base+(uint32_t)bj*4); B.tgt.push_back(tgtw); ui++;
     return bj - w + 1;
 }
-#endif
 
 // AFFINE ×CONST FOLD. A straight-line run of slli/add/sub/addi computes, for its result
 // register, a multi-variable affine form  res = imm + Σ_b C_b·(live-in reg b). This is the
@@ -706,100 +637,6 @@ static int rvcud_try_fuse(const RvcudBuild& B, int w,
 
     // (affine ×const fold moved to rvcud_try_affine, which can emit a multi-uop chain)
 
-#ifdef IDEA_ADDADD
-    // ── ADDADD — addi rd,rs,A ; addi rd,rd,B  (1st rd dead except for the 2nd) → addi rd,rs,A+B ──
-    if (OPC(w)==0x13 && ((img[w]>>12)&7)==0 && w+1<N && !B.leader[w+1] && OPC(w+1)==0x13 && ((img[w+1]>>12)&7)==0) {
-        uint32_t i1=img[w], i2=img[w+1];
-        uint32_t rd1=(i1>>7)&0x1F, rs=(i1>>15)&0x1F, rd2=(i2>>7)&0x1F, rs2=(i2>>15)&0x1F;
-        if (rd1!=0 && rd1==rd2 && rs2==rd1 && rs!=rd1) {              // chained on rd1, rs untouched
-            w0 = RCW0(RC_ADDC, rd1, rs, 0, 0, 0, RP_UNC, 0);
-            w1 = rv_iimm(i1) + rv_iimm(i2); weight = 2; tgt = RC_NOTGT; return 2;
-        }
-    }
-#endif
-#ifdef IDEA_BRCMP
-    // ── BRCMP — slt/sltu rd,a,b ; beq/bne rd,x0,T  (rd dead) → branch directly on a<b (no temp) ──
-    if (OPC(w)==0x33 && w+1<N && !B.leader[w+1] && OPC(w+1)==0x63) {
-        uint32_t i1=img[w], i2=img[w+1], sf3=(i1>>12)&7, sf7=(i1>>25)&0x7F;
-        uint32_t rd=(i1>>7)&0x1F, a=(i1>>15)&0x1F, b=(i1>>20)&0x1F;
-        uint32_t bf3=(i2>>12)&7, ba=(i2>>15)&0x1F, bb=(i2>>20)&0x1F;
-        bool isslt = (sf7==0 && (sf3==2||sf3==3));                    // slt (2) / sltu (3)
-        bool cmp0  = (bf3==0||bf3==1) && ((ba==rd&&bb==0)||(ba==0&&bb==rd));   // beq/bne rd,x0
-        bool dead  = !(B.liveout[w+1] & (1u<<rd));
-        if (isslt && cmp0 && rd!=0 && dead) {
-            // bne(rd!=0) ⇒ a<b ; beq(rd==0) ⇒ a>=b. signed slt→blt/bge(4/5), unsigned→bltu/bgeu(6/7)
-            uint32_t nf3 = (sf3==2) ? (bf3==1 ? 4u : 5u) : (bf3==1 ? 6u : 7u);
-            uint32_t pcw = B.base + (uint32_t)(w+1)*4;
-            w0 = RCW0(RC_BR, 0, a, b, nf3, 0, RP_UNC, 0);
-            w1 = 0; weight = 2; tgt = (pcw + rv_bimm(i2) - B.base) >> 2; return 2;
-        }
-    }
-#endif
-
-#ifdef IDEA_ROT
-    // ── ROT — rotate: slli ta,rs,s ; srli tb,rs,32-s ; or rd,{ta,tb}  (ta,tb dead) → rotl(rs,s) ──
-    if ((OPC(w)==0x13) && w+2<N && !B.leader[w+1] && !B.leader[w+2] && OPC(w+1)==0x13 && OPC(w+2)==0x33) {
-        uint32_t a=img[w], b=img[w+1], c=img[w+2];
-        uint32_t af3=(a>>12)&7, bf3=(b>>12)&7, cf3=(c>>12)&7, cf7=(c>>25)&0x7F;
-        uint32_t ta=(a>>7)&0x1F, ars=(a>>15)&0x1F, ash=(a>>20)&0x1F;
-        uint32_t tb=(b>>7)&0x1F, brs=(b>>15)&0x1F, bsh=(b>>20)&0x1F;
-        uint32_t rd=(c>>7)&0x1F, cra=(c>>15)&0x1F, crb=(c>>20)&0x1F;
-        // accept (slli, srli) or (srli, slli); shifts of the same source summing to 32; OR of {ta,tb}
-        bool shapes = ((af3==1 && bf3==5) || (af3==5 && bf3==1));
-        if (shapes && cf3==6 && cf7==0 && ars==brs && (ash+bsh)==32 && ta!=0 && tb!=0 && ta!=tb &&
-            ((cra==ta && crb==tb) || (cra==tb && crb==ta))) {
-            uint32_t lo = B.liveout[w+2];
-            bool dead = (!(lo&(1u<<ta)) || rd==ta) && (!(lo&(1u<<tb)) || rd==tb);
-            uint32_t lsh = (af3==1) ? ash : bsh;            // the left-shift amount = rotate-left amount
-            if (dead && ars!=ta && ars!=tb) {
-                w0 = RCW0(RC_ROT, rd, ars, 0, 0, 0, RP_UNC, 0);
-                w1 = lsh; weight = 3; tgt = RC_NOTGT;
-                return 3;
-            }
-        }
-    }
-#endif
-
-#ifdef IDEA_ANDSH
-    // ── ANDSH — (slli|srli) t,rs,k ; (and|or|xor) rd,t,rv  (t dead) → rd = (rs<<|>>k) <logic> rv ──
-    if (OPC(w)==0x13 && w+1<N && !B.leader[w+1] && OPC(w+1)==0x33) {
-        uint32_t i1=img[w], i2=img[w+1], sf3=(i1>>12)&7, sf7=(i1>>25)&0x7F;
-        bool left=(sf3==1), right=(sf3==5 && sf7==0);
-        uint32_t t=(i1>>7)&0x1F, rs=(i1>>15)&0x1F, sh=(i1>>20)&0x1F;
-        uint32_t xf3=(i2>>12)&7, xf7=(i2>>25)&0x7F, rd=(i2>>7)&0x1F, ra=(i2>>15)&0x1F, rb=(i2>>20)&0x1F;
-        bool logic = (xf3==4||xf3==6||xf3==7) && xf7==0;
-        if ((left||right) && logic && t!=0 && (ra==t||rb==t)) {
-            uint32_t rv = (ra==t) ? rb : ra;
-            bool tdead = (rd==t) || !(B.liveout[w+1] & (1u<<t));
-            if (rv!=t && rs!=t && tdead) {
-                w0 = RCW0(RC_ANDSH, rd, rs, rv, xf3, (uint32_t)right, RP_UNC, 0);
-                w1 = sh; weight = 2; tgt = RC_NOTGT; return 2;
-            }
-        }
-    }
-#endif
-#ifdef IDEA_XSHADD
-    // ── XSHADD — (slli|srli) t,rs,k ; xor x,{t,rs} ; add y,{x,rv}  → y = (rs^(rs<<|>>k)) + rv ──
-    if (OPC(w)==0x13 && w+2<N && !B.leader[w+1] && !B.leader[w+2] && OPC(w+1)==0x33 && OPC(w+2)==0x33) {
-        uint32_t i1=img[w], i2=img[w+1], i3=img[w+2];
-        uint32_t sf3=(i1>>12)&7, sf7=(i1>>25)&0x7F; bool left=(sf3==1), right=(sf3==5&&sf7==0);
-        uint32_t t=(i1>>7)&0x1F, rs=(i1>>15)&0x1F, sh=(i1>>20)&0x1F;
-        uint32_t xf3=(i2>>12)&7, xf7=(i2>>25)&0x7F, xrd=(i2>>7)&0x1F, xa=(i2>>15)&0x1F, xb=(i2>>20)&0x1F;
-        uint32_t af3=(i3>>12)&7, af7=(i3>>25)&0x7F, ard=(i3>>7)&0x1F, aa=(i3>>15)&0x1F, ab=(i3>>20)&0x1F;
-        bool xorok = (xf3==4 && xf7==0 && ((xa==t&&xb==rs)||(xa==rs&&xb==t)));
-        bool addok = (af3==0 && af7==0 && (aa==xrd||ab==xrd));
-        if ((left||right) && xorok && addok && t!=0 && xrd!=0) {
-            uint32_t rv = (aa==xrd) ? ab : aa;
-            bool tdead = !(B.liveout[w+2] & (1u<<t));            // t dead after the add
-            bool xdead = (ard==xrd) || !(B.liveout[w+2] & (1u<<xrd));
-            if (rs!=t && rv!=t && rv!=xrd && tdead && xdead) {
-                w0 = RCW0(RC_XSHADD, ard, rs, rv, 0, (uint32_t)right, RP_UNC, 0);
-                w1 = sh; weight = 3; tgt = RC_NOTGT; return 3;
-            }
-        }
-    }
-#endif
-
     // ── XSH — xorshift step: (slli|srli) rt,rs,k ; xor rd,{rt,rs} (rt dead after) → rd = rs ^ (rs<<|>>k) ──
     if (OPC(w)==0x13 && w+1<N && !B.leader[w+1] && OPC(w+1)==0x33) {
         uint32_t i1=img[w], i2=img[w+1];
@@ -889,98 +726,6 @@ static int rvcud_try_ifconv(RvcudBuild& B, int w, uint32_t& ui) {
     return n + 1;
 }
 
-// Phase 4 (T1) — JUMP-TABLE SWITCH FLATTEN. Recognizes `jalr x0,rt,0` dispatched through a
-// .rodata jump table (rt = lw[ TBASE + (idx<<2) ], selector idx = (x<<S1)>>S2), reads the N arm
-// targets from the image, walks each PURE-ALU arm to the common merge, and replaces the indirect
-// jump with: SETSEL (SEL=(x>>shift)&mask) + a predicated GUARD_SEL cascade of all arms + a jump to
-// the merge. No brx.idx, divergence-free. Pushes uops; returns 1 (the jalr) consumed, or 0.
-static int rvcud_try_switch(RvcudBuild& B, int w, uint32_t& ui) {
-    const int N = B.nwords; const uint32_t* img = B.img;
-    uint32_t instr = img[w];
-    if ((instr & 0x7F) != 0x67 || ((instr>>7)&0x1F) != 0 || rv_iimm(instr) != 0) return 0;  // jalr x0,rt,0
-    auto isW = [&](uint32_t op){ return op==0x13||op==0x33||op==0x03||op==0x37||op==0x17||op==0x6F||op==0x67; };
-    auto findDef = [&](int from, uint32_t reg)->int {
-        for (int j = from-1; j >= 0 && j >= from-32; j--) {
-            uint32_t in = img[j], op = in&0x7F, rd = (in>>7)&0x1F;
-            if (isW(op) && rd==reg && rd!=0) return j;
-        } return -1;
-    };
-    uint32_t rt = (instr>>15)&0x1F;
-    int jlw = findDef(w, rt); if (jlw<0 || (img[jlw]&0x7F)!=0x03 || ((img[jlw]>>12)&7)!=2) return 0; // lw rt,limm(rb)
-    uint32_t rb = (img[jlw]>>15)&0x1F; int32_t limm = (int32_t)rv_iimm(img[jlw]);
-    int jadd = findDef(jlw, rb);
-    if (jadd<0 || (img[jadd]&0x7F)!=0x33 || ((img[jadd]>>12)&7)!=0 || ((img[jadd]>>25)&0x7F)!=0) return 0; // add rb,A,B
-    uint32_t A=(img[jadd]>>15)&0x1F, Bb=(img[jadd]>>20)&0x1F;
-    int jslli=-1; uint32_t tbReg=0;
-    for (int t=0; t<2; t++) { uint32_t cand=t?Bb:A, other=t?A:Bb; int d=findDef(jadd,cand);
-        if (d>=0 && (img[d]&0x7F)==0x13 && ((img[d]>>12)&7)==1 && ((img[d]>>20)&0x1F)==2) { jslli=d; tbReg=other; break; } }
-    if (jslli<0) return 0;
-    uint32_t idxReg=(img[jslli]>>15)&0x1F;                                 // scaled = idxReg<<2
-    int jsr = findDef(jslli, idxReg);
-    if (jsr<0 || (img[jsr]&0x7F)!=0x13 || ((img[jsr]>>12)&7)!=5 || ((img[jsr]>>25)&0x7F)!=0) return 0;  // srli idx,T,S2
-    uint32_t S2=(img[jsr]>>20)&0x1F, Treg=(img[jsr]>>15)&0x1F;
-    int jsl = findDef(jsr, Treg);
-    if (jsl<0 || (img[jsl]&0x7F)!=0x13 || ((img[jsl]>>12)&7)!=1) return 0;  // slli T,X,S1
-    uint32_t S1=(img[jsl]>>20)&0x1F, Xreg=(img[jsl]>>15)&0x1F;
-    if (S2 < S1) return 0;
-    uint32_t shift = S2 - S1, bits = 32 - S2; if (bits == 0 || bits > 3) return 0;   // ≤ 8-way
-    uint32_t Nn = 1u << bits, mask = Nn - 1;
-    // table base constant (loop-invariant; lui/auipc[+addi]) — search whole prefix
-    auto constOf = [&](uint32_t reg, uint32_t& out)->bool {
-        int d=-1; for (int j=jadd-1;j>=0;j--){ uint32_t in=img[j],op=in&0x7F,rd=(in>>7)&0x1F;
-            if (isW(op)&&rd==reg&&rd!=0){d=j;break;} }
-        if (d<0) return false; uint32_t in=img[d],op=in&0x7F,pcw=B.base+(uint32_t)d*4;
-        if (op==0x37){ out=in&0xFFFFF000u; return true; }
-        if (op==0x17){ out=pcw+(in&0xFFFFF000u); return true; }
-        if (op==0x13 && ((in>>12)&7)==0){ uint32_t rs=(in>>15)&0x1F; int d2=-1;
-            for (int j=d-1;j>=0;j--){ uint32_t i2=img[j],o2=i2&0x7F,r2=(i2>>7)&0x1F; if(isW(o2)&&r2==rs&&r2!=0){d2=j;break;} }
-            if (d2<0) return false; uint32_t i2=img[d2],o2=i2&0x7F,p2=B.base+(uint32_t)d2*4; uint32_t b2;
-            if (o2==0x37) b2=i2&0xFFFFF000u; else if (o2==0x17) b2=p2+(i2&0xFFFFF000u); else return false;
-            out=b2+rv_iimm(in); return true; }
-        return false;
-    };
-    uint32_t TB; if (!constOf(tbReg, TB)) return 0;
-    uint32_t tbl = TB + (uint32_t)limm;                                    // table byte address
-    int armStart[8];
-    for (uint32_t k=0;k<Nn;k++){ uint32_t ea=tbl+k*4; if ((ea>>2)>=(uint32_t)N) return 0;
-        uint32_t t=img[ea>>2], aw=(t-B.base)>>2; if ((int)aw>=N) return 0; armStart[k]=(int)aw; }
-    // merge = target of arm0's first `j`
-    int mergeWord=-1; { int cur=armStart[0], st=0;
-        while (st++<16){ uint32_t in=img[cur],op=in&0x7F;
-            if (op==0x6F && ((in>>7)&0x1F)==0){ mergeWord=(int)((B.base+(uint32_t)cur*4+rv_jimm(in)-B.base)>>2); break; }
-            if (op==0x13||op==0x33||op==0x37||op==0x17){ cur++; continue; } break; } }
-    if (mergeWord<0 || mergeWord>=N) return 0;
-    // walk every arm: collect its ALU words + count guest instrs (ALU + j's), must reach mergeWord
-    int collW[8][16], collN[8], armGC[8];
-    for (uint32_t k=0;k<Nn;k++){ int cur=armStart[k], st=0, cn=0, gc=0;
-        while (cur!=mergeWord && st++<16){
-            if (cur<0||cur>=N){ cn=-1; break; }
-            uint32_t in=img[cur],op=in&0x7F;
-            if (op==0x6F && ((in>>7)&0x1F)==0){ gc++; cur=(int)((B.base+(uint32_t)cur*4+rv_jimm(in)-B.base)>>2); continue; }
-            if (op==0x13||op==0x33||op==0x37||op==0x17){ if(cn>=16){cn=-1;break;} collW[k][cn++]=cur; gc++; cur++; continue; }
-            cn=-1; break;   // load/store/branch/jalr/fence in arm → too complex, bail
-        }
-        if (cn<0 || cur!=mergeWord) return 0;
-        collN[k]=cn; armGC[k]=gc;
-    }
-    // ── emit: SETSEL + GUARD_SEL cascade + merge JAL ──
-    B.pc2uop[w]=ui;
-    B.w0.push_back(RCW0(RC_NOP, 0, Xreg, 0, 0, 0, RP_SETSEL, 0));           // SEL=(x>>shift)&mask
-    B.w1.push_back(shift | (mask<<8)); B.uw.push_back(1); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back(RC_NOTGT); ui++;
-    for (uint32_t k=0;k<Nn;k++){
-        for (int i=0;i<collN[k];i++){ int cw=collW[k][i]; uint32_t a0,a1,t; uint8_t wt0; rvcud_classify(B,cw,a0,a1,wt0,t);
-            a0 = (a0 & ~((uint32_t)7u<<26)) | ((uint32_t)RP_GSEL<<26);      // pred = GUARD_SEL
-            a0 = (a0 & ~((uint32_t)7u<<29)) | ((uint32_t)k<<29);           // selc = case index
-            uint8_t wt = (uint8_t)((i==collN[k]-1) ? (1 + (armGC[k]-collN[k])) : 1);  // last uop carries the arm's j-weight
-            B.w0.push_back(a0); B.w1.push_back(a1); B.uw.push_back(wt);
-            B.u2pc.push_back(B.base+(uint32_t)cw*4); B.tgt.push_back(t); ui++;
-        }
-    }
-    B.w0.push_back(RCW0(RC_JAL, 0, 0, 0, 0, 0, RP_UNC, 0));                 // unconditional jump to merge (weight 0)
-    B.w1.push_back(0); B.uw.push_back(0); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)mergeWord); ui++;
-    return 1;
-}
-
 static void rvcud_build(RvcudBuild& B) {
     int N = B.nwords;
     // Pass 1 — leaders (any uop start) and xtargets (explicit foreign entries only).
@@ -1000,11 +745,8 @@ static void rvcud_build(RvcudBuild& B) {
     B.pc2uop.assign(N, RC_BADUOP);
     uint32_t ui = 0;
     for (int w = 0; w < N; ) {
-        int consumed = RVCUD_T1 ? rvcud_try_switch(B, w, ui) : 0;  // T1: jump-table switch → predicated cascade (default OFF — hurts divergent)
-#ifdef IDEA_INCBR
-        if (consumed == 0) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
-#endif
-        if (consumed == 0 && RVCUD_T2) consumed = rvcud_try_ifconv(B, w, ui);  // T2: if-conversion
+        int consumed = rvcud_try_incbr(B, w, ui);                  // counted-loop addi+branch → INCBR
+        if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
         if (consumed == 0) {
             B.pc2uop[w] = ui;
@@ -1023,13 +765,11 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t tw = B.tgt[i];
             B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
         }
-#ifdef IDEA_INCBR
         else if (cls == RC_INCBR) {                                  // preserve K (high 8 bits); bake target into low 24
             uint32_t tw = B.tgt[i];
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x00FFFFFFu) : 0x00FFFFFFu;
             B.w1[i] = (B.w1[i] & 0xFF000000u) | idx;
         }
-#endif
     }
 }
 
@@ -1072,35 +812,9 @@ API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base
 API int cuda_rvcud_step_all(int budget) {
     if (g_ncores <= 0 || g_nuops <= 0) return -1;
     if (!g_ret) cudaMallocManaged(&g_ret, sizeof(unsigned long long));
-#ifndef RVCUD_BLOCK
-#define RVCUD_BLOCK 64
-#endif
-    int block = g_ncores < RVCUD_BLOCK ? g_ncores : RVCUD_BLOCK;
+    int block = g_ncores < 64 ? g_ncores : 64;       // 2-warp blocks (SM coverage)
     int grid  = (g_ncores + block - 1) / block;
-    size_t shmem = (size_t)block * REGSTRIDE * sizeof(uint32_t);
-#ifdef IDEA_CARVEOUT_L1
-    // The kernel needs only ~8KB shared (the regfile); bias the unified data cache toward L1 so the
-    // broadcast uop/code-image fetch (the throughput bottleneck) gets the most L1.
-    static bool s_carve=false; if(!s_carve){ s_carve=true;
-        cudaFuncSetAttribute((const void*)rvcud_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxL1); }
-#endif
-#ifdef IDEA_L2_PERSIST
-    // Pin the read-only uop stream (read by every core) in a set-aside L2 region.
-    static bool s_l2=false; if(!s_l2){ s_l2=true;
-        cudaDeviceProp pr; cudaGetDeviceProperties(&pr,0);
-        // Set aside only a small slice of L2 for the (few-KB) uop stream, so streaming-data guests
-        // keep most of L2. L2_SETASIDE_KB=0 → max (steals L2; hurts divergent-memory guests).
-#ifndef L2_SETASIDE_KB
-#define L2_SETASIDE_KB 0
-#endif
-        size_t setaside = L2_SETASIDE_KB ? (size_t)L2_SETASIDE_KB*1024 : (size_t)pr.persistingL2CacheMaxSize;
-        if(setaside>(size_t)pr.persistingL2CacheMaxSize) setaside=pr.persistingL2CacheMaxSize;
-        if(setaside) cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, setaside);
-        size_t bytes = (size_t)g_nuops*sizeof(uint2); if(bytes>(size_t)pr.accessPolicyMaxWindowSize) bytes=pr.accessPolicyMaxWindowSize;
-        cudaStreamAttrValue av{}; av.accessPolicyWindow.base_ptr=g_uops; av.accessPolicyWindow.num_bytes=bytes;
-        av.accessPolicyWindow.hitRatio=1.0f; av.accessPolicyWindow.hitProp=cudaAccessPropertyPersisting; av.accessPolicyWindow.missProp=cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(0, cudaStreamAttributeAccessPolicyWindow, &av); }
-#endif
+    size_t shmem = (size_t)block * 33 * sizeof(uint32_t);   // 33-stride regfile
     rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc,
                                          g_ncores, g_pc2words, g_base, budget, g_ret);   // nwords = pc2uop length (code words)
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
