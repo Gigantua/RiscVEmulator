@@ -68,8 +68,26 @@ static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, uint32_
     return (f3 & 1u) ? ((f3 & 2u) ? e3 : e1) : ((f3 & 2u) ? e2 : e0);
 }
 
+// Assemble the sign-extended, opcode-appropriate immediate for one instruction. Done inline in the
+// fetch path so the interpreter reads live guest RAM (correct for self-modifying / JIT guests like
+// TinyCC) rather than a stale predecoded copy.
+static __device__ __forceinline__ uint32_t decode_imm(uint32_t instr) {
+    const uint32_t op = instr & 0x7F;
+    if (op == 0x63)                        // B-type
+        return (((instr>>31)&1u)<<12 | ((instr>>7)&1u)<<11 | ((instr>>25)&0x3Fu)<<5 | ((instr>>8)&0xFu)<<1)
+             | ((instr & 0x80000000u) ? 0xFFFFE000u : 0u);
+    if (op == 0x6F)                        // J-type
+        return (((instr>>31)&1u)<<20 | ((instr>>12)&0xFFu)<<12 | ((instr>>20)&1u)<<11 | ((instr>>21)&0x3FFu)<<1)
+             | ((instr & 0x80000000u) ? 0xFFE00000u : 0u);
+    if (op == 0x37 || op == 0x17)          // U-type
+        return instr & 0xFFFFF000u;
+    if (op == 0x23)                        // S-type
+        return (uint32_t)(((int32_t)(instr & 0xFE000000) >> 20) | (int32_t)((instr >> 7) & 0x1F));
+    return (uint32_t)((int32_t)instr >> 20);   // I-type (don't-care for R-type)
+}
+
 __global__ void __launch_bounds__(256)
-rv32i_kernel(CoreState* st, uint32_t* mem, const uint2* dec, int ncores, int budget) {
+rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncores) return;
     CoreState& g  = st[id];
@@ -80,10 +98,10 @@ rv32i_kernel(CoreState* st, uint32_t* mem, const uint2* dec, int ncores, int bud
     uint32_t pc = g.pc;
 
     for (int n = 0; n < budget && (int32_t)pc >= 0; n++) {
-        // Two separate 32-bit loads (they pipeline better than one 64-bit load), but from the
-        // interleaved {instr,imm} record so both hit the same cache line — half the L1 footprint.
-        const uint32_t instr = __ldg(&dec[pc >> 2].x);   // raw instruction
-        const uint32_t d0    = __ldg(&dec[pc >> 2].y);   // predecoded immediate
+        // Fetch the instruction live from this core's RAM (correct for self-modifying / JIT guests),
+        // then assemble its immediate inline.
+        const uint32_t instr = ld_i<uint32_t>(mem, ncores, id, pc);
+        const uint32_t d0    = decode_imm(instr);
         const int      rd = (instr >> 7) & 0x1F;
         const uint32_t f3 = (instr >> 12) & 0x7, f7 = (instr >> 25) & 0x7F;
         const uint32_t u1 = regs[(instr >> 15) & 0x1F], u2 = regs[(instr >> 20) & 0x1F];
@@ -148,30 +166,6 @@ rv32i_kernel(CoreState* st, uint32_t* mem, const uint2* dec, int ncores, int bud
     #pragma unroll
     for (int i = 0; i < 32; i++) g.regs[i] = regs[i];
     g.pc = pc;
-}
-
-// Predecode each code word into its pre-assembled, sign-extended immediate, so the
-// hot loop never reconstructs B/J/S/I immediates (one broadcast load replaces the
-// ~6-op branch/jump immediate assembly). Run once after the code image is set.
-__global__ void predecode_kernel(const uint32_t* code, uint2* dec, int nwords) {
-    int w = blockIdx.x * blockDim.x + threadIdx.x;
-    if (w >= nwords) return;
-    const uint32_t instr = code[w];
-    const uint32_t op = instr & 0x7F;
-    uint32_t d0;
-    if (op == 0x63)                        // B-type
-        d0 = (((instr>>31)&1u)<<12 | ((instr>>7)&1u)<<11 | ((instr>>25)&0x3Fu)<<5 | ((instr>>8)&0xFu)<<1)
-           | ((instr & 0x80000000u) ? 0xFFFFE000u : 0u);
-    else if (op == 0x6F)                   // J-type
-        d0 = (((instr>>31)&1u)<<20 | ((instr>>12)&0xFFu)<<12 | ((instr>>20)&1u)<<11 | ((instr>>21)&0x3FFu)<<1)
-           | ((instr & 0x80000000u) ? 0xFFE00000u : 0u);
-    else if (op == 0x37 || op == 0x17)     // U-type
-        d0 = instr & 0xFFFFF000u;
-    else if (op == 0x23)                   // S-type
-        d0 = (uint32_t)(((int32_t)(instr & 0xFE000000) >> 20) | (int32_t)((instr >> 7) & 0x1F));
-    else                                   // I-type (and don't-care for R-type)
-        d0 = (uint32_t)((int32_t)instr >> 20);
-    dec[w] = make_uint2(instr, d0);
 }
 
 // ===================================================================
@@ -306,10 +300,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
 
 static CoreState* g_state  = nullptr;
 static uint32_t*  g_mem    = nullptr;   // word-interleaved RAM: [word*ncores + core]
-static uint32_t*  g_code   = nullptr;   // staging for the raw code image
-static uint2*     g_dec    = nullptr;   // predecoded {instr, imm} pairs — one 64-bit broadcast fetch/instr
 static int        g_ncores = 0;
-static int        g_words  = 0;         // code/dec words = memBytes/4
 
 // rvcud device buffers (built by the host translator in cuda_rvcud_set_code)
 static uint2*     g_uops    = nullptr;  // {w0,w1} per uop
@@ -326,13 +317,8 @@ API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     cudaError_t e;
     if ((e = cudaMallocManaged(&g_state, (size_t)nCores * sizeof(CoreState))) != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_mem, (size_t)nCores * memBytes)) != cudaSuccess) return (int)e;
-    if ((e = cudaMalloc(&g_code, memBytes)) != cudaSuccess) return (int)e;
-    g_words = (int)(memBytes >> 2);
-    if ((e = cudaMalloc(&g_dec, (size_t)g_words * sizeof(uint2))) != cudaSuccess) return (int)e;
     memset(g_state, 0, (size_t)nCores * sizeof(CoreState));
     cudaMemset(g_mem, 0, (size_t)nCores * memBytes);
-    cudaMemset(g_code, 0, memBytes);
-    cudaMemset(g_dec, 0, (size_t)g_words * sizeof(uint2));
     cudaDeviceSynchronize();
     return (int)cudaGetLastError();
 }
@@ -352,16 +338,6 @@ API int cuda_rv32i_read_mem(int core, void* dst, unsigned int off, unsigned int 
     return (int)cudaMemcpy2D(dst, 4, src, (size_t)g_ncores * 4, 4, len >> 2, cudaMemcpyDeviceToHost);
 }
 
-// Shared read-only code image (contiguous, one copy for all cores). Valid when
-// every core runs the same program — fetches broadcast from a single 8 KB region.
-API int cuda_rv32i_set_code(const void* src, unsigned int len) {
-    cudaError_t e = cudaMemcpy(g_code, src, len, cudaMemcpyHostToDevice);
-    if (e != cudaSuccess) return (int)e;
-    int b = 256, g = (g_words + b - 1) / b;            // predecode the whole image once
-    predecode_kernel<<<g, b>>>(g_code, g_dec, g_words);
-    return (int)cudaDeviceSynchronize();
-}
-
 API int cuda_rv32i_step_all(int budget) {
     if (g_ncores <= 0) return 0;
     // Small (2-warp) blocks: at modest core counts this spreads work across many
@@ -370,7 +346,7 @@ API int cuda_rv32i_step_all(int budget) {
     int block = g_ncores < 64 ? g_ncores : 64;
     int grid  = (g_ncores + block - 1) / block;
     size_t shmem = (size_t)block * 33 * sizeof(uint32_t);
-    rv32i_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_dec, g_ncores, budget);
+    rv32i_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
 }
@@ -829,8 +805,6 @@ API void cuda_rv32i_shutdown() {
     rvcud_free();
     if (g_ret) { cudaFree(g_ret); g_ret = nullptr; }
     if (g_mem)  { cudaFree(g_mem);  g_mem  = nullptr; }
-    if (g_code) { cudaFree(g_code); g_code = nullptr; }
-    if (g_dec)  { cudaFree(g_dec);  g_dec  = nullptr; }
     if (g_state) { cudaFree(g_state); g_state = nullptr; }
     g_ncores = 0;
 }
