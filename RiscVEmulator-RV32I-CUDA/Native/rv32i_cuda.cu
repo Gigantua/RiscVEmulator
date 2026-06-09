@@ -555,13 +555,20 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t X=regs[Xr], Y=regs[Yr], D=regs[Dr], END=regs[Er], MASK=regs[Mr], BASE=regs[Br];
             uint32_t CMAP=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oC), TEX=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oT);  // HOISTED: loop-invariant
             uint32_t XS=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oX), YS=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oY);     // (ds_* globals, disjoint from FB)
-            while (D != END && gi < budget) {                                 // 3 mem-ops/pixel (was 7)
+            uint32_t acc = 0, npend = 0;                                      // packed FB bytes pending in lanes 0..npend-1
+            while (D != END && gi < budget) {                                 // 2 mem-ops/pixel + 1 word-store per 4 (was 7)
                 uint32_t off  = ((Y>>shY)&MASK) + ((X<<shX1)>>shX2);
                 uint32_t pidx = ld_i<uint8_t,NC1>(mem,ncores,id, TEX + off);
                 uint32_t pix  = ld_i<uint8_t,NC1>(mem,ncores,id, CMAP + pidx);
-                st_i<uint8_t,NC1>(mem,ncores,id, D, (uint8_t)pix);
+                uint32_t lane = D & 3u;                                       // D advances by +1 → consecutive byte addrs
+                if (lane == 0u || npend) {                                    // aligned word in progress: pack, store once full
+                    acc |= pix << (lane << 3); npend += 1;                    // LE byte lane == word bits 8*lane..+7
+                    if (lane == 3u) { st_i<uint32_t,NC1>(mem,ncores,id, D & ~3u, acc); acc = 0; npend = 0; }
+                } else st_i<uint8_t,NC1>(mem,ncores,id, D, (uint8_t)pix);     // unaligned head: byte store as before
                 X += XS; Y += YS; D += 1; gi += 19;                           // 19 guest instrs/iteration
             }
+            for (uint32_t k = 0; k < npend; k++)                              // tail / budget-cut: flush partial word as
+                st_i<uint8_t,NC1>(mem,ncores,id, D - npend + k, (uint8_t)(acc >> (k << 3)));  // byte stores → memory as-if per-pixel
             regs[Xr]=X; regs[Yr]=Y; regs[Dr]=D;                               // XPOS,YPOS final; DST→END
             if (D == END) { uint32_t ft = w1;
                 if (ft == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 19*4; break; }
