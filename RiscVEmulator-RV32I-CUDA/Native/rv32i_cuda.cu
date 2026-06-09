@@ -1896,24 +1896,32 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                      const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base) {
     const uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
     auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2; return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w]; };
-    // emit a transfer to guest target t: direct bra if compiled & forward, else fall back to interpreter.
-    auto xfer=[&](const char* pred, uint32_t t){
-        if(goable(t) && t>pc)      rvx_app(s,"%sbra L%u;\n",pred,t);
-        else if(goable(t))         rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XDISP;\n",pred,t,pred);   // backward → budget check
-        else                       rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XSAVE;\n",pred,t,pred);   // leaves compiled set
+    // Emit a transfer to guest target t. cond=true ⇒ guarded by %p0 (conditional branch). Forward
+    // compiled target → direct bra (can't loop, no budget check). Backward compiled target (a loop) →
+    // INLINE register-only budget check + direct bra: this avoids the per-iteration pc2idx global load +
+    // brx.idx that routing through XDISP would cost on every loop trip. Uncompiled target → hand to interp.
+    auto xfer=[&](bool cond, uint32_t t){
+        const char* pg = cond ? "@%p0 " : "";
+        if(goable(t) && t>pc)      rvx_app(s,"%sbra L%u;\n",pg,t);
+        else if(goable(t)) {                                                                          // backward (loop)
+            if(cond) rvx_app(s,"setp.lt.and.s32 %%p1, %%cnt, %%budget, %%p0;\nsetp.ge.and.s32 %%p2, %%cnt, %%budget, %%p0;\n"
+                               "@%%p2 mov.u32 %%pc, %u;\n@%%p2 bra XSAVE;\n@%%p1 bra L%u;\n",t,t);
+            else     rvx_app(s,"setp.ge.s32 %%p0, %%cnt, %%budget;\n@%%p0 mov.u32 %%pc, %u;\n@%%p0 bra XSAVE;\nbra L%u;\n",t,t);
+        }
+        else                       rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XSAVE;\n",pg,t,pg);          // leaves compiled set
     };
     // guest byte address (rs1+imm) into %a0 (b64, + %M); leaves %t0/%t1 free as scratch.
     auto addr=[&](int32_t imm){ rvx_app(s,"add.s32 %%t0, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t0;\nadd.u64 %%a0, %%a0, %%M;\n",rs1,imm); };
     switch(op) {
     case 0x37: if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,instr&0xFFFFF000u); break;
     case 0x17: if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+(instr&0xFFFFF000u)); break;
-    case 0x6F:{ uint32_t t=pc+rv_jimm(instr); if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); xfer("",t); } break;
+    case 0x6F:{ uint32_t t=pc+rv_jimm(instr); if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); xfer(false,t); } break;
     case 0x67:{ rvx_app(s,"add.s32 %%t0, %%x%u, %d;\nand.b32 %%t0, %%t0, 4294967294;\n",rs1,(int)rv_iimm(instr));
                 if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); s += "mov.b32 %pc, %t0;\nbra XDISP;\n"; } break;
     case 0x63:{ uint32_t t=pc+rv_bimm(instr); const char* cc; bool sg=false;
                 switch(f3){case 0:cc="eq";break;case 1:cc="ne";break;case 4:cc="lt";sg=true;break;case 5:cc="ge";sg=true;break;case 6:cc="lt";break;default:cc="ge";}
                 rvx_app(s,"setp.%s.%s %%p0, %%x%u, %%x%u;\n",cc,sg?"s32":"u32",rs1,rs2);
-                xfer("@%p0 ",t); } break;                                                            // not-taken falls through to next emitted word
+                xfer(true,t); } break;                                                               // not-taken falls through to next emitted word
     case 0x03:{ if(!rd) break; addr((int)rv_iimm(instr));                                             // %t0=guest addr, %a0=M+addr
                 if(f3==0){ rvx_app(s,"ld.global.s8 %%x%u, [%%a0];\n",rd); break; }                     // lb (always 1-aligned)
                 if(f3==4){ rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\n",rd); break; }                     // lbu
@@ -1995,7 +2003,7 @@ static void rvx_codegen(std::string& ptx, std::vector<uint32_t>& pc2idx,
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
     ptx += ".reg .b64 %M,%S,%P2I,%RET,%a0,%ad;\n";
     ptx += ".reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n";
-    ptx += ".reg .u32 %wi,%bidx;\n.reg .pred %p0;\n";
+    ptx += ".reg .u32 %wi,%bidx;\n.reg .pred %p0,%p1,%p2;\n";
     ptx += "ld.param.u64 %M,[pM];\nld.param.u64 %S,[pS];\nld.param.u32 %budget,[pBud];\n"
            "ld.param.u64 %P2I,[pP2I];\nld.param.u64 %RET,[pRet];\n";
     ptx += "mov.b32 %x0, 0;\n";
