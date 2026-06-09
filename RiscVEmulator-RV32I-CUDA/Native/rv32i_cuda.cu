@@ -27,7 +27,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
+#include <string>
 #include <cuda_runtime.h>
+#include <cuda.h>            // driver API (cuModuleLoadDataEx / cuLaunchKernel) — for the tiered exec_block cross-compiler
 #if RVCUD_CPASYNC
 #include <cuda_pipeline.h>          // __pipeline_memcpy_async / commit / wait_prior (LDGSTS, sm_80+)
 #endif
@@ -1836,6 +1838,35 @@ API int cuda_rvcud_step_all(int budget) {
 // since a fused uop retires several). The verify gate runs rv32i for exactly this many.
 API unsigned long long cuda_rvcud_retired() { return g_ret ? *g_ret : 0ull; }
 API unsigned long long cuda_rvcud_iters() { unsigned long long h=0; cudaMemcpyFromSymbol(&h,g_dev_iters,sizeof(h)); return h; }
+
+// ── exec_block foundation: driver-API PTX execution pipeline ─────────────────
+// Proves we can load+run hand-emitted PTX (the basis for cross-compiling hot rv32i blocks to PTX and
+// dispatching them via an RC_EXECBLOCK uop). NOT the disallowed whole-program CUDA-as-PTX monolith —
+// this loads small, hand/cross-emitted PTX directly. Returns 1 on success.
+API int cuda_rvexec_selftest() {
+    cudaFree(0);                                   // ensure the runtime primary context exists & is current
+    const char* ptx =
+        ".version 7.8\n.target sm_86\n.address_size 64\n"
+        ".visible .entry k(.param .u64 p){\n"
+        "  .reg .b64 %rd0; .reg .b32 %r0;\n"
+        "  ld.param.u64 %rd0, [p];\n"
+        "  mov.b32 %r0, 51966;\n"                  // 0xCAFE
+        "  st.global.u32 [%rd0], %r0;\n"
+        "  ret;\n}\n";
+    cuInit(0);
+    CUcontext ctx = nullptr; cuCtxGetCurrent(&ctx);
+    if (!ctx) { CUdevice dev; cuDeviceGet(&dev,0); cuDevicePrimaryCtxRetain(&ctx,dev); cuCtxSetCurrent(ctx); }
+    CUmodule mod; CUfunction fn;
+    if (cuModuleLoadData(&mod, ptx) != CUDA_SUCCESS) { fprintf(stderr,"[xblk] PTX load fail\n"); return 0; }
+    if (cuModuleGetFunction(&fn, mod, "k") != CUDA_SUCCESS) { cuModuleUnload(mod); return 0; }
+    unsigned* d=nullptr; cudaMalloc(&d,4); cudaMemset(d,0,4);
+    void* args[]={&d};
+    CUresult lr = cuLaunchKernel(fn, 1,1,1, 1,1,1, 0,0, args, nullptr);
+    cudaDeviceSynchronize();
+    unsigned h=0; cudaMemcpy(&h,d,4,cudaMemcpyDeviceToHost);
+    cudaFree(d); cuModuleUnload(mod);
+    return (lr==CUDA_SUCCESS && h==0xCAFEu) ? 1 : 0;
+}
 
 API void cuda_rv32i_shutdown() {
 #if RVCUD_HOTHIST
