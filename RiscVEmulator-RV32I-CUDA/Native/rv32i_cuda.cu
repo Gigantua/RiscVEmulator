@@ -1994,10 +1994,16 @@ static inline bool rvx_compilable(uint32_t op){
 // append an explicit hand-off. brx.idx over the full compiled set lets any pc (jalr / interpreter hand-off)
 // re-enter. Guest regs live in %x1..%x31 across the whole run — this is what removes the per-uop tax.
 static void rvx_codegen(std::string& ptx, std::vector<uint32_t>& pc2idx,
-                        const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp) {
-    std::vector<uint32_t> words;
+                        const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
+                        const std::vector<uint8_t>& disp) {
+    // `comp[w]` = body emitted (reached by fall-through / direct bra). `disp[w]` = a brx.idx dispatch entry
+    // (interpreter hand-off / jalr re-entry point) — a SUBSET of comp (leaders only). Keeping branchtargets
+    // to leaders keeps the brx small (the driver's PTX JIT blows up super-linearly in brx fan-out), so
+    // coverage can be large. Labels are emitted for ALL comp words, so direct bra to any of them still works.
+    std::vector<uint32_t> body, dwords;
     pc2idx.assign(N, 0xFFFFFFFFu);
-    for (int w=0; w<N; w++) if (comp[w]) { pc2idx[w]=(uint32_t)words.size(); words.push_back((uint32_t)w); }
+    for (int w=0; w<N; w++) if (comp[w]) body.push_back((uint32_t)w);
+    for (int w=0; w<N; w++) if (comp[w] && disp[w]) { pc2idx[w]=(uint32_t)dwords.size(); dwords.push_back((uint32_t)w); }
 
     ptx  = ".version 7.8\n.target sm_86\n.address_size 64\n";
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
@@ -2016,10 +2022,10 @@ static void rvx_codegen(std::string& ptx, std::vector<uint32_t>& pc2idx,
     ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n";
     ptx += "setp.eq.u32 %p0, %bidx, 4294967295;\n@%p0 bra XSAVE;\n";
     ptx += "BT: .branchtargets ";
-    for (size_t i=0;i<words.size();i++) rvx_app(ptx, "%sL%u", i?",":"", base+words[i]*4);
+    for (size_t i=0;i<dwords.size();i++) rvx_app(ptx, "%sL%u", i?",":"", base+dwords[i]*4);
     ptx += ";\nbrx.idx %bidx, BT;\n";
     // bodies, ascending pc
-    for (uint32_t w : words) {
+    for (uint32_t w : body) {
         uint32_t pc = base + w*4, op = img[w]&0x7F;
         rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
         rvx_emit(ptx, pc, img[w], comp, comp, N, base);
@@ -2048,6 +2054,9 @@ static int rvx_load_module(const std::string& ptx, CUmodule* mod, CUfunction* fn
 
 // Build the exec_block from the live (statically-translated) image. Compiles up to RVX_MAXW
 // reachable+compilable words. Single-core only (linear memory ⇒ byte addr == %M + a).
+// The driver's PTX JIT (ptxas) blows up super-linearly in single-function size: the whole compiled set
+// lives in ONE .entry, so ~24000 words (~3 MB PTX) builds fine but ~48000 explodes the assembler to tens
+// of GB. Keep below that ceiling (a multi-module tiering would be needed to go higher).
 #ifndef RVX_MAXW
 #define RVX_MAXW 24000
 #endif
@@ -2076,8 +2085,15 @@ static void rvxblk_build() {
     }
     if (cnt == 0) return;
 
+    // Dispatch entries = compiled words that are also statically-translated LEADERS. Those are exactly the
+    // pcs the interpreter can hand back (it leaves pc at uop boundaries) and the valid jalr re-entry points.
+    // Restricting branchtargets to this subset keeps the brx.idx fan-out small (avoids the JIT blowup).
+    std::vector<uint8_t> disp(N, 0);
+    int ndisp = 0;
+    for (int w=0; w<N; w++) if (comp[w] && g_pc2uop_h[w] != RC_BADUOP) { disp[w]=1; ndisp++; }
+
     std::string ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp);
+    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp);
 
     cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
@@ -2090,9 +2106,10 @@ static void rvxblk_build() {
     cudaMemcpy(d_p2i, pc2idx.data(), (size_t)N*4, cudaMemcpyHostToDevice);
     g_xmod=mod; g_xfn=fn; g_x_pc2idx=d_p2i;
     g_xtab.assign(N, 0);
-    for (int w=0; w<N; w++) g_xtab[w] = comp[w];
+    for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch (leader) words
     g_xblk_ok = getenv("RVX_OFF") ? 0 : 1;   // RVX_OFF=1 builds but disables exec (isolation probe)
-    fprintf(stderr,"[xblk] built: %d compiled words, ~%zu KB PTX (exec %s)\n", cnt, ptx.size()/1024, g_xblk_ok?"ON":"OFF");
+    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, ~%zu KB PTX (exec %s)\n",
+            cnt, ndisp, ptx.size()/1024, g_xblk_ok?"ON":"OFF");
 }
 
 // Run the exec_block from g_state[0].pc for up to `budget` guest instructions. Updates g_state[0]
@@ -2164,7 +2181,7 @@ API int cuda_rvexec_blocktest() {
     std::vector<uint8_t> comp(N,0);
     for (int w=0; w<N; w++) if (rvx_compilable(img[w]&0x7F)) comp[w]=1;   // word 8 (ebreak) stays 0
     std::string ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, img.data(), N, base, comp);
+    rvx_codegen(ptx, pc2idx, img.data(), N, base, comp, comp);   // tests: every compiled word is a dispatch entry
 
     cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
@@ -2271,7 +2288,7 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // exec_block run
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp);
+        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2338,7 +2355,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
         compared++;
         uint32_t ref_pc=pc;
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp);
+        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz2] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2396,7 +2413,7 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // random compiled subset (≈70%); never compile the ebreak
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=(rnd()%100)<70;
-        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp);
+        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz3] prog %d module fail\n",p); fails++; continue; }
         void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
