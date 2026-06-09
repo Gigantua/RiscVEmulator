@@ -618,6 +618,18 @@ static std::vector<uint32_t> g_w0h, g_w1h, g_u2pch;  // host mirrors of the uop 
 static std::vector<uint8_t>  g_uwh;
 static int        g_uopcap  = 0;
 
+// TIERED exec_block (defined far below): cross-compile a BOUNDED set of statically-reached rv32i words
+// to ONE PTX kernel (guest regs → PTX registers, no per-uop interpreter tax), dispatched by pc via
+// brx.idx; the interpreter owns everything uncompiled (shared g_state/g_mem, hand off via pc). Declared
+// here so cuda_rvcud_set_code / cuda_rvcud_step_all (above the definitions) can use the hybrid path.
+static CUmodule   g_xmod    = nullptr;
+static CUfunction g_xfn     = nullptr;
+static int        g_xblk_ok = 0;
+static std::vector<uint8_t> g_xtab;          // per guest-word: 1 if a compiled exec_block entry
+static void*      g_x_pc2idx = nullptr;      // device u32[N]: word → branchtargets index, or 0xFFFFFFFF
+static void       rvxblk_build();
+static long long  rvxblk_step(long long budget);
+
 API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     g_ncores = nCores;
     cudaError_t e;
@@ -1755,7 +1767,9 @@ API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base
     cudaMemcpy(g_uw,     g_uwh.data(),    (size_t)g_nuops,                cudaMemcpyHostToDevice);
     cudaMemcpy(g_uop2pc, g_u2pch.data(),  (size_t)g_nuops * 4,            cudaMemcpyHostToDevice);
     cudaMemcpy(g_pc2uop, g_pc2uop_h.data(), (size_t)N * 4,               cudaMemcpyHostToDevice);
-    return (int)cudaDeviceSynchronize();
+    int rc = (int)cudaDeviceSynchronize();
+    rvxblk_build();                          // cross-compile the statically-reached hot words to an exec_block PTX kernel
+    return rc;
 }
 
 // Translate-on-miss: an indirect (JALR) jump landed on code with no uop. Lazily translate from `pc`
@@ -1817,6 +1831,29 @@ API int cuda_rvcud_step_all(int budget) {
     for (int guard = 0; guard < 1 << 20; guard++) {
         int rem = budget - (int)total;
         if (rem <= 0) break;
+        // exec_block fast path: if pc is a cross-compiled word, run the register-resident PTX kernel
+        // (no per-uop interpreter tax). It returns at the first uncompiled pc / budget exhaustion;
+        // the interpreter then owns whatever it handed back. On launch fault, disable & fall through.
+        if (g_xblk_ok) {
+            uint32_t xpc = g_state[0].pc;
+            int xw = (xpc >= g_base) ? (int)((xpc - g_base) >> 2) : -1;
+            if (xw >= 0 && xw < g_pc2words && g_xtab[xw]) {
+                long long did = rvxblk_step(rem);
+                if (did < 0) { g_xblk_ok = 0; }            // exec error → permanently fall back to interpreter
+                else {
+                    total += did;
+                    uint32_t epc = g_state[0].pc;
+                    if (epc & 0x80000000u) break;            // halted
+                    // exec_block can hand back at a word that is NOT a valid interpreter leader (e.g. the
+                    // fall-through interior of a fused uop → RC_BADUOP). The interpreter HALTS if it *starts*
+                    // a launch on a BADUOP pc (ui<0 ⇒ loop never runs ⇒ resume stays HALT_BIT), so translate
+                    // that pc into a real leader first — otherwise the guest wrongly appears halted.
+                    int ew = (epc >= g_base) ? (int)((epc - g_base) >> 2) : -1;
+                    if (ew >= 0 && ew < g_pc2words && g_pc2uop_h[ew] == RC_BADUOP) rvcud_translate_miss(epc);
+                    continue;                                // re-evaluate: exec_block or interpreter for the new pc
+                }
+            }
+        }
         rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
                                              g_ncores, g_pc2words, g_base, rem, g_ret);
         cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
@@ -1847,14 +1884,6 @@ API unsigned long long cuda_rvcud_iters() { unsigned long long h=0; cudaMemcpyFr
 //  g_mem, hand off via pc). Size-capped reachability avoids the whole-program
 //  ptxas blowup. lw/sw are misalignment-safe (a misaligned fault is unrecoverable).
 // ============================================================================
-static CUmodule   g_xmod  = nullptr;
-static CUfunction g_xfn    = nullptr;
-static int        g_xblk_ok = 0;
-static std::vector<uint8_t> g_xtab;          // per guest-word: 1 if a compiled block entry (valid exec_block dispatch)
-static void*      g_x_pc2idx = nullptr;      // device u32[N]: word → branchtargets index, or 0xFFFFFFFF
-static void       rvxblk_build();
-static long long  rvxblk_step(long long budget);
-
 static void rvx_app(std::string& s, const char* fmt, ...) {
     char b[512]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap); s += b;
 }
@@ -2005,11 +2034,25 @@ static void rvxblk_build() {
     g_xblk_ok = 0;
     if (g_ncores != 1 || g_img.empty()) return;
     int N = g_pc2words;
-    std::vector<uint8_t> comp(N, 0);
-    // seed: words the static translator reached (known code) AND that rvx_emit can execute, capped.
+    std::vector<uint8_t> comp(N, 0), seen(N, 0);
+    // Reachability walk over the RAW image, seeded from every statically-translated leader (confirmed
+    // code, including jalr-only-reachable function entries). Walking the raw instructions FILLS the
+    // fusion-interior holes the translator leaves as BADUOP — without this, exec_block falls through to
+    // an uncompiled word every few instructions and never runs a whole loop in-register. comp[w]=1 for
+    // reachable + rvx_compilable words (contiguous regions); capped at RVX_MAXW.
+    std::vector<int> stack; stack.reserve(4096);
+    for (int w=0; w<N; w++) if (g_pc2uop_h[w] != RC_BADUOP) { if(!seen[w]){ seen[w]=1; stack.push_back(w); } }
     int cnt = 0;
-    for (int w=0; w<N && cnt<RVX_MAXW; w++)
-        if (g_pc2uop_h[w] != RC_BADUOP && rvx_compilable(g_img[w]&0x7F)) { comp[w]=1; cnt++; }
+    while (!stack.empty()) {
+        int w = stack.back(); stack.pop_back();
+        uint32_t instr = g_img[w], op = instr & 0x7F;
+        if (rvx_compilable(op) && !comp[w] && cnt < RVX_MAXW) { comp[w]=1; cnt++; }
+        auto push=[&](int t){ if(t>=0 && t<N && !seen[t]){ seen[t]=1; stack.push_back(t); } };
+        if (op==0x63)       { push(w+1); push((int)(((g_base+(uint32_t)w*4)+rv_bimm(instr)-g_base)>>2)); }   // branch: fall-through + target
+        else if (op==0x6F)  { push((int)(((g_base+(uint32_t)w*4)+rv_jimm(instr)-g_base)>>2)); }              // jal: target only
+        else if (op==0x67 || op==0x73) { /* jalr (dynamic) / system: stop — no static successor */ }
+        else                { push(w+1); }                                                                   // sequential
+    }
     if (cnt == 0) return;
 
     std::string ptx; std::vector<uint32_t> pc2idx;
@@ -2027,8 +2070,8 @@ static void rvxblk_build() {
     g_xmod=mod; g_xfn=fn; g_x_pc2idx=d_p2i;
     g_xtab.assign(N, 0);
     for (int w=0; w<N; w++) g_xtab[w] = comp[w];
-    g_xblk_ok = 1;
-    fprintf(stderr,"[xblk] built: %d compiled words, ~%zu KB PTX\n", cnt, ptx.size()/1024);
+    g_xblk_ok = getenv("RVX_OFF") ? 0 : 1;   // RVX_OFF=1 builds but disables exec (isolation probe)
+    fprintf(stderr,"[xblk] built: %d compiled words, ~%zu KB PTX (exec %s)\n", cnt, ptx.size()/1024, g_xblk_ok?"ON":"OFF");
 }
 
 // Run the exec_block from g_state[0].pc for up to `budget` guest instructions. Updates g_state[0]
@@ -2126,6 +2169,247 @@ API int cuda_rvexec_blocktest() {
     fprintf(stderr,"[xblk] blocktest x1=%u x2=%u x4=%u mem[0x40]=%u pc=0x%X ret=%u lr=%d se=%d -> %s\n",
             st.regs[1],st.regs[2],st.regs[4],m40,st.pc,ret,(int)lr,(int)se, ok?"PASS":"FAIL");
     return ok;
+}
+
+// Reference RV32I single-step (host, independent of rvx_emit) — returns next pc (0x8.. = halt).
+static uint32_t rvx_ref_step(uint32_t* R, uint8_t* M, uint32_t pc, uint32_t instr) {
+    uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
+    auto wr=[&](uint32_t v){ if(rd) R[rd]=v; };
+    int32_t i_=(int32_t)rv_iimm(instr);
+    switch(op){
+      case 0x37: wr(instr&0xFFFFF000u); return pc+4;
+      case 0x17: wr(pc+(instr&0xFFFFF000u)); return pc+4;
+      case 0x6F: { uint32_t t=pc+rv_jimm(instr); wr(pc+4); return t; }
+      case 0x67: { uint32_t t=(R[rs1]+(uint32_t)i_)&~1u; wr(pc+4); return t; }
+      case 0x63: { uint32_t u1=R[rs1],u2=R[rs2]; int32_t s1=(int32_t)u1,s2=(int32_t)u2; bool tk;
+                   switch(f3){case 0:tk=u1==u2;break;case 1:tk=u1!=u2;break;case 4:tk=s1<s2;break;case 5:tk=s1>=s2;break;case 6:tk=u1<u2;break;default:tk=u1>=u2;}
+                   return tk ? pc+rv_bimm(instr) : pc+4; }
+      case 0x03: { uint32_t a=R[rs1]+(uint32_t)i_, v;
+                   switch(f3){case 0:v=(uint32_t)(int8_t)M[a];break;case 1:v=(uint32_t)(int16_t)(uint16_t)(M[a]|(M[a+1]<<8));break;
+                              case 2:v=M[a]|(M[a+1]<<8)|(M[a+2]<<16)|(M[a+3]<<24);break;case 4:v=M[a];break;default:v=M[a]|(M[a+1]<<8);}
+                   wr(v); return pc+4; }
+      case 0x23: { uint32_t a=R[rs1]+rv_simm(instr), v=R[rs2];
+                   switch(f3){case 0:M[a]=(uint8_t)v;break;case 1:M[a]=(uint8_t)v;M[a+1]=(uint8_t)(v>>8);break;
+                              default:M[a]=(uint8_t)v;M[a+1]=(uint8_t)(v>>8);M[a+2]=(uint8_t)(v>>16);M[a+3]=(uint8_t)(v>>24);}
+                   return pc+4; }
+      case 0x13: { uint32_t u1=R[rs1],sh=(uint32_t)i_&0x1F,v;
+                   switch(f3){case 0:v=u1+(uint32_t)i_;break;case 2:v=((int32_t)u1<i_)?1:0;break;case 3:v=(u1<(uint32_t)i_)?1:0;break;
+                              case 4:v=u1^(uint32_t)i_;break;case 6:v=u1|(uint32_t)i_;break;case 7:v=u1&(uint32_t)i_;break;
+                              case 1:v=u1<<sh;break;default:v=(f7==0x20)?(uint32_t)((int32_t)u1>>sh):(u1>>sh);}
+                   wr(v); return pc+4; }
+      case 0x33: { uint32_t u1=R[rs1],u2=R[rs2],sh=u2&31,v;
+                   switch(f3){case 0:v=(f7==0x20)?(u1-u2):(u1+u2);break;case 1:v=u1<<sh;break;case 2:v=((int32_t)u1<(int32_t)u2)?1:0;break;
+                              case 3:v=(u1<u2)?1:0;break;case 4:v=u1^u2;break;case 5:v=(f7==0x20)?(uint32_t)((int32_t)u1>>sh):(u1>>sh);break;
+                              case 6:v=u1|u2;break;default:v=u1&u2;}
+                   wr(v); return pc+4; }
+      case 0x0F: return pc+4;
+      default: return 0x80000000u;
+    }
+}
+
+// Differential fuzz: random RV32I programs with FORWARD-ONLY control (guaranteed to terminate) run on
+// rvx_ref_step AND the exec_block; compares the full register file + pc + retired count. Isolates
+// ALU/mem/branch-condition/forward-bra/lui/auipc bugs. Returns the number of FAILING programs (0 = pass).
+API int cuda_rvexec_fuzz(int seed, int nprog) {
+    cudaFree(0); cuInit(0);
+    CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
+    if (!ctx) { CUdevice dev; cuDeviceGet(&dev,0); cuDevicePrimaryCtxRetain(&ctx,dev); cuCtxSetCurrent(ctx); }
+    uint32_t st=(uint32_t)seed; auto rnd=[&](){ st=st*1664525u+1013904223u; return st; };
+    const uint32_t base=0x1000, MEMB=8192, DLO=0x200, DHI=0x400;
+    int fails=0;
+    for (int p=0; p<nprog; p++) {
+        int PL = 8 + (int)(rnd()%56);                       // 8..63 instrs
+        std::vector<uint32_t> img(PL+1);
+        for (int w=0; w<PL; w++) {
+            uint32_t k=rnd()%100, rd=rnd()&31, rs1=rnd()&31, rs2=rnd()&31, instr;
+            if (k<20) instr=(((rnd()&0xFFFFF)<<12))|(rd<<7)|((rnd()&1)?0x37:0x17);                       // lui/auipc
+            else if (k<28 && w+1<PL) {                                                                    // forward branch
+                uint32_t f3=(uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                int hop=1+(int)(rnd()%((PL-w)>6?6:(PL-w))); uint32_t t=base+(uint32_t)(w+hop)*4; int off=(int)(t-(base+(uint32_t)w*4));
+                uint32_t i=(uint32_t)off; instr=(((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63;
+            }
+            else if (k<32 && w+1<PL) {                                                                    // forward jal
+                int hop=1+(int)(rnd()%((PL-w)>6?6:(PL-w))); uint32_t t=base+(uint32_t)(w+hop)*4; uint32_t off=t-(base+(uint32_t)w*4);
+                uint32_t i=off; instr=(((i>>20)&1)<<31)|(((i>>1)&0x3FF)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xFF)<<12)|(rd<<7)|0x6F;
+            }
+            else if (k<50) { uint32_t f3=rnd()%5, ty=(uint32_t)"\x00\x01\x02\x04\x05"[f3];                // load (base x0, imm in scratch)
+                uint32_t imm=DLO+(rnd()%(DHI-DLO)); instr=(imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+            else if (k<68) { uint32_t f3=rnd()%3; uint32_t imm=DLO+(rnd()%(DHI-DLO));                      // store
+                instr=(((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+            else if (k<84) { uint32_t f3=rnd()&7, imm12=rnd()&0xFFF, f7=(f3==5&&(rnd()&1))?0x20:0;        // op-imm
+                instr=(imm12<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; if(f3==1||f3==5) instr=(f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+            else { uint32_t f3=rnd()&7, f7=((f3==0||f3==5)&&(rnd()&1))?0x20:0;                             // op (R)
+                instr=(f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+            img[w]=instr;
+        }
+        img[PL]=0x00100073u;                                                                              // ebreak terminator
+        int N=PL+1;
+        // reference run
+        uint32_t R[32]={0}; std::vector<uint8_t> M(MEMB,0); uint32_t pc=base; long long rs=0;
+        for (int g=0; g<200000; g++){ int w=(int)((pc-base)>>2); if(w<0||w>=N) break; uint32_t ni=rvx_ref_step(R,M.data(),pc,img[w]); if(ni&0x80000000u){break;} pc=ni; R[0]=0; rs++; }
+        uint32_t ref_pc=pc;
+        // exec_block run
+        std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
+        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp);
+        CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz] prog %d module fail\n",p); fails++; continue; }
+        CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
+        CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
+        void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
+        void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
+        unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
+        unsigned bud=300000; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
+        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+        cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
+        cudaFree(d_st); cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_ret); cuModuleUnload(mod);
+        bool ok = (lr==CUDA_SUCCESS && se==cudaSuccess && cs.pc==ref_pc && (long long)ret==rs);
+        if (ok) for(int r=1;r<32;r++) if(cs.regs[r]!=R[r]){ ok=false; break; }
+        if (!ok) { fails++;
+            fprintf(stderr,"[fuzz] FAIL prog %d (PL=%d) ref_pc=0x%X exec_pc=0x%X refsteps=%lld ret=%u lr=%d se=%d\n",p,PL,ref_pc,cs.pc,rs,ret,(int)lr,(int)se);
+            for(int r=1;r<32;r++) if(cs.regs[r]!=R[r]) fprintf(stderr,"    x%d ref=%08X exec=%08X\n",r,R[r],cs.regs[r]);
+            if (fails>=5) { fprintf(stderr,"[fuzz] stopping after 5 fails\n"); break; }
+        }
+    }
+    fprintf(stderr,"[fuzz] %d programs, %d failures (seed=%d)\n", nprog, fails, seed);
+    return fails;
+}
+
+// Differential fuzz #2: programs WITH backward branches/jal and JALR (target = x31+word*4, where x31 is
+// set to `base` by a leading auipc — so jalr reaches any code word). Programs may loop; the reference runs
+// with a step cap and only terminating runs are compared. exec_block budget = refsteps+slack so a control
+// divergence surfaces as a pc/register mismatch instead of an unbounded loop. Returns # of FAILING programs.
+API int cuda_rvexec_fuzz2(int seed, int nprog) {
+    cudaFree(0); cuInit(0);
+    CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
+    if (!ctx) { CUdevice dev; cuDeviceGet(&dev,0); cuDevicePrimaryCtxRetain(&ctx,dev); cuCtxSetCurrent(ctx); }
+    uint32_t st=(uint32_t)seed; auto rnd=[&](){ st=st*1664525u+1013904223u; return st; };
+    const uint32_t base=0x1000, MEMB=8192, DLO=0x200, DHI=0x400, STEPCAP=20000;
+    int fails=0, compared=0;
+    for (int p=0; p<nprog; p++) {
+        int PL = 12 + (int)(rnd()%52);
+        std::vector<uint32_t> img(PL+1);
+        img[0] = (0u<<12)|(31<<7)|0x17;                     // auipc x31, 0  →  x31 = base
+        for (int w=1; w<PL; w++) {
+            uint32_t k=rnd()%100, rd=rnd()%31, rs1=rnd()&31, rs2=rnd()&31, instr;   // rd in 0..30 (never clobber x31)
+            if (k<10) instr=(((rnd()&0xFFFFF)<<12))|(rd<<7)|((rnd()&1)?0x37:0x17);
+            else if (k<24) {                                                         // branch (forward OR backward)
+                uint32_t f3=(uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                int tw=1+(int)(rnd()%(PL-1)); int off=(tw-w)*4; uint32_t i=(uint32_t)off;
+                instr=(((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63;
+            }
+            else if (k<30) {                                                         // jalr rd, (tw*4)(x31)
+                int tw=1+(int)(rnd()%(PL-1)); uint32_t imm=(uint32_t)(tw*4)&0xFFF;
+                instr=(imm<<20)|(31<<15)|(0<<12)|(rd<<7)|0x67;
+            }
+            else if (k<36) {                                                         // jal (forward or backward)
+                int tw=1+(int)(rnd()%(PL-1)); int off=(tw-w)*4; uint32_t i=(uint32_t)off;
+                instr=(((i>>20)&1)<<31)|(((i>>1)&0x3FF)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xFF)<<12)|(rd<<7)|0x6F;
+            }
+            else if (k<52) { uint32_t f3=rnd()%5, ty=(uint32_t)"\x00\x01\x02\x04\x05"[f3]; uint32_t imm=DLO+(rnd()%(DHI-DLO)); instr=(imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+            else if (k<66) { uint32_t f3=rnd()%3; uint32_t imm=DLO+(rnd()%(DHI-DLO)); instr=(((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+            else if (k<84) { uint32_t f3=rnd()&7; if(f3==1||f3==5){ uint32_t f7=(f3==5&&(rnd()&1))?0x20:0; instr=(f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; } else instr=((rnd()&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+            else { uint32_t f3=rnd()&7, f7=((f3==0||f3==5)&&(rnd()&1))?0x20:0; instr=(f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+            img[w]=instr;
+        }
+        img[PL]=0x00100073u; int N=PL+1;
+        uint32_t R[32]={0}; std::vector<uint8_t> M(MEMB,0); uint32_t pc=base; long long rs=0; bool term=false;
+        for (uint32_t g=0; g<STEPCAP; g++){ int w=(int)((pc-base)>>2); if(w<0||w>=N){term=true;break;} uint32_t ni=rvx_ref_step(R,M.data(),pc,img[w]); if(ni&0x80000000u){term=true;break;} pc=ni; R[0]=0; rs++; }
+        if (!term) continue;                                  // looping program — can't validate, skip
+        compared++;
+        uint32_t ref_pc=pc;
+        std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
+        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp);
+        CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz2] prog %d module fail\n",p); fails++; continue; }
+        CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
+        CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
+        void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
+        void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
+        unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
+        unsigned bud=(unsigned)rs+64; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
+        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+        cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
+        cudaFree(d_st); cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_ret); cuModuleUnload(mod);
+        bool ok = (lr==CUDA_SUCCESS && se==cudaSuccess && cs.pc==ref_pc && (long long)ret==rs);
+        if (ok) for(int r=1;r<32;r++) if(cs.regs[r]!=R[r]){ ok=false; break; }
+        if (!ok) { fails++;
+            fprintf(stderr,"[fuzz2] FAIL prog %d (PL=%d) ref_pc=0x%X exec_pc=0x%X refsteps=%lld ret=%u lr=%d se=%d\n",p,PL,ref_pc,cs.pc,rs,ret,(int)lr,(int)se);
+            for(int r=1;r<32;r++) if(cs.regs[r]!=R[r]) fprintf(stderr,"    x%d ref=%08X exec=%08X\n",r,R[r],cs.regs[r]);
+            if (fails>=5) { fprintf(stderr,"[fuzz2] stopping after 5 fails\n"); break; }
+        }
+    }
+    fprintf(stderr,"[fuzz2] %d programs, %d compared (terminating), %d failures (seed=%d)\n", nprog, compared, fails, seed);
+    return fails;
+}
+
+// Differential fuzz #3: models the REAL hybrid (exec_block runs compiled words; an interpreter — here
+// rvx_ref_step — owns everything uncompiled), with a RANDOM ~70% compiled subset so interior gaps,
+// fall-through hand-offs, and re-entry via brx.idx are all exercised. Compares the hybrid's final state
+// against a pure reference run. This is the exact failure shape Doom hits. Returns # of FAILING programs.
+API int cuda_rvexec_fuzz3(int seed, int nprog) {
+    cudaFree(0); cuInit(0);
+    CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
+    if (!ctx) { CUdevice dev; cuDeviceGet(&dev,0); cuDevicePrimaryCtxRetain(&ctx,dev); cuCtxSetCurrent(ctx); }
+    uint32_t st=(uint32_t)seed; auto rnd=[&](){ st=st*1664525u+1013904223u; return st; };
+    const uint32_t base=0x1000, MEMB=8192, DLO=0x200, DHI=0x400;
+    int fails=0;
+    for (int p=0; p<nprog; p++) {
+        int PL = 10 + (int)(rnd()%50);
+        std::vector<uint32_t> img(PL+1);
+        for (int w=0; w<PL; w++) {                          // FORWARD-only control ⇒ terminates
+            uint32_t k=rnd()%100, rd=rnd()&31, rs1=rnd()&31, rs2=rnd()&31, instr;
+            if (k<14) instr=(((rnd()&0xFFFFF)<<12))|(rd<<7)|((rnd()&1)?0x37:0x17);
+            else if (k<26 && w+1<PL) { uint32_t f3=(uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                int hop=1+(int)(rnd()%((PL-w)>6?6:(PL-w))); uint32_t i=(uint32_t)(hop*4);
+                instr=(((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63; }
+            else if (k<32 && w+1<PL) { int hop=1+(int)(rnd()%((PL-w)>6?6:(PL-w))); uint32_t i=(uint32_t)(hop*4);
+                instr=(((i>>20)&1)<<31)|(((i>>1)&0x3FF)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xFF)<<12)|(rd<<7)|0x6F; }
+            else if (k<50) { uint32_t f3=rnd()%5, ty=(uint32_t)"\x00\x01\x02\x04\x05"[f3]; uint32_t imm=DLO+(rnd()%(DHI-DLO)); instr=(imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+            else if (k<66) { uint32_t f3=rnd()%3; uint32_t imm=DLO+(rnd()%(DHI-DLO)); instr=(((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+            else if (k<84) { uint32_t f3=rnd()&7; if(f3==1||f3==5){ uint32_t f7=(f3==5&&(rnd()&1))?0x20:0; instr=(f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; } else instr=((rnd()&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+            else { uint32_t f3=rnd()&7, f7=((f3==0||f3==5)&&(rnd()&1))?0x20:0; instr=(f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+            img[w]=instr;
+        }
+        img[PL]=0x00100073u; int N=PL+1;
+        // pure reference
+        uint32_t Rref[32]={0}; std::vector<uint8_t> Mref(MEMB,0); uint32_t pc=base;
+        for (int g=0; g<200000; g++){ int w=(int)((pc-base)>>2); if(w<0||w>=N) break; uint32_t ni=rvx_ref_step(Rref,Mref.data(),pc,img[w]); if(ni&0x80000000u)break; pc=ni; Rref[0]=0; }
+        uint32_t ref_pc=pc;
+        // random compiled subset (≈70%); never compile the ebreak
+        std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=(rnd()%100)<70;
+        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp);
+        CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz3] prog %d module fail\n",p); fails++; continue; }
+        void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
+        void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
+        CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof(CoreState));
+        unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4);
+        // hybrid: exec_block on compiled pc, rvx_ref_step on uncompiled pc (mirrors the real interpreter fallback)
+        uint32_t Rh[32]={0}; std::vector<uint8_t> Mh(MEMB,0); pc=base; bool blew=false;
+        for (int g=0; g<400000; g++) {
+            int w=(int)((pc-base)>>2); if(w<0||w>=N) break;
+            if (comp[w]) {
+                CoreState cs; memset(&cs,0,sizeof cs); for(int r=0;r<32;r++) cs.regs[r]=Rh[r]; cs.pc=pc;
+                cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
+                cudaMemcpy(d_mem,Mh.data(),MEMB,cudaMemcpyHostToDevice);
+                cudaMemset(d_ret,0,4); unsigned bud=100000; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
+                CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+                if(lr!=CUDA_SUCCESS||se!=cudaSuccess){ blew=true; break; }
+                cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); cudaMemcpy(Mh.data(),d_mem,MEMB,cudaMemcpyDeviceToHost);
+                for(int r=0;r<32;r++) Rh[r]=cs.regs[r]; Rh[0]=0; pc=cs.pc;
+            } else {
+                uint32_t ni=rvx_ref_step(Rh,Mh.data(),pc,img[w]); if(ni&0x80000000u) break; pc=ni; Rh[0]=0;
+            }
+        }
+        cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_st); cudaFree(d_ret); cuModuleUnload(mod);
+        bool ok = !blew && pc==ref_pc;
+        if (ok) for(int r=1;r<32;r++) if(Rh[r]!=Rref[r]){ ok=false; break; }
+        if (ok) { if (memcmp(Mh.data(),Mref.data(),MEMB)!=0) ok=false; }
+        if (!ok) { fails++;
+            fprintf(stderr,"[fuzz3] FAIL prog %d (PL=%d) ref_pc=0x%X hyb_pc=0x%X blew=%d\n",p,PL,ref_pc,pc,(int)blew);
+            for(int r=1;r<32;r++) if(Rh[r]!=Rref[r]) fprintf(stderr,"    x%d ref=%08X hyb=%08X\n",r,Rref[r],Rh[r]);
+            if (fails>=5) { fprintf(stderr,"[fuzz3] stopping after 5 fails\n"); break; }
+        }
+    }
+    fprintf(stderr,"[fuzz3] %d programs, %d failures (seed=%d)\n", nprog, fails, seed);
+    return fails;
 }
 
 API void cuda_rv32i_shutdown() {
