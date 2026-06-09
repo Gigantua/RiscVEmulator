@@ -50,6 +50,11 @@ static __device__ __forceinline__ void pf_i(const uint32_t* m, int nc, int id, u
     const uint32_t* p = m + (size_t)(a >> 2) * nc + id;
     asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
 }
+// Same hint for a HOST-array address (uop descriptors): issued once at fused-loop entry so the
+// loop-exit dispatch's cold uops[ft]/uw[ft] loads are already in L2 when the loop finishes.
+static __device__ __forceinline__ void pf_h(const void* p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
 template<class T> static __device__ __forceinline__ T ld_i(const uint32_t* m, int nc, int id, uint32_t a) {
     uint32_t w = a >> 2, off = (a & 3u) << 3;
     uint32_t lo = m[(size_t)w * nc + id];
@@ -380,6 +385,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             pf_i(mem, ncores, id, u1 + (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFF));  // prefetch next iteration's source
             ui += 1; gi += wt; continue; }
         else if (cls == RC_MULLOOP) {                    // whole shift-add software-multiply loop → 1 hardware multiply
+            { uint32_t ftp = w1 & 0x00FFFFFFu;           // warm the exit dispatch's descriptor loads (hint only)
+              if (ftp != 0x00FFFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
             uint32_t M0 = u1, B0 = u2, ACC0 = regs[rd];  // rs1=multiplier(→0), rs2=multiplicand(<<iters), rd=accumulator
             unsigned it = M0 ? (32u - (unsigned)__clz(M0)) : 1u;                    // exact loop iteration count (do-while ≥1)
             regs[rd]            = ACC0 + B0 * M0;                                   // ACC += B*M  (hardware multiply)
@@ -391,6 +398,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             if (ft == 0x00FFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 28; break; } // 7 words; unresolved → translate-on-miss
             ui = ft; continue; }
         else if (cls == RC_DIVLOOP) {                    // bit-serial restoring-division loop → one hardware divide
+            { uint32_t ftp = w1 & 0x003FFFFFu;           // warm the exit dispatch's descriptor loads (hint only)
+              if (ftp != 0x003FFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
             uint32_t Rr=(w0>>12)&0x1F, Nr=(w0>>17)&0x1F; // rd=Q (quotient); rs1=R (remainder); rs2=N (dividend)
             uint32_t Dr=(w1>>22)&0x1F, ir=(w1>>27)&0x1F; // D=divisor; i=down-counter (→ -1). Matcher verified the
             uint32_t Nv=regs[Nr], Dv=regs[Dr];           // prologue sets R=0,Q=0,i=31,ONE=1,NEG1=-1 (32-bit udiv).
@@ -403,6 +412,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             ui = ft; continue; }
         else if (cls == RC_MEMSET) {                     // byte-fill loop (memset) → one native loop
             uint32_t D = regs[rd], VAL = u1, END = u2, nDr = (w1>>24)&0x1F;   // rd=DST, rs1=VAL, rs2=END (VAL,END invariant)
+            { uint32_t ftp = w1 & 0x00FFFFFFu;           // warm the exit dispatch's descriptor loads (hint only)
+              if (ftp != 0x00FFFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
             while (D != END && gi < budget) { st_i<uint8_t>(mem,ncores,id,D,(uint8_t)VAL); D += 1; gi += 4; }  // 4 instrs/iter
             regs[rd] = D; regs[nDr] = D;                 // DST→END; nD (temp) = END
             if (D == END) { uint32_t ft = w1 & 0x00FFFFFFu;
@@ -427,6 +438,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_COPYLOOP) {                   // whole forward unit-stride byte memcpy loop, word-widened
             uint32_t s = u1, d = u2, L = regs[(w1>>24)&0x1F];  // src, dst, limit; counter = src or dst
             const bool cdst = (w0>>25)&1;                      // which pointer the bne compares to L
+            { uint32_t ftp = w1 & 0x00FFFFFFu;                 // warm the exit dispatch's descriptor loads (hint only)
+              if (ftp != 0x00FFFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
 #if RVCUD_CPASYNC
             // cp.async/LDGSTS fast path (single-Doom only: ncores==1 ⇒ guest byte a lives at ((char*)mem)[a],
             // so the source region is contiguous and stage-able). Stream 16-B chunks through a shared
@@ -507,6 +520,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_PALEXP) {                     // 8bpp→32bpp palette expand: whole loop, native
             uint32_t SRC=regs[(w0>>7)&0x1F], DST=regs[(w0>>12)&0x1F], PAL=regs[(w0>>17)&0x1F];
             uint32_t END=regs[(w1>>22)&0x1F], A=regs[(w1>>27)&0x1F];   // END, ALPHA invariant; PAL invariant
+            { uint32_t ftp = w1 & 0x003FFFFFu;                         // warm the exit dispatch's descriptor loads (hint only)
+              if (ftp != 0x003FFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
             while (SRC != END && gi < budget) {                       // COALESCED: 1 word-load + 1 word-store (was 3+4 byte ops)
                 uint32_t p = PAL + 3u * ld_i<uint8_t>(mem,ncores,id,SRC);
                 uint32_t rgb = ld_i<uint32_t>(mem,ncores,id,p);                                 // R|G<<8|B<<16 (+1 byte masked off)
@@ -521,6 +536,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             }                                                          // else budget-cut → ui stays, resume here
             continue; }
         else if (cls == RC_TEXSPAN) {                    // texture-mapped span: whole loop, native (params in ext[])
+            if (w1 != 0xFFFFFFFFu) { pf_h(&uops[w1]); pf_h(&uw[w1]); }         // warm the exit dispatch's descriptor loads (hint only)
             uint32_t e = w0 >> 7;                                              // ext base index
             uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]), p2=__ldg(&ext[e+2]), p3=__ldg(&ext[e+3]);
             uint32_t Xr=p0&31, Yr=(p0>>5)&31, Dr=(p0>>10)&31, Er=(p0>>15)&31, Mr=(p0>>20)&31, Br=(p0>>25)&31;
@@ -542,6 +558,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 ui = ft; }
             continue; }
         else if (cls == RC_COPYLOOPS) {                  // strided copy loop: whole loop, native (params in ext[])
+            if (w1 != 0xFFFFFFFFu) { pf_h(&uops[w1]); pf_h(&uw[w1]); }   // warm the exit dispatch's descriptor loads (hint only)
             uint32_t e = w0 >> 7; uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]);
             uint32_t sR=p0&31, dR=(p0>>5)&31, rtR=(p0>>10)&31, lR=(p0>>15)&31, cdst=(p0>>20)&1, f3=(p0>>21)&7;
             int32_t Ks=(int32_t)(int16_t)(p1&0xFFFF), Kd=(int32_t)(int16_t)(p1>>16);
@@ -560,6 +577,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 ui = ft; }
             continue; }
         else if (cls == RC_TEXCOL) {                     // textured-column loop: whole loop, native (params in ext[])
+            if (w1 != 0xFFFFFFFFu) { pf_h(&uops[w1]); pf_h(&uw[w1]); }   // warm the exit dispatch's descriptor loads (hint only)
             uint32_t e = w0 >> 7; uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]), p2=__ldg(&ext[e+2]);
             uint32_t Fr=p0&31, Dr=(p0>>5)&31, Er=(p0>>10)&31, Br=(p0>>15)&31, Sr=(p0>>20)&31;   // FRAC,DST,END,BASE,STEP
             uint32_t oT=p1&0xFFF, oC=(p1>>12)&0xFFF;
