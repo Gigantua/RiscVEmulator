@@ -504,12 +504,10 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_PALEXP) {                     // 8bpp→32bpp palette expand: whole loop, native
             uint32_t SRC=regs[(w0>>7)&0x1F], DST=regs[(w0>>12)&0x1F], PAL=regs[(w0>>17)&0x1F];
             uint32_t END=regs[(w1>>22)&0x1F], A=regs[(w1>>27)&0x1F];   // END, ALPHA invariant; PAL invariant
-            while (SRC != END && gi < budget) {                       // mirrors the guest body in program order
+            while (SRC != END && gi < budget) {                       // COALESCED: 1 word-load + 1 word-store (was 3+4 byte ops)
                 uint32_t p = PAL + 3u * ld_i<uint8_t>(mem,ncores,id,SRC);
-                st_i<uint8_t>(mem,ncores,id,DST-3,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p));     // R
-                st_i<uint8_t>(mem,ncores,id,DST-2,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p+1));   // G
-                st_i<uint8_t>(mem,ncores,id,DST-1,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p+2));   // B
-                st_i<uint8_t>(mem,ncores,id,DST,(uint8_t)A);                                    // alpha (const)
+                uint32_t rgb = ld_i<uint32_t>(mem,ncores,id,p);                                 // R|G<<8|B<<16 (+1 byte masked off)
+                st_i<uint32_t>(mem,ncores,id,DST-3,(rgb & 0x00FFFFFFu) | ((A & 0xFFu) << 24));   // one RGBA word store (== the 4 byte stores)
                 SRC += 1; DST += 4; gi += 14;                          // 14 guest instrs/iteration
             }
             regs[(w0>>7)&0x1F] = SRC; regs[(w0>>12)&0x1F] = DST;       // SRC→END, DST advanced
@@ -526,15 +524,13 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t oC=p1&0xFFF, oT=(p1>>12)&0xFFF, oX=p2&0xFFF, oY=(p2>>12)&0xFFF;
             uint32_t shY=p3&31, shX1=(p3>>5)&31, shX2=(p3>>10)&31;
             uint32_t X=regs[Xr], Y=regs[Yr], D=regs[Dr], END=regs[Er], MASK=regs[Mr], BASE=regs[Br];
-            while (D != END && gi < budget) {                                 // mirrors the 19 guest instrs in program order
-                uint32_t CMAP = ld_i<uint32_t>(mem,ncores,id,BASE+oC);        // re-loaded each iter (alias-safe; matches guest)
-                uint32_t TEX  = ld_i<uint32_t>(mem,ncores,id,BASE+oT);
+            uint32_t CMAP=ld_i<uint32_t>(mem,ncores,id,BASE+oC), TEX=ld_i<uint32_t>(mem,ncores,id,BASE+oT);  // HOISTED: loop-invariant
+            uint32_t XS=ld_i<uint32_t>(mem,ncores,id,BASE+oX), YS=ld_i<uint32_t>(mem,ncores,id,BASE+oY);     // (ds_* globals, disjoint from FB)
+            while (D != END && gi < budget) {                                 // 3 mem-ops/pixel (was 7)
                 uint32_t off  = ((Y>>shY)&MASK) + ((X<<shX1)>>shX2);
                 uint32_t pidx = ld_i<uint8_t>(mem,ncores,id, TEX + off);
                 uint32_t pix  = ld_i<uint8_t>(mem,ncores,id, CMAP + pidx);
                 st_i<uint8_t>(mem,ncores,id, D, (uint8_t)pix);
-                uint32_t XS = ld_i<uint32_t>(mem,ncores,id,BASE+oX);
-                uint32_t YS = ld_i<uint32_t>(mem,ncores,id,BASE+oY);
                 X += XS; Y += YS; D += 1; gi += 19;                           // 19 guest instrs/iteration
             }
             regs[Xr]=X; regs[Yr]=Y; regs[Dr]=D;                               // XPOS,YPOS final; DST→END
@@ -566,9 +562,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t oT=p1&0xFFF, oC=(p1>>12)&0xFFF;
             uint32_t sa=p2&31, sb=(p2>>5)&31; int32_t STR=(int32_t)(int16_t)((p2>>10)&0xFFFF);
             uint32_t F=regs[Fr], D=regs[Dr], END=regs[Er], BASE=regs[Br], STEP=regs[Sr];
-            while (D != END && gi < budget) {                                  // mirrors the 12 guest instrs in order
-                uint32_t TEX  = ld_i<uint32_t>(mem,ncores,id,BASE+oT);         // invariants re-loaded each iter (alias-safe)
-                uint32_t CMAP = ld_i<uint32_t>(mem,ncores,id,BASE+oC);
+            uint32_t TEX=ld_i<uint32_t>(mem,ncores,id,BASE+oT), CMAP=ld_i<uint32_t>(mem,ncores,id,BASE+oC);  // HOISTED: loop-invariant
+            while (D != END && gi < budget) {                                  // 3 mem-ops/pixel (was 5)
                 uint32_t t    = (F << sa) >> sb;
                 uint32_t pidx = ld_i<uint8_t>(mem,ncores,id, TEX + t);
                 uint32_t pix  = ld_i<uint8_t>(mem,ncores,id, CMAP + pidx);
