@@ -1,11 +1,39 @@
+// ── EXPERIMENTAL FEATURE FLAGS (all default OFF → the committed-best path is byte-for-byte unchanged) ──
+// Flip one on at the nvcc command line: -DRVCUD_CPASYNC=1  (each is independent; combine freely).
+// Every flag preserves the rvcud↔rv32i bit-identical verify gate — they change cache policy, memory
+// staging, or uop COUNT, never the architectural result. Validate each with the gate, then read the
+// Doom "RV32I MIPS = uop-throughput × fusion-ratio" bench line (+FPS cross-check). See IDEA_BeyondTenMips.md.
+//   RVCUD_CPASYNC   §1  cp.async/LDGSTS-stream the COPYLOOP source through a shared double-buffer
+//                       (overlaps the ~400-cyc global read behind the store). Single-Doom only (ncores==1).
+//   RVCUD_STREAM_FB §3  stores to the framebuffer region (addr ≥ FB_BASE) use st.global.wt (write-through,
+//                       L1-bypass) so the constant FB writes don't evict hot read data from L1.
+//   RVCUD_BITFIELD  §8  fuse `srli rt,rs,k ; andi rd,rt,mask` → one BFE uop (rd = (rs>>k)&mask); the
+//                       shift temp never reaches the shared regfile. Targets Doom's texel bit-math.
+#ifndef RVCUD_CPASYNC
+#define RVCUD_CPASYNC 0
+#endif
+#ifndef RVCUD_STREAM_FB
+#define RVCUD_STREAM_FB 0
+#endif
+#ifndef RVCUD_BITFIELD
+#define RVCUD_BITFIELD 0
+#endif
+#ifndef RVCUD_LOADFWD       // #5  static redundant-load elimination: a load matching an earlier same-block
+#define RVCUD_LOADFWD 0     //     load (base unchanged, no store between) → register copy, no memory op
+#endif
+
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
 #include <cuda_runtime.h>
+#if RVCUD_CPASYNC
+#include <cuda_pipeline.h>          // __pipeline_memcpy_async / commit / wait_prior (LDGSTS, sm_80+)
+#endif
 
 static constexpr uint32_t HALT_BIT = 0x80000000u;
+static constexpr uint32_t FB_BASE  = 0x20000000u;   // guest framebuffer base (Doom present target); used by RVCUD_STREAM_FB
 
 struct CoreState { uint32_t regs[32], pc; };
 
@@ -54,6 +82,37 @@ template<class T> static __device__ __forceinline__ void st_i(uint32_t* m, int n
         uint32_t mask = 0xFFu << off;
         m[i0] = (m[i0] & ~mask) | ((uint32_t)(uint8_t)v << off);
     }
+}
+
+#if RVCUD_STREAM_FB
+// Write-through word store (st.global.wt): updates DRAM/L2 and bypasses keeping the line in L1, so the
+// renderer's constant framebuffer writes don't evict hot read data. Same bytes as st_i — gate-identical.
+static __device__ __forceinline__ void stwt32(uint32_t* p, uint32_t v) {
+    asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+template<class T> static __device__ __forceinline__ void sts_i(uint32_t* m, int nc, int id, uint32_t a, T v) {
+    uint32_t w = a >> 2, off = (a & 3u) << 3; size_t i0 = (size_t)w * nc + id;   // mirrors st_i; writes go through wt
+    if constexpr (sizeof(T) == 4) {
+        if (off == 0) { stwt32(&m[i0], (uint32_t)v); return; }
+        size_t i1 = (size_t)(w + 1) * nc + id; uint32_t lomask = (1u << off) - 1u;
+        stwt32(&m[i0], (m[i0] & lomask)  | ((uint32_t)v << off));
+        stwt32(&m[i1], (m[i1] & ~lomask) | ((uint32_t)v >> (32 - off)));
+    } else if constexpr (sizeof(T) == 2) {
+        uint32_t vv = (uint16_t)v;
+        if (off <= 16) { uint32_t mask = 0xFFFFu << off; stwt32(&m[i0], (m[i0] & ~mask) | (vv << off)); }
+        else { size_t i1 = (size_t)(w + 1) * nc + id;
+               stwt32(&m[i0], (m[i0] & 0x00FFFFFFu) | (vv << 24));
+               stwt32(&m[i1], (m[i1] & 0xFFFFFF00u) | (vv >> 8)); }
+    } else { uint32_t mask = 0xFFu << off; stwt32(&m[i0], (m[i0] & ~mask) | ((uint32_t)(uint8_t)v << off)); }
+}
+#endif
+// Store router: framebuffer-region stores stream (write-through) when RVCUD_STREAM_FB is on; otherwise
+// identical to st_i (the compare folds away when the flag is off → zero cost on the default path).
+template<class T> static __device__ __forceinline__ void st_route(uint32_t* m, int nc, int id, uint32_t a, T v) {
+#if RVCUD_STREAM_FB
+    if (a >= FB_BASE) { sts_i<T>(m, nc, id, a, v); return; }
+#endif
+    st_i<T>(m, nc, id, a, v);
 }
 
 static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, uint32_t a2u,
@@ -196,7 +255,8 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_CONST=0x37, RC_LEA=0x1B, RC_ADDC=0x2B, RC_JAL=0x6F, RC_JALR=0x67, RC_NOP=0x0F,
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65,
-       RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_ILL=0x00 };
+       RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_ILL=0x00 };
+       // RC_BFE (RVCUD_BITFIELD): rd = (rs >> k) & mask  — fused srli+andi; 0x09 is a free sparse code.
        // COPYLOOP: byte-memcpy loop; MEXT: mulh*/div*/rem*; MULLOOP: whole shift-add software-multiply loop → 1 hw multiply
 enum { RP_UNC=0, RP_GP=1, RP_GNP=2, RP_SETP=3 };   // uop predicate: unconditional / guard-P / guard-!P / set-P
 static constexpr uint32_t RC_BADUOP = 0x80000000u;   // pc2uop sentinel: not a uop leader → halt on landing
@@ -271,9 +331,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
                           default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // f3==5 (translator validated {0,1,2,4,5})
         else if (cls == RC_ST) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
-            if (live) switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)u2);  break;
-                                    case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)u2); break;
-                                    default:st_i<uint32_t>(mem,ncores,id,a,u2); }           // @p st.global when predicated
+            if (live) switch (f3) { case 0: st_route<uint8_t> (mem,ncores,id,a,(uint8_t)u2);  break;
+                                    case 1: st_route<uint16_t>(mem,ncores,id,a,(uint16_t)u2); break;
+                                    default:st_route<uint32_t>(mem,ncores,id,a,u2); }           // @p st.global when predicated
             ui += 1; gi += live ? wt : 0; continue; }    // count only if the guest would have run it
         else if (cls == RC_BR) {
             int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
@@ -289,9 +349,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             regs[(w0>>12)&0x1F] = u1 + w1;               // rd != base (translator-enforced) → both writes safe
             pf_i(mem, ncores, id, u1 + w1); }            // prefetch next iteration's source (this loop's stride)
         else if (cls == RC_STOREPI) {                    // store[base] = rs2; base += w1  (store + post-increment)
-            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,u1,(uint8_t)u2);  break;
-                          case 1: st_i<uint16_t>(mem,ncores,id,u1,(uint16_t)u2); break;
-                          default:st_i<uint32_t>(mem,ncores,id,u1,u2); }
+            switch (f3) { case 0: st_route<uint8_t> (mem,ncores,id,u1,(uint8_t)u2);  break;
+                          case 1: st_route<uint16_t>(mem,ncores,id,u1,(uint16_t)u2); break;
+                          default:st_route<uint32_t>(mem,ncores,id,u1,u2); }
             regs[(w0>>12)&0x1F] = u1 + w1; ui += 1; gi += wt; continue; }
         else if (cls == RC_LDX) { uint32_t a = u1 + u2 + w1;          // rd = mem[ra+rb+imm]  (add + load → 1 uop)
             switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
@@ -303,11 +363,11 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_COPYPI) {                     // mem[dst]=mem[src]; rt=loaded; src+=Ks; dst+=Kd  (lb;sb;addi;addi → 1 uop)
             uint32_t t;                                  // u1=src base, u2=dst base; w1 = Ks(lo16) | Kd(hi16); rt = rd field
             switch (f3) {                                // t = sign/zero-extended load (mirrors lb/lbu/lh/lhu/lw); store uses low bits
-                case 0: t=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,u1); st_i<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
-                case 1: t=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,u1); st_i<uint16_t>(mem,ncores,id,u2,(uint16_t)t); break;
-                case 2: t=                   ld_i<uint32_t>(mem,ncores,id,u1); st_i<uint32_t>(mem,ncores,id,u2,t);           break;
-                case 4: t=                   ld_i<uint8_t> (mem,ncores,id,u1); st_i<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
-                default:t=                   ld_i<uint16_t>(mem,ncores,id,u1); st_i<uint16_t>(mem,ncores,id,u2,(uint16_t)t); }
+                case 0: t=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,u1); st_route<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
+                case 1: t=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,u1); st_route<uint16_t>(mem,ncores,id,u2,(uint16_t)t); break;
+                case 2: t=                   ld_i<uint32_t>(mem,ncores,id,u1); st_route<uint32_t>(mem,ncores,id,u2,t);           break;
+                case 4: t=                   ld_i<uint8_t> (mem,ncores,id,u1); st_route<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
+                default:t=                   ld_i<uint16_t>(mem,ncores,id,u1); st_route<uint16_t>(mem,ncores,id,u2,(uint16_t)t); }
             if (rd) regs[rd] = t;                                                  // rt = loaded value (rt != src,dst)
             regs[(w0>>12)&0x1F] = u1 + (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFF);   // src += Ks
             regs[(w0>>17)&0x1F] = u2 + (uint32_t)(int32_t)(int16_t)(w1 >> 16);      // dst += Kd
@@ -326,9 +386,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             ui = ft; continue; }
         else if (cls == RC_STX) { uint32_t a = u1 + u2 + w1;          // mem[ra+rb+imm] = rc  (add + store → 1 uop)
             uint32_t val = regs[(w0>>7)&0x1F];                        // rc carried in the rd field
-            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
-                          case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
-                          default:st_i<uint32_t>(mem,ncores,id,a,val); }
+            switch (f3) { case 0: st_route<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
+                          case 1: st_route<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
+                          default:st_route<uint32_t>(mem,ncores,id,a,val); }
             ui += 1; gi += wt; continue; }
         else if (cls == RC_INCBR) {                                             // counted loop: rc += K; if (rc cmp rX) goto T
             int32_t inc = (int32_t)w1 >> 24;                                     // signed high byte = increment
@@ -342,17 +402,44 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_COPYLOOP) {                   // whole forward unit-stride byte memcpy loop, word-widened
             uint32_t s = u1, d = u2, L = regs[(w1>>24)&0x1F];  // src, dst, limit; counter = src or dst
             const bool cdst = (w0>>25)&1;                      // which pointer the bne compares to L
-            do {                                               // do-while mirrors the guest body-then-bne (entered with gi<budget)
+#if RVCUD_CPASYNC
+            // cp.async/LDGSTS fast path (single-Doom only: ncores==1 ⇒ guest byte a lives at ((char*)mem)[a],
+            // so the source region is contiguous and stage-able). Stream 16-B chunks through a shared
+            // double-buffer — the global read of chunk N+1 overlaps the store of chunk N. Byte-for-byte
+            // identical to the scalar copy below (same bytes, gi=5/byte), so the verify gate is unchanged.
+            if (ncores == 1) {
+                __shared__ uint32_t s_cp[2][4];            // two 16-B stages, one thread (block==1) → +32 B shared
+                char* const gm = (char*)mem;
+                while ((s & 15u) && (cdst ? d : s) != L && gi < budget) {   // align src to 16 B (cp.async.cg wants 16-B align)
+                    st_route<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s)); s++; d++; gi += 5; }
+                int cur = 0; bool inflight = false;
+                while ((L - (cdst ? d : s)) >= 16u && (((d>s)?(d-s):(s-d)) >= 16u) && gi < budget) {
+                    if (!inflight) { __pipeline_memcpy_async(&s_cp[cur][0], gm + s, 16); __pipeline_commit(); }
+                    int nxt = cur ^ 1;
+                    bool haveNext = ((L - (cdst ? d : s) - 16u) >= 16u) && (gi + 80 < budget);
+                    if (haveNext) { __pipeline_memcpy_async(&s_cp[nxt][0], gm + s + 16u, 16); __pipeline_commit(); }
+                    __pipeline_wait_prior(haveNext ? 1 : 0);   // current stage filled
+                    st_route<uint32_t>(mem,ncores,id,d,    s_cp[cur][0]);
+                    st_route<uint32_t>(mem,ncores,id,d+4,  s_cp[cur][1]);
+                    st_route<uint32_t>(mem,ncores,id,d+8,  s_cp[cur][2]);
+                    st_route<uint32_t>(mem,ncores,id,d+12, s_cp[cur][3]);
+                    s += 16u; d += 16u; gi += 80;              // 16 bytes × 5 guest instrs
+                    cur = nxt; inflight = haveNext;
+                }
+                if (inflight) __pipeline_wait_prior(0);        // drain the unconsumed prefetch (tail re-reads from global)
+            }
+#endif
+            while ((cdst ? d : s) != L && gi < budget) {       // scalar copy: base path AND the cp.async tail/overlap
                 uint32_t cnt = cdst ? d : s, rem = L - cnt, adiff = (d > s) ? (d - s) : (s - d);
                 pf_i(mem, ncores, id, s + 96);                 // prefetch source ~96B ahead of the copy cursor
                 if (rem >= 4u && adiff >= 4u) {                // word copy: ≥4 to go AND non-overlapping within the word
-                    st_i<uint32_t>(mem,ncores,id,d, ld_i<uint32_t>(mem,ncores,id,s));
+                    st_route<uint32_t>(mem,ncores,id,d, ld_i<uint32_t>(mem,ncores,id,s));
                     s += 4; d += 4; gi += 20;                  // 4 byte-iterations (×5 guest instrs)
                 } else {                                       // byte copy (tail / overlap)
-                    st_i<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s));
+                    st_route<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s));
                     s += 1; d += 1; gi += 5;
                 }
-            } while ((cdst ? d : s) != L && gi < budget);
+            }
             uint32_t lastb = ld_i<uint8_t>(mem,ncores,id,s-1);
             if (rd) regs[rd] = (f3==0) ? (uint32_t)(int8_t)lastb : lastb;          // rt = last loaded byte (may be live)
             regs[(w0>>12)&0x1F] = s; regs[(w0>>17)&0x1F] = d;                       // src, dst
@@ -363,6 +450,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             }                                                                      // else budget-cut → ui stays, resume here
             continue; }
         else if (cls == RC_XSH)   r = u1 ^ (sra ? (u1 >> (w1 & 31)) : (u1 << (w1 & 31)));  // xorshift step: rs ^ (rs<<|>>k)
+#if RVCUD_BITFIELD
+        else if (cls == RC_BFE)   r = (u1 >> (w1 & 0x1F)) & (w1 >> 5);            // (rs>>k)&mask: fused srli+andi
+#endif
         else if (cls == RC_ADDC)  r = u1 + w1;
         else if (cls == RC_MULC)  r = u1 * w1;                                   // strength-reduced ×const → 1 IMAD
         else if (cls == RC_LEA)   r = (u1 << (w1 & 31)) + u2;                    // slli+add fused
@@ -789,6 +879,22 @@ static int rvcud_try_fuse(const RvcudBuild& B, int w,
         }
     }
 
+#if RVCUD_BITFIELD
+    // ── BFE — srli rt,rs,k ; andi rd,rt,mask  (rt dead after) → rd = (rs>>k)&mask (one uop) ──
+    if (OPC(w)==0x13 && ((img[w]>>12)&7)==5 && ((img[w]>>25)&0x7F)==0          // srli (logical, f7==0)
+        && w+1<N && !B.leader[w+1] && OPC(w+1)==0x13 && ((img[w+1]>>12)&7)==7) {  // andi
+        uint32_t i1=img[w], i2=img[w+1];
+        uint32_t rt=(i1>>7)&0x1F, rs=(i1>>15)&0x1F, k=(i1>>20)&0x1F;
+        uint32_t rd=(i2>>7)&0x1F, ra=(i2>>15)&0x1F, mask=rv_iimm(i2);           // andi imm sign-extends to 32 b
+        bool rtdead = (rd==rt) || !(B.liveout[w+1] & (1u<<rt));                 // the shift temp must not escape
+        if (rt!=0 && ra==rt && rs!=rt && rtdead && mask <= 0xFFFFu) {           // real positive mask (excludes andi -1 = mv)
+            w0 = RCW0(RC_BFE, rd, rs, 0, 0, 0, RP_UNC, 0);
+            w1 = (k & 0x1F) | (mask << 5); weight = 2; tgt = RC_NOTGT;          // pack k[4:0] | mask<<5
+            return 2;
+        }
+    }
+#endif
+
     return rvcud_classify(B, w, w0, w1, weight, tgt);   // 1:1 fallback
 }
 
@@ -1017,6 +1123,41 @@ static int rvcud_try_mulloop(RvcudBuild& B, int w, uint32_t& ui) {
     return 7;
 }
 
+#if RVCUD_LOADFWD
+// STATIC REDUNDANT-LOAD ELIMINATION (#5). A load whose (base,offset,width,sign=f3) matches an EARLIER
+// load in the SAME basic block — with the base register unchanged and NO store between (conservative
+// alias kill) and the earlier dest still holding its value — is replaced by a register copy (ADDC rd,rA,0),
+// dropping the memory op. Sound: mem[base+off] is provably unchanged across the window, so the second
+// load reads identical bits → gate-identical (weight 1, same as the load it replaces). clang -O2 already
+// elides most of these, so EV is low; the flag exists to MEASURE the Doom hit-rate. Default OFF.
+static int rvcud_try_loadfwd(RvcudBuild& B, int w, uint32_t& ui) {
+    const uint32_t* img = B.img;
+    uint32_t i0 = img[w]; if ((i0 & 0x7F) != 0x03) return 0;
+    uint32_t f3 = (i0>>12)&7; if (!(f3==0||f3==1||f3==2||f3==4||f3==5)) return 0;
+    uint32_t rd = (i0>>7)&0x1F, rb = (i0>>15)&0x1F, off = rv_iimm(i0);
+    if (rd == 0 || B.leader[w]) return 0;                 // don't forward into a block entry (no dominance)
+    uint32_t redef = 0;                                   // registers written strictly between j and w
+    for (int j = w-1; j >= 0; j--) {
+        uint32_t in = img[j], op = in & 0x7F, jrd = (in>>7)&0x1F;
+        if (op == 0x23) return 0;                         // a store between → may alias the address → bail
+        if (op == 0x03 && ((in>>12)&7)==f3 && ((in>>15)&0x1F)==rb && rv_iimm(in)==off) {   // matching producer load
+            uint32_t rA = jrd;
+            if (rA != 0 && rA != rb && !((redef>>rA)&1u) && !((redef>>rb)&1u)) {            // rA still holds it; base stable
+                B.pc2uop[w] = ui;
+                B.w0.push_back(RCW0(RC_ADDC, rd, rA, 0, 0, 0, RP_UNC, 0));
+                B.w1.push_back(0); B.uw.push_back(1);
+                B.u2pc.push_back(B.base + (uint32_t)w*4); B.tgt.push_back(RC_NOTGT); ui++;
+                return 1;
+            }
+        }
+        if (op==0x6F || op==0x67 || op==0x73) return 0;   // call/jump/system between → not straight-line
+        if (jrd) { if (jrd == rb) return 0; redef |= (1u << jrd); }   // base reg changed before w → no stable producer
+        if (B.leader[j]) break;                           // reached this block's start
+    }
+    return 0;
+}
+#endif
+
 static void rvcud_build(RvcudBuild& B) {
     int N = B.nwords;
     // Pass 1 — leaders (any uop start) and xtargets (explicit foreign entries only).
@@ -1044,6 +1185,9 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
         if (consumed == 0) consumed = rvcud_try_ldx(B, w, ui);      // add + load/store → indexed mem op (1 uop)
         if (consumed == 0) consumed = rvcud_try_postinc(B, w, ui);  // load/store + base post-increment → 1 uop
+#if RVCUD_LOADFWD
+        if (consumed == 0) consumed = rvcud_try_loadfwd(B, w, ui);  // redundant load → register copy (no memory op)
+#endif
         if (consumed == 0) {
             B.pc2uop[w] = ui;
             uint32_t a0, a1, t; uint8_t wt;
