@@ -507,7 +507,23 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_PALEXP) {                     // 8bpp→32bpp palette expand: whole loop, native
             uint32_t SRC=regs[(w0>>7)&0x1F], DST=regs[(w0>>12)&0x1F], PAL=regs[(w0>>17)&0x1F];
             uint32_t END=regs[(w1>>22)&0x1F], A=regs[(w1>>27)&0x1F];   // END, ALPHA invariant; PAL invariant
-            while (SRC != END && gi < budget) {                       // COALESCED: 1 word-load + 1 word-store (was 3+4 byte ops)
+            // LUT fast path: long run → pre-expand the 256×3 B palette to RGBA32 once, then the inner
+            // loop has zero per-pixel address ALU. Legal only if the loop's own stores can't touch the
+            // palette (the guest re-reads pal[] every pixel, so a store into it must stay observable).
+            uint32_t rem = END - SRC;                                  // pixels left this entry
+            uint32_t st_lo = DST - 3u, st_hi = st_lo + 4u*rem, pal_hi = PAL + 768u;
+            if (rem >= 512u && rem < 0x20000000u && gi < budget        // bound: 4*rem can't alias-wrap
+                    && st_hi > st_lo && pal_hi > PAL                   // neither range wraps 2^32
+                    && (st_hi <= PAL || pal_hi <= st_lo)) {            // store range ∩ palette = ∅
+                uint32_t lut[256];                                     // local (L1-backed); dynamic index
+                for (int i = 0; i < 256; ++i)
+                    lut[i] = (ld_i<uint32_t>(mem,ncores,id, PAL + 3u*(uint32_t)i) & 0x00FFFFFFu) | ((A & 0xFFu) << 24);
+                while (SRC != END && gi < budget) {                    // identical stores/order/weights
+                    st_i<uint32_t>(mem,ncores,id, DST-3, lut[ld_i<uint8_t>(mem,ncores,id,SRC)]);
+                    SRC += 1; DST += 4; gi += 14;
+                }
+            }
+            else while (SRC != END && gi < budget) {                  // COALESCED: 1 word-load + 1 word-store (was 3+4 byte ops)
                 uint32_t p = PAL + 3u * ld_i<uint8_t>(mem,ncores,id,SRC);
                 uint32_t rgb = ld_i<uint32_t>(mem,ncores,id,p);                                 // R|G<<8|B<<16 (+1 byte masked off)
                 st_i<uint32_t>(mem,ncores,id,DST-3,(rgb & 0x00FFFFFFu) | ((A & 0xFFu) << 24));   // one RGBA word store (== the 4 byte stores)
