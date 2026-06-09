@@ -50,7 +50,20 @@ static __device__ __forceinline__ void pf_i(const uint32_t* m, int nc, int id, u
     const uint32_t* p = m + (size_t)(a >> 2) * nc + id;
     asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
 }
-template<class T> static __device__ __forceinline__ T ld_i(const uint32_t* m, int nc, int id, uint32_t a) {
+// NC1 (compile-time): single-core layout — the interleave degenerates to a flat linear array, so guest
+// byte address a lives at ((uint8_t*)mem)[a] exactly. Bytes are direct loads/stores (no word RMW);
+// half/word keep an aligned fast path (misaligned ld.u32/u16 faults on GPU) + byte-assembled fallback.
+template<class T, bool NC1> static __device__ __forceinline__ T ld_i(const uint32_t* m, int nc, int id, uint32_t a) {
+    if constexpr (NC1) {
+        const uint8_t* b = (const uint8_t*)m;
+        if constexpr (sizeof(T) == 4) {
+            if ((a & 3u) == 0) return (T)*(const uint32_t*)(b + a);
+            return (T)((uint32_t)b[a] | ((uint32_t)b[a+1] << 8) | ((uint32_t)b[a+2] << 16) | ((uint32_t)b[a+3] << 24));
+        } else if constexpr (sizeof(T) == 2) {
+            if ((a & 1u) == 0) return (T)*(const uint16_t*)(b + a);
+            return (T)((uint32_t)b[a] | ((uint32_t)b[a+1] << 8));
+        } else return (T)b[a];
+    }
     uint32_t w = a >> 2, off = (a & 3u) << 3;
     uint32_t lo = m[(size_t)w * nc + id];
     if constexpr (sizeof(T) == 4) {
@@ -63,7 +76,20 @@ template<class T> static __device__ __forceinline__ T ld_i(const uint32_t* m, in
         return (T)((lo >> off) | (hi << (32 - off)));
     } else return (T)(lo >> off);
 }
-template<class T> static __device__ __forceinline__ void st_i(uint32_t* m, int nc, int id, uint32_t a, T v) {
+template<class T, bool NC1> static __device__ __forceinline__ void st_i(uint32_t* m, int nc, int id, uint32_t a, T v) {
+    if constexpr (NC1) {
+        uint8_t* b = (uint8_t*)m;
+        if constexpr (sizeof(T) == 4) {
+            uint32_t vv = (uint32_t)v;
+            if ((a & 3u) == 0) { *(uint32_t*)(b + a) = vv; return; }
+            b[a] = (uint8_t)vv; b[a+1] = (uint8_t)(vv >> 8); b[a+2] = (uint8_t)(vv >> 16); b[a+3] = (uint8_t)(vv >> 24);
+        } else if constexpr (sizeof(T) == 2) {
+            uint32_t vv = (uint16_t)v;
+            if ((a & 1u) == 0) { *(uint16_t*)(b + a) = (uint16_t)vv; return; }
+            b[a] = (uint8_t)vv; b[a+1] = (uint8_t)(vv >> 8);
+        } else b[a] = (uint8_t)v;
+        return;
+    }
     uint32_t w = a >> 2, off = (a & 3u) << 3;
     size_t i0 = (size_t)w * nc + id;
     if constexpr (sizeof(T) == 4) {
@@ -122,7 +148,7 @@ static __device__ __forceinline__ uint32_t decode_imm(uint32_t instr) {
     return (uint32_t)((int32_t)instr >> 20);   // I-type (don't-care for R-type)
 }
 
-__global__ void __launch_bounds__(256)
+template<bool NC1> __global__ void __launch_bounds__(256)
 rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncores) return;
@@ -136,7 +162,7 @@ rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
     for (int n = 0; n < budget && (int32_t)pc >= 0; n++) {
         // Fetch the instruction live from this core's RAM (correct for self-modifying / JIT guests),
         // then assemble its immediate inline.
-        const uint32_t instr = ld_i<uint32_t>(mem, ncores, id, pc);
+        const uint32_t instr = ld_i<uint32_t,NC1>(mem, ncores, id, pc);
         const uint32_t d0    = decode_imm(instr);
         const int      rd = (instr >> 7) & 0x1F;
         const uint32_t f3 = (instr >> 12) & 0x7, f7 = (instr >> 25) & 0x7F;
@@ -156,11 +182,11 @@ rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
         else if (op == 0x03) {
             uint32_t addr = (uint32_t)(s1 + (int32_t)d0);
             switch (f3) {
-                case 0: r = (uint32_t)(int8_t) ld_i<uint8_t> (mem, ncores, id, addr); break;
-                case 1: r = (uint32_t)(int16_t)ld_i<uint16_t>(mem, ncores, id, addr); break;
-                case 2: r =                    ld_i<uint32_t>(mem, ncores, id, addr); break;
-                case 4: r =                    ld_i<uint8_t> (mem, ncores, id, addr); break;
-                case 5: r =                    ld_i<uint16_t>(mem, ncores, id, addr); break;
+                case 0: r = (uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem, ncores, id, addr); break;
+                case 1: r = (uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem, ncores, id, addr); break;
+                case 2: r =                    ld_i<uint32_t,NC1>(mem, ncores, id, addr); break;
+                case 4: r =                    ld_i<uint8_t,NC1> (mem, ncores, id, addr); break;
+                case 5: r =                    ld_i<uint16_t,NC1>(mem, ncores, id, addr); break;
                 default: pc |= HALT_BIT; continue;
             }
         }
@@ -174,9 +200,9 @@ rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
         }
         else if (op == 0x23) {
             uint32_t addr = (uint32_t)(s1 + (int32_t)d0);
-            switch (f3) { case 0: st_i<uint8_t>(mem,ncores,id,addr,(uint8_t)u2); break;
-                          case 1: st_i<uint16_t>(mem,ncores,id,addr,(uint16_t)u2); break;
-                          case 2: st_i<uint32_t>(mem,ncores,id,addr,u2); break;
+            switch (f3) { case 0: st_i<uint8_t,NC1>(mem,ncores,id,addr,(uint8_t)u2); break;
+                          case 1: st_i<uint16_t,NC1>(mem,ncores,id,addr,(uint16_t)u2); break;
+                          case 2: st_i<uint32_t,NC1>(mem,ncores,id,addr,u2); break;
                           default: pc |= HALT_BIT; continue; }
             pc = nextpc; continue;
         }
@@ -255,7 +281,7 @@ __device__ unsigned long long g_dev_iters = 0;   // DEBUG: total uop-loop iterat
 #if RVCUD_HOTHIST
 __device__ unsigned long long* g_dev_hot = nullptr;   // profiling: per-uop execution count (core 0)
 #endif
-__global__ void __launch_bounds__(256)
+template<bool NC1> __global__ void __launch_bounds__(256)
 rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2* __restrict__ uops, const uint8_t* __restrict__ uw,
              const uint32_t* __restrict__ pc2uop, const uint32_t* __restrict__ uop2pc,
              const uint32_t* __restrict__ ext,
@@ -316,15 +342,15 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         if      (cls == RC_ALUI)  r = alu(f3, u1, w1, w1 & 0x1F, false, sra);
         else if (cls == RC_ALUR)  r = alu(f3, u1, u2, (uint32_t)(s2 & 0x1F), false, sra);
         else if (cls == RC_LOAD) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
-            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
-                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,a); break;
-                          case 2: r=                   ld_i<uint32_t>(mem,ncores,id,a); break;
-                          case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
-                          default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // f3==5 (translator validated {0,1,2,4,5})
+            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
+                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,a); break;
+                          case 2: r=                   ld_i<uint32_t,NC1>(mem,ncores,id,a); break;
+                          case 4: r=                   ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
+                          default:r=                   ld_i<uint16_t,NC1>(mem,ncores,id,a); } }   // f3==5 (translator validated {0,1,2,4,5})
         else if (cls == RC_ST) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
-            if (live) switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)u2);  break;
-                                    case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)u2); break;
-                                    default:st_i<uint32_t>(mem,ncores,id,a,u2); }           // @p st.global when predicated
+            if (live) switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)u2);  break;
+                                    case 1: st_i<uint16_t,NC1>(mem,ncores,id,a,(uint16_t)u2); break;
+                                    default:st_i<uint32_t,NC1>(mem,ncores,id,a,u2); }           // @p st.global when predicated
             ui += 1; gi += live ? wt : 0; continue; }    // count only if the guest would have run it
         else if (cls == RC_BR) {
             int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
@@ -332,48 +358,48 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             ui = t ? w1 : ui + 1; gi += wt; continue;                            // w1 = baked target uop-index
         }
         else if (cls == RC_LOADPI) {                     // r = load[base]; base += w1  (load + post-increment)
-            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,u1); break;
-                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,u1); break;
-                          case 2: r=                   ld_i<uint32_t>(mem,ncores,id,u1); break;
-                          case 4: r=                   ld_i<uint8_t> (mem,ncores,id,u1); break;
-                          default:r=                   ld_i<uint16_t>(mem,ncores,id,u1); }
+            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,u1); break;
+                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,u1); break;
+                          case 2: r=                   ld_i<uint32_t,NC1>(mem,ncores,id,u1); break;
+                          case 4: r=                   ld_i<uint8_t,NC1> (mem,ncores,id,u1); break;
+                          default:r=                   ld_i<uint16_t,NC1>(mem,ncores,id,u1); }
             regs[(w0>>12)&0x1F] = u1 + w1;               // rd != base (translator-enforced) → both writes safe
             pf_i(mem, ncores, id, u1 + w1); }            // prefetch next iteration's source (this loop's stride)
         else if (cls == RC_STOREPI) {                    // store[base] = rs2; base += w1  (store + post-increment)
-            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,u1,(uint8_t)u2);  break;
-                          case 1: st_i<uint16_t>(mem,ncores,id,u1,(uint16_t)u2); break;
-                          default:st_i<uint32_t>(mem,ncores,id,u1,u2); }
+            switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,u1,(uint8_t)u2);  break;
+                          case 1: st_i<uint16_t,NC1>(mem,ncores,id,u1,(uint16_t)u2); break;
+                          default:st_i<uint32_t,NC1>(mem,ncores,id,u1,u2); }
             regs[(w0>>12)&0x1F] = u1 + w1; ui += 1; gi += wt; continue; }
         else if (cls == RC_LDX) { uint32_t a = u1 + u2 + w1;          // rd = mem[ra+rb+imm]  (add + load → 1 uop)
-            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
-                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,a); break;
-                          case 2: r=                   ld_i<uint32_t>(mem,ncores,id,a); break;
-                          case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
-                          default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // falls through to rd writeback
+            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
+                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,a); break;
+                          case 2: r=                   ld_i<uint32_t,NC1>(mem,ncores,id,a); break;
+                          case 4: r=                   ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
+                          default:r=                   ld_i<uint16_t,NC1>(mem,ncores,id,a); } }   // falls through to rd writeback
         else if (cls == RC_LDXS) {                                    // rd = mem[(ra<<k)+rb+imm]  (slli+add+load → 1 uop)
             uint32_t k = (w1>>24)&0x1F; int32_t imm = ((int32_t)(w1 & 0x00FFFFFF) << 8) >> 8;   // scale k; sign-ext 24→32
             uint32_t a = (u1 << k) + u2 + (uint32_t)imm;              // scaled address lives only in this CUDA register
-            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
-                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,a); break;
-                          case 2: r=                   ld_i<uint32_t>(mem,ncores,id,a); break;
-                          case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
-                          default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // falls through to rd writeback
+            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
+                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,a); break;
+                          case 2: r=                   ld_i<uint32_t,NC1>(mem,ncores,id,a); break;
+                          case 4: r=                   ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
+                          default:r=                   ld_i<uint16_t,NC1>(mem,ncores,id,a); } }   // falls through to rd writeback
         else if (cls == RC_STXS) {                                    // mem[(ra<<k)+rb+imm] = rc  (slli+add+store → 1 uop)
             uint32_t k = (w1>>24)&0x1F; int32_t imm = ((int32_t)(w1 & 0x00FFFFFF) << 8) >> 8;
             uint32_t a = (u1 << k) + u2 + (uint32_t)imm; uint32_t val = regs[(w0>>7)&0x1F];   // rc carried in rd field
-            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
-                          case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
-                          default:st_i<uint32_t>(mem,ncores,id,a,val); }
+            switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)val);  break;
+                          case 1: st_i<uint16_t,NC1>(mem,ncores,id,a,(uint16_t)val); break;
+                          default:st_i<uint32_t,NC1>(mem,ncores,id,a,val); }
             ui += 1; gi += wt; continue; }
         else if (cls == RC_MULADD) r = u1 * w1 + u2;                             // affine ×const tree + live const-reg → 1 IMAD
         else if (cls == RC_COPYPI) {                     // mem[dst]=mem[src]; rt=loaded; src+=Ks; dst+=Kd  (lb;sb;addi;addi → 1 uop)
             uint32_t t;                                  // u1=src base, u2=dst base; w1 = Ks(lo16) | Kd(hi16); rt = rd field
             switch (f3) {                                // t = sign/zero-extended load (mirrors lb/lbu/lh/lhu/lw); store uses low bits
-                case 0: t=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,u1); st_i<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
-                case 1: t=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,u1); st_i<uint16_t>(mem,ncores,id,u2,(uint16_t)t); break;
-                case 2: t=                   ld_i<uint32_t>(mem,ncores,id,u1); st_i<uint32_t>(mem,ncores,id,u2,t);           break;
-                case 4: t=                   ld_i<uint8_t> (mem,ncores,id,u1); st_i<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
-                default:t=                   ld_i<uint16_t>(mem,ncores,id,u1); st_i<uint16_t>(mem,ncores,id,u2,(uint16_t)t); }
+                case 0: t=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,u1); st_i<uint8_t,NC1> (mem,ncores,id,u2,(uint8_t)t);  break;
+                case 1: t=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,u1); st_i<uint16_t,NC1>(mem,ncores,id,u2,(uint16_t)t); break;
+                case 2: t=                   ld_i<uint32_t,NC1>(mem,ncores,id,u1); st_i<uint32_t,NC1>(mem,ncores,id,u2,t);           break;
+                case 4: t=                   ld_i<uint8_t,NC1> (mem,ncores,id,u1); st_i<uint8_t,NC1> (mem,ncores,id,u2,(uint8_t)t);  break;
+                default:t=                   ld_i<uint16_t,NC1>(mem,ncores,id,u1); st_i<uint16_t,NC1>(mem,ncores,id,u2,(uint16_t)t); }
             if (rd) regs[rd] = t;                                                  // rt = loaded value (rt != src,dst)
             regs[(w0>>12)&0x1F] = u1 + (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFF);   // src += Ks
             regs[(w0>>17)&0x1F] = u2 + (uint32_t)(int32_t)(int16_t)(w1 >> 16);      // dst += Kd
@@ -403,7 +429,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             ui = ft; continue; }
         else if (cls == RC_MEMSET) {                     // byte-fill loop (memset) → one native loop
             uint32_t D = regs[rd], VAL = u1, END = u2, nDr = (w1>>24)&0x1F;   // rd=DST, rs1=VAL, rs2=END (VAL,END invariant)
-            while (D != END && gi < budget) { st_i<uint8_t>(mem,ncores,id,D,(uint8_t)VAL); D += 1; gi += 4; }  // 4 instrs/iter
+            while (D != END && gi < budget) { st_i<uint8_t,NC1>(mem,ncores,id,D,(uint8_t)VAL); D += 1; gi += 4; }  // 4 instrs/iter
             regs[rd] = D; regs[nDr] = D;                 // DST→END; nD (temp) = END
             if (D == END) { uint32_t ft = w1 & 0x00FFFFFFu;
                 if (ft == 0x00FFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 16; break; }   // 4 words; unresolved → translate-on-miss
@@ -411,9 +437,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             continue; }
         else if (cls == RC_STX) { uint32_t a = u1 + u2 + w1;          // mem[ra+rb+imm] = rc  (add + store → 1 uop)
             uint32_t val = regs[(w0>>7)&0x1F];                        // rc carried in the rd field
-            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
-                          case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
-                          default:st_i<uint32_t>(mem,ncores,id,a,val); }
+            switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)val);  break;
+                          case 1: st_i<uint16_t,NC1>(mem,ncores,id,a,(uint16_t)val); break;
+                          default:st_i<uint32_t,NC1>(mem,ncores,id,a,val); }
             ui += 1; gi += wt; continue; }
         else if (cls == RC_INCBR) {                                             // counted loop: rc += K; if (rc cmp rX) goto T
             int32_t inc = (int32_t)w1 >> 24;                                     // signed high byte = increment
@@ -436,7 +462,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 __shared__ uint32_t s_cp[2][4];            // two 16-B stages, one thread (block==1) → +32 B shared
                 char* const gm = (char*)mem;
                 while ((s & 15u) && (cdst ? d : s) != L && gi < budget) {   // align src to 16 B (cp.async.cg wants 16-B align)
-                    st_i<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s)); s++; d++; gi += 5; }
+                    st_i<uint8_t,NC1>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t,NC1>(mem,ncores,id,s)); s++; d++; gi += 5; }
                 int cur = 0; bool inflight = false;
                 while ((L - (cdst ? d : s)) >= 16u && (((d>s)?(d-s):(s-d)) >= 16u) && gi < budget) {
                     if (!inflight) { __pipeline_memcpy_async(&s_cp[cur][0], gm + s, 16); __pipeline_commit(); }
@@ -444,10 +470,10 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                     bool haveNext = ((L - (cdst ? d : s) - 16u) >= 16u) && (gi + 80 < budget);
                     if (haveNext) { __pipeline_memcpy_async(&s_cp[nxt][0], gm + s + 16u, 16); __pipeline_commit(); }
                     __pipeline_wait_prior(haveNext ? 1 : 0);   // current stage filled
-                    st_i<uint32_t>(mem,ncores,id,d,    s_cp[cur][0]);
-                    st_i<uint32_t>(mem,ncores,id,d+4,  s_cp[cur][1]);
-                    st_i<uint32_t>(mem,ncores,id,d+8,  s_cp[cur][2]);
-                    st_i<uint32_t>(mem,ncores,id,d+12, s_cp[cur][3]);
+                    st_i<uint32_t,NC1>(mem,ncores,id,d,    s_cp[cur][0]);
+                    st_i<uint32_t,NC1>(mem,ncores,id,d+4,  s_cp[cur][1]);
+                    st_i<uint32_t,NC1>(mem,ncores,id,d+8,  s_cp[cur][2]);
+                    st_i<uint32_t,NC1>(mem,ncores,id,d+12, s_cp[cur][3]);
                     s += 16u; d += 16u; gi += 80;              // 16 bytes × 5 guest instrs
                     cur = nxt; inflight = haveNext;
                 }
@@ -458,14 +484,14 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 uint32_t cnt = cdst ? d : s, rem = L - cnt, adiff = (d > s) ? (d - s) : (s - d);
                 pf_i(mem, ncores, id, s + 96);                 // prefetch source ~96B ahead of the copy cursor
                 if (rem >= 4u && adiff >= 4u) {                // word copy: ≥4 to go AND non-overlapping within the word
-                    st_i<uint32_t>(mem,ncores,id,d, ld_i<uint32_t>(mem,ncores,id,s));
+                    st_i<uint32_t,NC1>(mem,ncores,id,d, ld_i<uint32_t,NC1>(mem,ncores,id,s));
                     s += 4; d += 4; gi += 20;                  // 4 byte-iterations (×5 guest instrs)
                 } else {                                       // byte copy (tail / overlap)
-                    st_i<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s));
+                    st_i<uint8_t,NC1>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t,NC1>(mem,ncores,id,s));
                     s += 1; d += 1; gi += 5;
                 }
             }
-            uint32_t lastb = ld_i<uint8_t>(mem,ncores,id,s-1);
+            uint32_t lastb = ld_i<uint8_t,NC1>(mem,ncores,id,s-1);
             if (rd) regs[rd] = (f3==0) ? (uint32_t)(int8_t)lastb : lastb;          // rt = last loaded byte (may be live)
             regs[(w0>>12)&0x1F] = s; regs[(w0>>17)&0x1F] = d;                       // src, dst
             if ((cdst ? d : s) == L) {                                             // loop finished → fall through
@@ -508,9 +534,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t SRC=regs[(w0>>7)&0x1F], DST=regs[(w0>>12)&0x1F], PAL=regs[(w0>>17)&0x1F];
             uint32_t END=regs[(w1>>22)&0x1F], A=regs[(w1>>27)&0x1F];   // END, ALPHA invariant; PAL invariant
             while (SRC != END && gi < budget) {                       // COALESCED: 1 word-load + 1 word-store (was 3+4 byte ops)
-                uint32_t p = PAL + 3u * ld_i<uint8_t>(mem,ncores,id,SRC);
-                uint32_t rgb = ld_i<uint32_t>(mem,ncores,id,p);                                 // R|G<<8|B<<16 (+1 byte masked off)
-                st_i<uint32_t>(mem,ncores,id,DST-3,(rgb & 0x00FFFFFFu) | ((A & 0xFFu) << 24));   // one RGBA word store (== the 4 byte stores)
+                uint32_t p = PAL + 3u * ld_i<uint8_t,NC1>(mem,ncores,id,SRC);
+                uint32_t rgb = ld_i<uint32_t,NC1>(mem,ncores,id,p);                                 // R|G<<8|B<<16 (+1 byte masked off)
+                st_i<uint32_t,NC1>(mem,ncores,id,DST-3,(rgb & 0x00FFFFFFu) | ((A & 0xFFu) << 24));   // one RGBA word store (== the 4 byte stores)
                 SRC += 1; DST += 4; gi += 14;                          // 14 guest instrs/iteration
             }
             regs[(w0>>7)&0x1F] = SRC; regs[(w0>>12)&0x1F] = DST;       // SRC→END, DST advanced
@@ -527,13 +553,13 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t oC=p1&0xFFF, oT=(p1>>12)&0xFFF, oX=p2&0xFFF, oY=(p2>>12)&0xFFF;
             uint32_t shY=p3&31, shX1=(p3>>5)&31, shX2=(p3>>10)&31;
             uint32_t X=regs[Xr], Y=regs[Yr], D=regs[Dr], END=regs[Er], MASK=regs[Mr], BASE=regs[Br];
-            uint32_t CMAP=ld_i<uint32_t>(mem,ncores,id,BASE+oC), TEX=ld_i<uint32_t>(mem,ncores,id,BASE+oT);  // HOISTED: loop-invariant
-            uint32_t XS=ld_i<uint32_t>(mem,ncores,id,BASE+oX), YS=ld_i<uint32_t>(mem,ncores,id,BASE+oY);     // (ds_* globals, disjoint from FB)
+            uint32_t CMAP=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oC), TEX=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oT);  // HOISTED: loop-invariant
+            uint32_t XS=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oX), YS=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oY);     // (ds_* globals, disjoint from FB)
             while (D != END && gi < budget) {                                 // 3 mem-ops/pixel (was 7)
                 uint32_t off  = ((Y>>shY)&MASK) + ((X<<shX1)>>shX2);
-                uint32_t pidx = ld_i<uint8_t>(mem,ncores,id, TEX + off);
-                uint32_t pix  = ld_i<uint8_t>(mem,ncores,id, CMAP + pidx);
-                st_i<uint8_t>(mem,ncores,id, D, (uint8_t)pix);
+                uint32_t pidx = ld_i<uint8_t,NC1>(mem,ncores,id, TEX + off);
+                uint32_t pix  = ld_i<uint8_t,NC1>(mem,ncores,id, CMAP + pidx);
+                st_i<uint8_t,NC1>(mem,ncores,id, D, (uint8_t)pix);
                 X += XS; Y += YS; D += 1; gi += 19;                           // 19 guest instrs/iteration
             }
             regs[Xr]=X; regs[Yr]=Y; regs[Dr]=D;                               // XPOS,YPOS final; DST→END
@@ -547,11 +573,11 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             int32_t Ks=(int32_t)(int16_t)(p1&0xFFFF), Kd=(int32_t)(int16_t)(p1>>16);
             uint32_t s=regs[sR], d=regs[dR], L=regs[lR], last=0;
             while ((cdst?d:s) != L && gi < budget) {     // mirrors load;store;src+=Ks;dst+=Kd;bne in guest order
-                switch (f3) { case 0: last=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,s); st_i<uint8_t> (mem,ncores,id,d,(uint8_t)last);  break;
-                              case 1: last=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,s); st_i<uint16_t>(mem,ncores,id,d,(uint16_t)last); break;
-                              case 2: last=                   ld_i<uint32_t>(mem,ncores,id,s); st_i<uint32_t>(mem,ncores,id,d,last);           break;
-                              case 4: last=                   ld_i<uint8_t> (mem,ncores,id,s); st_i<uint8_t> (mem,ncores,id,d,(uint8_t)last);  break;
-                              default:last=                   ld_i<uint16_t>(mem,ncores,id,s); st_i<uint16_t>(mem,ncores,id,d,(uint16_t)last); }
+                switch (f3) { case 0: last=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,s); st_i<uint8_t,NC1> (mem,ncores,id,d,(uint8_t)last);  break;
+                              case 1: last=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,s); st_i<uint16_t,NC1>(mem,ncores,id,d,(uint16_t)last); break;
+                              case 2: last=                   ld_i<uint32_t,NC1>(mem,ncores,id,s); st_i<uint32_t,NC1>(mem,ncores,id,d,last);           break;
+                              case 4: last=                   ld_i<uint8_t,NC1> (mem,ncores,id,s); st_i<uint8_t,NC1> (mem,ncores,id,d,(uint8_t)last);  break;
+                              default:last=                   ld_i<uint16_t,NC1>(mem,ncores,id,s); st_i<uint16_t,NC1>(mem,ncores,id,d,(uint16_t)last); }
                 s += (uint32_t)Ks; d += (uint32_t)Kd; gi += 5;       // load,addi,store,addi,bne
             }
             regs[sR]=s; regs[dR]=d; if (rtR) regs[rtR]=last;          // src,dst advanced; rt = last loaded (sign/zero-ext)
@@ -565,12 +591,12 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t oT=p1&0xFFF, oC=(p1>>12)&0xFFF;
             uint32_t sa=p2&31, sb=(p2>>5)&31; int32_t STR=(int32_t)(int16_t)((p2>>10)&0xFFFF);
             uint32_t F=regs[Fr], D=regs[Dr], END=regs[Er], BASE=regs[Br], STEP=regs[Sr];
-            uint32_t TEX=ld_i<uint32_t>(mem,ncores,id,BASE+oT), CMAP=ld_i<uint32_t>(mem,ncores,id,BASE+oC);  // HOISTED: loop-invariant
+            uint32_t TEX=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oT), CMAP=ld_i<uint32_t,NC1>(mem,ncores,id,BASE+oC);  // HOISTED: loop-invariant
             while (D != END && gi < budget) {                                  // 3 mem-ops/pixel (was 5)
                 uint32_t t    = (F << sa) >> sb;
-                uint32_t pidx = ld_i<uint8_t>(mem,ncores,id, TEX + t);
-                uint32_t pix  = ld_i<uint8_t>(mem,ncores,id, CMAP + pidx);
-                st_i<uint8_t>(mem,ncores,id, D, (uint8_t)pix);
+                uint32_t pidx = ld_i<uint8_t,NC1>(mem,ncores,id, TEX + t);
+                uint32_t pix  = ld_i<uint8_t,NC1>(mem,ncores,id, CMAP + pidx);
+                st_i<uint8_t,NC1>(mem,ncores,id, D, (uint8_t)pix);
                 D += (uint32_t)STR; F += STEP; gi += 12;                       // 12 guest instrs/iteration
             }
             regs[Dr]=D; regs[Fr]=F;                                            // DST→END; FRAC advanced
@@ -664,7 +690,8 @@ API int cuda_rv32i_step_all(int budget) {
     int block = g_ncores < 64 ? g_ncores : 64;
     int grid  = (g_ncores + block - 1) / block;
     size_t shmem = (size_t)block * 33 * sizeof(uint32_t);
-    rv32i_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
+    if (g_ncores == 1) rv32i_kernel<true ><<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
+    else               rv32i_kernel<false><<<grid, block, shmem>>>(g_state, g_mem, g_ncores, budget);
     cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
     return le != cudaSuccess ? (int)le : (int)se;
 }
@@ -1854,8 +1881,12 @@ API int cuda_rvcud_step_all(int budget) {
                 }
             }
         }
-        rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
-                                             g_ncores, g_pc2words, g_base, rem, g_ret);
+        if (g_ncores == 1)
+            rvcud_kernel<true ><<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
+                                                        g_ncores, g_pc2words, g_base, rem, g_ret);
+        else
+            rvcud_kernel<false><<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
+                                                        g_ncores, g_pc2words, g_base, rem, g_ret);
         cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
         if (le != cudaSuccess) return (int)le;
         if (se != cudaSuccess) return (int)se;
