@@ -1,0 +1,24 @@
+{
+  "profiles": {
+    "Examples.CudaDoom (rvcud — RV32I MIPS bench) ★": {
+      "commandName": "Project",
+      "commandLineArgs": "--rvcud --bench"
+    },
+    "Examples.CudaDoom (base — RV32I MIPS bench)": {
+      "commandName": "Project",
+      "commandLineArgs": "--bench"
+    },
+    "Examples.CudaDoom (rvcud — play)": {
+      "commandName": "Project",
+      "commandLineArgs": "--rvcud"
+    },
+    "Examples.CudaDoom (play)": {
+      "commandName": "Project",
+      "commandLineArgs": ""
+    },
+    "Examples.CudaDoom (rvcud, time-to-first-frames)": {
+      "commandName": "Project",
+      "commandLineArgs": "--rvcud --ttf 2"
+    }
+  }
+}

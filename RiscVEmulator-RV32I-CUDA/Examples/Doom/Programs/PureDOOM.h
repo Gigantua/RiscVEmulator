@@ -9526,7 +9526,7 @@ void D_DoAdvanceDemo(void)
             if (gamemode == commercial)
                 pagetic = 35 * 11;
             else
-                pagetic = 170;
+                pagetic = 8;     // shortened title-screen hold (was 170) → attract demo starts fast (bench warmup)
             gamestate = GS_DEMOSCREEN;
             pagename = "TITLEPIC";
             if (gamemode == commercial)

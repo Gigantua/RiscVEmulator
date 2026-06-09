@@ -37,6 +37,8 @@ namespace RiscVEmulator.Core.Cuda
         // per-instruction kernel, so all device staging/draining is unchanged.
         [DllImport(Lib)] private static extern int  cuda_rvcud_set_code(byte[] src, uint len, uint baseAddr, uint entry);
         [DllImport(Lib)] private static extern int  cuda_rvcud_step_all(int budget);
+        [DllImport(Lib)] private static extern ulong cuda_rvcud_iters();
+        public ulong RvcudIters => cuda_rvcud_iters();
 
         // ── Guest memory map (host-side device layout inside the flat buffer) ──
         // The core is oblivious to all of these; they are just memory addresses the
