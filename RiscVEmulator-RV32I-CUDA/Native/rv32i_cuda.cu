@@ -31,6 +31,13 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <cuda.h>            // driver API (cuModuleLoadDataEx / cuLaunchKernel) — for the tiered exec_block cross-compiler
+#ifdef _WIN32                // peak-commit reporting for the exec_block build (ptxas memory-knee watch)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#define PSAPI_VERSION 2
+#include <windows.h>
+#include <psapi.h>
+#endif
 #if RVCUD_CPASYNC
 #include <cuda_pipeline.h>          // __pipeline_memcpy_async / commit / wait_prior (LDGSTS, sm_80+)
 #endif
@@ -2160,16 +2167,21 @@ static void rvx_app(std::string& s, const char* fmt, ...) {
 // Emit PTX for one guest instruction. Guest regs are %x0..%x31 (%x0 holds 0); %t0/%t1 b32, %a0 b64
 // temps; %p0 pred; %M global-mem base. Memory is byte-wise assembled (ncores==1 ⇒ linear layout):
 // every load/store uses only ld/st.global.u8 so a misaligned guest address can never raise the
-// unrecoverable misaligned-access fault that aligned ld.global.u32 would. Branch/jal to a compiled
-// FORWARD target → direct bra L<t>; BACKWARD (loop) or jalr → route through XDISP (budget check there).
+// unrecoverable misaligned-access fault that aligned ld.global.u32 would. Branch/jal to a SAME-REGION
+// compiled FORWARD target → direct bra L<t>; BACKWARD (loop) → inline budget check + bra; jalr → the
+// region-local XDISP (same-region targets stay in-register). Cross-region or uncompiled target → set pc,
+// bra XSAVE (the region epilogue spills to XS and returns; the dispatcher re-enters the right region
+// on-device, or exits to the host/interpreter when pc2idx has no entry for pc).
 static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
-                     const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base) {
+                     const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base,
+                     const std::vector<int>& regof, int myreg) {
     const uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
-    auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2; return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w]; };
+    auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2;
+        return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w] && regof[w]==myreg; };
     // Emit a transfer to guest target t. cond=true ⇒ guarded by %p0 (conditional branch). Forward
-    // compiled target → direct bra (can't loop, no budget check). Backward compiled target (a loop) →
-    // INLINE register-only budget check + direct bra: this avoids the per-iteration pc2idx global load +
-    // brx.idx that routing through XDISP would cost on every loop trip. Uncompiled target → hand to interp.
+    // same-region target → direct bra (can't loop, no budget check). Backward same-region target (a
+    // loop) → INLINE register-only budget check + direct bra: this avoids the per-iteration pc2idx
+    // global load + brx.idx that routing through XDISP would cost on every loop trip.
     auto xfer=[&](bool cond, uint32_t t){
         const char* pg = cond ? "@%p0 " : "";
         if(goable(t) && t>pc)      rvx_app(s,"%sbra L%u;\n",pg,t);
@@ -2178,7 +2190,7 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                                "@%%p2 mov.u32 %%pc, %u;\n@%%p2 bra XSAVE;\n@%%p1 bra L%u;\n",t,t);
             else     rvx_app(s,"setp.ge.s32 %%p0, %%cnt, %%budget;\n@%%p0 mov.u32 %%pc, %u;\n@%%p0 bra XSAVE;\nbra L%u;\n",t,t);
         }
-        else                       rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XSAVE;\n",pg,t,pg);          // leaves compiled set
+        else                       rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XSAVE;\n",pg,t,pg);          // leaves region/compiled set
     };
     // guest byte address (rs1+imm) into %a0 (b64, + %M); leaves %t0/%t1 free as scratch.
     auto addr=[&](int32_t imm){ rvx_app(s,"add.s32 %%t0, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t0;\nadd.u64 %%a0, %%a0, %%M;\n",rs1,imm); };
@@ -2258,81 +2270,243 @@ static inline bool rvx_compilable(uint32_t op){
     return op==0x37||op==0x17||op==0x6F||op==0x67||op==0x63||op==0x03||op==0x23||op==0x13||op==0x33||op==0x0F;
 }
 
-// Build the exec_block PTX module + the word→branchtargets-ordinal map (pc2idx, size N; 0xFFFFFFFF = not
-// compiled → hand back to interpreter). `comp[w]` selects which words are compiled; bodies are emitted in
-// ascending pc so a compiled word's natural fall-through reaches word w+1 — when w+1 is NOT compiled we
-// append an explicit hand-off. brx.idx over the full compiled set lets any pc (jalr / interpreter hand-off)
-// re-enter. Guest regs live in %x1..%x31 across the whole run — this is what removes the per-uop tax.
-static void rvx_codegen(std::string& ptx, std::vector<uint32_t>& pc2idx,
+// MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
+// unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
+// linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, the 24000-word Doom set):
+//   - ONE .entry, one 21611-target brx.idx (the old monolith): 1.38 GB — but on a knife edge: ANY
+//     perturbation (+3 instructions, or splitting the brx into 4 in the same entry) → 12-25 GB.
+//   - K .funcs in ONE unit: ~12 GB regardless of K (whole-module .func analysis, ~0.5 MB per target).
+//   - the SAME region .func compiled ALONE: 0.83 GB. Per-unit compilation is what kills the knee, and
+//     it makes total coverage scale ~linearly in K with a FLAT per-unit peak.
+// Guest regs live in PTX registers %x1..%x31 WITHIN a region; at region boundaries they spill/load
+// through a 168-byte .global block XS (defined in the dispatcher unit, .extern in region units) —
+// region transitions are vastly rarer than instructions. Cross-region transfers stay ON-DEVICE: the
+// region returns and the dispatcher loop re-enters the target region (a host hand-off per crossing
+// would collapse throughput — measured 20× at RVX_MAXW=8000).
+//   XS layout (bytes): [4*r] x<r> (r=1..31) | [128] pc | [132] cnt | [136] budget |
+//                      [144] M (u64) | [152] P2I (u64) | [160] region-entry brx ordinal
+// pc2idx[w] = (region<<20)|local-ordinal for every region-entry word (0xFFFFFFFF = not enterable).
+// Region-entry words = `disp` leaders ∪ cross-region static-edge targets — the latter keep region-
+// boundary branches enterable. Within a region, labels / fall-through / direct bra / inline-budget
+// backward branches work exactly like the old monolith; jalr probes its own region via the local XDISP.
+#ifndef RVX_REGW
+#define RVX_REGW 6000
+#endif
+static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& pc2idx,
                         const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
                         const std::vector<uint8_t>& disp) {
-    // `comp[w]` = body emitted (reached by fall-through / direct bra). `disp[w]` = a brx.idx dispatch entry
-    // (interpreter hand-off / jalr re-entry point) — a SUBSET of comp (leaders only). Keeping branchtargets
-    // to leaders keeps the brx small (the driver's PTX JIT blows up super-linearly in brx fan-out), so
-    // coverage can be large. Labels are emitted for ALL comp words, so direct bra to any of them still works.
-    std::vector<uint32_t> body, dwords;
-    pc2idx.assign(N, 0xFFFFFFFFu);
+    std::vector<uint32_t> body;
     for (int w=0; w<N; w++) if (comp[w]) body.push_back((uint32_t)w);
-    for (int w=0; w<N; w++) if (comp[w] && disp[w]) { pc2idx[w]=(uint32_t)dwords.size(); dwords.push_back((uint32_t)w); }
-
-    ptx  = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
-    ptx += ".reg .b64 %M,%S,%P2I,%RET,%a0,%ad;\n";
-    ptx += ".reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n";
-    ptx += ".reg .u32 %wi,%bidx;\n.reg .pred %p0,%p1,%p2;\n";
-    ptx += "ld.param.u64 %M,[pM];\nld.param.u64 %S,[pS];\nld.param.u32 %budget,[pBud];\n"
-           "ld.param.u64 %P2I,[pP2I];\nld.param.u64 %RET,[pRet];\n";
-    ptx += "mov.b32 %x0, 0;\n";
-    for (int r=1; r<32; r++) rvx_app(ptx,"ld.global.u32 %%x%u, [%%S+%d];\n", r, r*4);
-    rvx_app(ptx,"ld.global.u32 %%pc, [%%S+%d];\nmov.b32 %%cnt, 0;\n", 32*4);
-    // dispatch: budget gate → bounds → pc2idx lookup → indirect branch (or hand back)
-    ptx += "XDISP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
-    rvx_app(ptx,"sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
-    rvx_app(ptx,"setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
-    ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n";
-    ptx += "setp.eq.u32 %p0, %bidx, 4294967295;\n@%p0 bra XSAVE;\n";
-    ptx += "BT: .branchtargets ";
-    for (size_t i=0;i<dwords.size();i++) rvx_app(ptx, "%sL%u", i?",":"", base+dwords[i]*4);
-    ptx += ";\nbrx.idx %bidx, BT;\n";
-    // bodies, ascending pc
-    for (uint32_t w : body) {
-        uint32_t pc = base + w*4, op = img[w]&0x7F;
-        rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
-        rvx_emit(ptx, pc, img[w], comp, comp, N, base);
-        bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
-        if (!terminates) {                                                 // fall-through: redirect if w+1 not compiled
-            int nw = (int)w + 1;
-            if (nw>=N || !comp[nw]) rvx_app(ptx,"mov.u32 %%pc, %u;\nbra XSAVE;\n", base+(uint32_t)nw*4);
+    const int nb = (int)body.size();
+    int regw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) regw=v; }
+    if (regw >= (1<<20)) regw = (1<<20)-1;                  // local ordinal must fit pc2idx bits 19:0
+    int K = nb ? (nb + regw - 1) / regw : 1; if (K > 2048) K = 2048;   // region id fits 12 bits (no 0xFFFFFFFF alias)
+    // Region cuts: start from equal-compiled-word-count ideals, then slide each cut (±700 body slots)
+    // to the word boundary crossed by the FEWEST static edges (branch/jal/fall-through between compiled
+    // words; backward edges ×8 — a loop crossing a cut pays the spill/refill EVERY iteration).
+    std::vector<int> regof(N, -1);
+    std::vector<int> cuts;                                  // body-index of each region's first word
+    if (K > 1) {
+        std::vector<long long> diff(N+1, 0);
+        for (int w=0; w<N; w++) if (comp[w]) {
+            uint32_t in=img[w], op=in&0x7F; uint32_t pc=base+(uint32_t)w*4;
+            auto edge=[&](uint32_t t){ if(t<base||((t-base)&3)) return; int tw=(int)((t-base)>>2);
+                if(tw<0||tw>=N||!comp[tw]||tw==w) return; int lo=w<tw?w:tw, hi=w<tw?tw:w, wt=tw<w?8:1;
+                diff[lo+1]+=wt; diff[hi+1]-=wt; };
+            if (op==0x63) edge(pc+rv_bimm(in));
+            else if (op==0x6F) edge(pc+rv_jimm(in));
+            bool term = (op==0x6F || op==0x67 || !rvx_compilable(op));
+            if (!term && w+1<N && comp[w+1]) { diff[w+1]+=1; diff[w+2]-=1; }
+        }
+        std::vector<long long> cost(N+1, 0);                // cost[w] = edges crossing the boundary below word w
+        { long long a=0; for (int w=0; w<=N; w++) { a+=diff[w]; cost[w]=a; } }
+        for (int r=1; r<K; r++) {
+            int ideal=(int)((long long)nb*r/K), lo=ideal-700, hi=ideal+700;
+            int minlo = cuts.empty() ? 1 : cuts.back()+1;   // strictly increasing → every region nonempty
+            int maxhi = nb-1 - (K-1-r);                     // leave room for the remaining cuts
+            if (lo<minlo) lo=minlo; if (hi>maxhi) hi=maxhi;
+            if (lo>hi) break;                               // no room left — settle for fewer regions
+            int bi=lo; long long bc=0x7fffffffffffffffLL;
+            for (int i=lo; i<=hi; i++) { long long c=cost[body[i]]; if (c<bc) { bc=c; bi=i; } }
+            cuts.push_back(bi);
         }
     }
+    K = (int)cuts.size() + 1;
+    { int r=0; size_t ci=0;
+      for (int i=0; i<nb; i++) { while (ci<cuts.size() && i>=cuts[ci]) { r++; ci++; } regof[body[i]]=r; } }
+    // Region-entry words: disp leaders + every compiled word a CROSS-REGION static edge lands on.
+    std::vector<uint8_t> xt(N, 0);
+    for (int w=0; w<N; w++) if (comp[w]) {
+        uint32_t in=img[w], op=in&0x7F; uint32_t pc=base+(uint32_t)w*4;
+        auto mark=[&](uint32_t t){ if(t<base||((t-base)&3)) return; int tw=(int)((t-base)>>2);
+            if (tw>=0 && tw<N && comp[tw] && regof[tw]!=regof[w]) xt[tw]=1; };
+        if (op==0x63) mark(pc+rv_bimm(in));
+        else if (op==0x6F) mark(pc+rv_jimm(in));
+        bool term = (op==0x6F || op==0x67 || !rvx_compilable(op));
+        if (!term && w+1<N && comp[w+1] && regof[w+1]!=regof[w]) xt[w+1]=1;
+    }
+    std::vector<std::vector<uint32_t>> rtgt(K);
+    pc2idx.assign(N, 0xFFFFFFFFu);
+    for (int w=0; w<N; w++) if (comp[w] && (disp[w] || xt[w])) {
+        int r = regof[w];
+        pc2idx[w] = ((uint32_t)r<<20) | (uint32_t)rtgt[r].size();   // ordinal < 2^20 (region ≤ ~regw words)
+        rtgt[r].push_back((uint32_t)w);
+    }
+    for (int r=0; r<K; r++) if (rtgt[r].empty())            // never enterable, but keep the PTX well-formed
+        for (int i=0; i<nb; i++) if (regof[body[i]]==r) { pc2idx[body[i]]=(uint32_t)r<<20; rtgt[r].push_back(body[i]); break; }
+
+    const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
+    units.assign(1+K, std::string());
+    // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
+    //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
+    //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
+    int bi = 0;                                             // walking index into body[]
+    for (int r=0; r<K; r++) {
+        std::string& ptx = units[1+r];
+        ptx  = hdr;
+        ptx += ".extern .global .align 8 .b8 XS[168];\n";
+        rvx_app(ptx, ".visible .func xr%d\n{\n", r);
+        ptx += ".reg .b64 %M,%P2I,%a0,%ad;\n.reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n"
+               ".reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0,%p1,%p2;\n";
+        ptx += "mov.b32 %x0, 0;\n";
+        for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%x%u, [XS+%d];\n", g, g*4);
+        ptx += "ld.global.u32 %cnt, [XS+132];\nld.global.u32 %budget, [XS+136];\n"
+               "ld.global.u64 %M, [XS+144];\nld.global.u64 %P2I, [XS+152];\nld.global.u32 %bidx, [XS+160];\n";
+        ptx += "BT: .branchtargets ";
+        for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
+        ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
+        for (; bi<nb && regof[body[bi]]==r; bi++) {
+            uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
+            rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r);
+            bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
+            if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
+                int nw = (int)w + 1;
+                if (nw>=N || !comp[nw] || regof[nw]!=r) rvx_app(ptx,"mov.u32 %%pc, %u;\nbra XSAVE;\n", base+(uint32_t)nw*4);
+            }
+        }
+        ptx += "XDISP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
+        rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
+        rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
+        ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n"
+               "setp.eq.u32 %p0, %bidx, 4294967295;\n@%p0 bra XSAVE;\n";
+        rvx_app(ptx, "shr.u32 %%rg, %%bidx, 20;\nsetp.ne.u32 %%p0, %%rg, %d;\n@%%p0 bra XSAVE;\n", r);
+        ptx += "and.b32 %bidx, %bidx, 1048575;\nbra JBRX;\n";
+        ptx += "XSAVE:\n";
+        for (int g=1; g<32; g++) rvx_app(ptx, "st.global.u32 [XS+%d], %%x%u;\n", g*4, g);
+        ptx += "st.global.u32 [XS+128], %pc;\nst.global.u32 [XS+132], %cnt;\nret;\n}\n";
+    }
+    // ── dispatcher unit: state→XS, then loop { budget/bounds/pc2idx gate → call region } → state←XS.
+    std::string& ptx = units[0];
+    ptx  = hdr;
+    ptx += ".visible .global .align 8 .b8 XS[168];\n";
+    for (int r=0; r<K; r++) rvx_app(ptx, ".extern .func xr%d;\n", r);
+    ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
+    ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0;\n";
+    ptx += "ld.param.u64 %M,[pM];\nld.param.u64 %S,[pS];\nld.param.u32 %budget,[pBud];\n"
+           "ld.param.u64 %P2I,[pP2I];\nld.param.u64 %RET,[pRet];\n";
+    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.global.u32 [XS+%d], %%t0;\n", g*4, g*4);
+    rvx_app(ptx, "ld.global.u32 %%pc, [%%S+%d];\nmov.b32 %%cnt, 0;\n", 32*4);
+    ptx += "st.global.u32 [XS+132], %cnt;\nst.global.u32 [XS+136], %budget;\n"
+           "st.global.u64 [XS+144], %M;\nst.global.u64 [XS+152], %P2I;\n";
+    ptx += "DLOOP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
+    rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
+    rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
+    ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n";
+    ptx += "setp.eq.u32 %p0, %bidx, 4294967295;\n@%p0 bra XSAVE;\n";
+    ptx += "shr.u32 %rg, %bidx, 20;\nand.b32 %bidx, %bidx, 1048575;\nst.global.u32 [XS+160], %bidx;\n";
+    for (int r=0; r<K; r++) rvx_app(ptx, "setp.eq.u32 %%p0, %%rg, %d;\n@%%p0 call.uni xr%d;\n", r, r);
+    ptx += "ld.global.u32 %pc, [XS+128];\nld.global.u32 %cnt, [XS+132];\nbra DLOOP;\n";
     // save architectural state and return retired count
     ptx += "XSAVE:\n";
-    for (int r=1; r<32; r++) rvx_app(ptx,"st.global.u32 [%%S+%d], %%x%u;\n", r*4, r);
+    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [XS+%d];\nst.global.u32 [%%S+%d], %%t0;\n", g*4, g*4);
     rvx_app(ptx,"st.global.u32 [%%S+%d], %%pc;\nst.global.u32 [%%RET], %%cnt;\nret;\n}\n", 32*4);
 }
 
-// Assemble PTX → module, fetch entry `xk`. Returns 0 on success (driver assembles; NOT NVRTC).
-static int rvx_load_module(const std::string& ptx, CUmodule* mod, CUfunction* fn) {
+// Compile each PTX unit OUT-OF-PROCESS with the toolkit's ptxas (-c --disable-optimizer-constants),
+// then device-link the cubins into ONE module; fetch entry `xk`. Two reasons ptxas must run standalone:
+//   1. the per-entry "compiler-generated constants" bank overflows when the linker folds K brx tables
+//      into xk's budget — only the --disable-optimizer-constants flag avoids it, and the driver JIT has
+//      no way to pass it;
+//   2. ptxas' multi-GB brx working set then lives (and dies) in a child process, not ours.
+// If ptxas.exe can't be found/run, falls back to in-driver PTX compilation (fine for small programs).
+// RVX_STATS=1 prints the JIT/link info log. Returns 0 on success.
+static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
+#ifdef _WIN32
+    static int seq = 0;
+    char dir[MAX_PATH]; if (!GetTempPathA(sizeof dir, dir)) return -1;
+    char fin[MAX_PATH], fout[MAX_PATH];
+    snprintf(fin,  sizeof fin,  "%sxblk_%lu_%d.ptx",   dir, GetCurrentProcessId(), seq);
+    snprintf(fout, sizeof fout, "%sxblk_%lu_%d.cubin", dir, GetCurrentProcessId(), seq); seq++;
+    FILE* f = fopen(fin, "wb"); if (!f) return -1;
+    fwrite(ptx.data(), 1, ptx.size(), f); fclose(f);
+    const char* cp = getenv("CUDA_PATH");
+    char cmd[2048];
+    snprintf(cmd, sizeof cmd, "\"%s%sptxas.exe\" -arch=sm_86 -O3 -c --disable-optimizer-constants \"%s\" -o \"%s\"",
+             cp?cp:"", cp?"\\bin\\":"", fin, fout);
+    STARTUPINFOA si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+    int rc = -1;
+    if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        if (ec == 0 && (f = fopen(fout, "rb")) != nullptr) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            cubin.resize((size_t)sz);
+            rc = (fread(cubin.data(), 1, (size_t)sz, f) == (size_t)sz) ? 0 : -1;
+            fclose(f);
+        }
+    }
+    remove(fin); remove(fout);
+    return rc;
+#else
+    (void)ptx; (void)cubin; return -1;
+#endif
+}
+static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod, CUfunction* fn) {
+    const int verbose = getenv("RVX_STATS") ? 1 : 0;
     char log[8192]; log[0]=0;
-    CUjit_option opt[] = { CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES };
-    void* val[] = { log, (void*)(size_t)sizeof(log) };
-    CUresult r = cuModuleLoadDataEx(mod, ptx.c_str(), 2, opt, val);
-    if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] ptxas: %s\n", log); return (int)r; }
-    if (cuModuleGetFunction(fn, *mod, "xk") != CUDA_SUCCESS) { cuModuleUnload(*mod); return -1; }
+    std::vector<char> ilog(1<<16); ilog[0]=0;
+    CUjit_option opt[] = { CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+                           CU_JIT_INFO_LOG_BUFFER, CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES, CU_JIT_LOG_VERBOSE };
+    void* val[] = { log, (void*)(size_t)sizeof(log), ilog.data(), (void*)ilog.size(), (void*)(size_t)verbose };
+    CUlinkState ls;
+    CUresult r = cuLinkCreate(5, opt, val, &ls);
+    if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] cuLinkCreate: %d\n",(int)r); return -1; }
+    std::vector<std::vector<char>> cubins(units.size());     // keep alive until cuLinkComplete
+    for (size_t u=0; u<units.size(); u++) {
+        char nm[24]; snprintf(nm, sizeof nm, "xu%zu", u);
+        if (rvx_assemble_unit(units[u], cubins[u]) == 0)
+            r = cuLinkAddData(ls, CU_JIT_INPUT_CUBIN, cubins[u].data(), cubins[u].size(), nm, 0, nullptr, nullptr);
+        else                                                  // no standalone ptxas — in-driver fallback
+            r = cuLinkAddData(ls, CU_JIT_INPUT_PTX, (void*)units[u].c_str(), units[u].size()+1, nm, 0, nullptr, nullptr);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr,"[xblk] add (%s): %d %s\n", nm, (int)r, log); cuLinkDestroy(ls); return -2; }
+    }
+    void* cubin=nullptr; size_t csz=0;
+    r = cuLinkComplete(ls, &cubin, &csz);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr,"[xblk] link: %d %s\n", (int)r, log); cuLinkDestroy(ls); return -3; }
+    if (verbose && ilog[0]) fprintf(stderr,"[xblk] link info log:\n%s\n", ilog.data());
+    r = cuModuleLoadData(mod, cubin);                        // cubin owned by ls — load before destroy
+    cuLinkDestroy(ls);
+    if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] module load: %d\n",(int)r); return (int)r; }
+    if (cuModuleGetFunction(fn, *mod, "xk") != CUDA_SUCCESS) { cuModuleUnload(*mod); return -4; }
     return 0;
 }
 
 // Build the exec_block from the live (statically-translated) image. Compiles up to RVX_MAXW
-// reachable+compilable words. Single-core only (linear memory ⇒ byte addr == %M + a).
-// The driver's PTX JIT (ptxas) blows up super-linearly in single-function size: the whole compiled set
-// lives in ONE .entry, so ~24000 words (~3 MB PTX) builds fine but ~48000 explodes the assembler to tens
-// of GB. Keep below that ceiling (a multi-module tiering would be needed to go higher).
+// reachable+compilable words (env RVX_MAXW overrides). Single-core only (linear memory ⇒ byte addr ==
+// %M + a). The old 24000-word cap existed only for the single-function ptxas memory knee; with per-unit
+// out-of-process assembly the limit is gone — default to full coverage (Doom: 108650 words, 19 regions,
+// ~1.3 GB per ptxas child, ~1.4 GB in-process; ttf30 15.5 → 27 MIPS, coverage WAS the bottleneck).
 #ifndef RVX_MAXW
-#define RVX_MAXW 24000
+#define RVX_MAXW (1<<20)
 #endif
 static void rvxblk_build() {
     g_xblk_ok = 0;
     if (g_ncores != 1 || g_img.empty()) return;
+    int maxw = RVX_MAXW; if (const char* e=getenv("RVX_MAXW")) { int v=atoi(e); if (v>0) maxw=v; }
     int N = g_pc2words;
     std::vector<uint8_t> comp(N, 0), seen(N, 0);
     // Reachability walk over the RAW image, seeded from every statically-translated leader (confirmed
@@ -2346,7 +2520,7 @@ static void rvxblk_build() {
     while (!stack.empty()) {
         int w = stack.back(); stack.pop_back();
         uint32_t instr = g_img[w], op = instr & 0x7F;
-        if (rvx_compilable(op) && !comp[w] && cnt < RVX_MAXW) { comp[w]=1; cnt++; }
+        if (rvx_compilable(op) && !comp[w] && cnt < maxw) { comp[w]=1; cnt++; }
         auto push=[&](int t){ if(t>=0 && t<N && !seen[t]){ seen[t]=1; stack.push_back(t); } };
         if (op==0x63)       { push(w+1); push((int)(((g_base+(uint32_t)w*4)+rv_bimm(instr)-g_base)>>2)); }   // branch: fall-through + target
         else if (op==0x6F)  { push((int)(((g_base+(uint32_t)w*4)+rv_jimm(instr)-g_base)>>2)); }              // jal: target only
@@ -2362,8 +2536,13 @@ static void rvxblk_build() {
     int ndisp = 0;
     for (int w=0; w<N; w++) if (comp[w] && g_pc2uop_h[w] != RC_BADUOP) { disp[w]=1; ndisp++; }
 
-    std::string ptx; std::vector<uint32_t> pc2idx;
+    std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
     rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp);
+    if (const char* dp = getenv("RVX_DUMP"))                 // offline ptxas experiments: <prefix><u>.ptx per unit
+        for (size_t u=0; u<ptx.size(); u++) {
+            char fn[512]; snprintf(fn, sizeof fn, "%s%zu.ptx", dp, u);
+            if (FILE* f = fopen(fn, "wb")) { fwrite(ptx[u].data(), 1, ptx[u].size(), f); fclose(f); }
+        }
 
     cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
@@ -2378,8 +2557,15 @@ static void rvxblk_build() {
     g_xtab.assign(N, 0);
     for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch (leader) words
     g_xblk_ok = getenv("RVX_OFF") ? 0 : 1;   // RVX_OFF=1 builds but disables exec (isolation probe)
-    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, ~%zu KB PTX (exec %s)\n",
-            cnt, ndisp, ptx.size()/1024, g_xblk_ok?"ON":"OFF");
+    size_t psz = 0; for (auto& u : ptx) psz += u.size();
+    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s)\n",
+            cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF");
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;     // ptxas memory-knee watch: peak build commit
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
+        fprintf(stderr,"[xblk] build peak: %.2f GB commit, %.2f GB working set\n",
+                pmc.PeakPagefileUsage/1073741824.0, pmc.PeakWorkingSetSize/1073741824.0);
+#endif
 }
 
 // Run the exec_block from g_state[0].pc for up to `budget` guest instructions. Updates g_state[0]
@@ -2450,7 +2636,7 @@ API int cuda_rvexec_blocktest() {
     int N=(int)img.size(); uint32_t base=0x1000;
     std::vector<uint8_t> comp(N,0);
     for (int w=0; w<N; w++) if (rvx_compilable(img[w]&0x7F)) comp[w]=1;   // word 8 (ebreak) stays 0
-    std::string ptx; std::vector<uint32_t> pc2idx;
+    std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
     rvx_codegen(ptx, pc2idx, img.data(), N, base, comp, comp);   // tests: every compiled word is a dispatch entry
 
     cuInit(0);
@@ -2558,7 +2744,7 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // exec_block run
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2625,7 +2811,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
         compared++;
         uint32_t ref_pc=pc;
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz2] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2683,7 +2869,7 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // random compiled subset (≈70%); never compile the ebreak
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=(rnd()%100)<70;
-        std::string ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz3] prog %d module fail\n",p); fails++; continue; }
         void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
