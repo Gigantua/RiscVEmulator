@@ -3,20 +3,20 @@
 // Every flag preserves the rvcud↔rv32i bit-identical verify gate — they change cache policy, memory
 // staging, or uop COUNT, never the architectural result. Validate each with the gate, then read the
 // Doom "RV32I MIPS = uop-throughput × fusion-ratio" bench line (+FPS cross-check). See IDEA_BeyondTenMips.md.
-//   RVCUD_CPASYNC   §1  cp.async/LDGSTS-stream the COPYLOOP source through a shared double-buffer
-//                       (overlaps the ~400-cyc global read behind the store). Single-Doom only (ncores==1).
-//   RVCUD_STREAM_FB §3  stores to the framebuffer region (addr ≥ FB_BASE) use st.global.wt (write-through,
-//                       L1-bypass) so the constant FB writes don't evict hot read data from L1.
+//   RVCUD_CPASYNC   §1  cp.async/LDGSTS-stream a detected unit-stride memcpy loop's source through a
+//                       shared double-buffer (overlaps the global read behind the store). Single-core
+//                       only (ncores==1, where guest RAM is linear). GENERIC — keys on the copy-loop
+//                       instruction pattern, not on any guest address.
 //   RVCUD_BITFIELD  §8  fuse `srli rt,rs,k ; andi rd,rt,mask` → one BFE uop (rd = (rs>>k)&mask); the
-//                       shift temp never reaches the shared regfile. Targets Doom's texel bit-math.
+//                       shift temp never reaches the shared regfile. GENERIC bit-field extract pattern.
 #ifndef RVCUD_CPASYNC
 #define RVCUD_CPASYNC 0
 #endif
-#ifndef RVCUD_STREAM_FB
-#define RVCUD_STREAM_FB 0
-#endif
 #ifndef RVCUD_BITFIELD
 #define RVCUD_BITFIELD 0
+#endif
+#ifndef RVCUD_HOTHIST       // profiling only: count per-uop executions on core 0, dump CSV (ui,pc,class,count) on shutdown
+#define RVCUD_HOTHIST 0
 #endif
 #ifndef RVCUD_LOADFWD       // #5  static redundant-load elimination: a load matching an earlier same-block
 #define RVCUD_LOADFWD 0     //     load (base unchanged, no store between) → register copy, no memory op
@@ -33,7 +33,6 @@
 #endif
 
 static constexpr uint32_t HALT_BIT = 0x80000000u;
-static constexpr uint32_t FB_BASE  = 0x20000000u;   // guest framebuffer base (Doom present target); used by RVCUD_STREAM_FB
 
 struct CoreState { uint32_t regs[32], pc; };
 
@@ -82,37 +81,6 @@ template<class T> static __device__ __forceinline__ void st_i(uint32_t* m, int n
         uint32_t mask = 0xFFu << off;
         m[i0] = (m[i0] & ~mask) | ((uint32_t)(uint8_t)v << off);
     }
-}
-
-#if RVCUD_STREAM_FB
-// Write-through word store (st.global.wt): updates DRAM/L2 and bypasses keeping the line in L1, so the
-// renderer's constant framebuffer writes don't evict hot read data. Same bytes as st_i — gate-identical.
-static __device__ __forceinline__ void stwt32(uint32_t* p, uint32_t v) {
-    asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
-}
-template<class T> static __device__ __forceinline__ void sts_i(uint32_t* m, int nc, int id, uint32_t a, T v) {
-    uint32_t w = a >> 2, off = (a & 3u) << 3; size_t i0 = (size_t)w * nc + id;   // mirrors st_i; writes go through wt
-    if constexpr (sizeof(T) == 4) {
-        if (off == 0) { stwt32(&m[i0], (uint32_t)v); return; }
-        size_t i1 = (size_t)(w + 1) * nc + id; uint32_t lomask = (1u << off) - 1u;
-        stwt32(&m[i0], (m[i0] & lomask)  | ((uint32_t)v << off));
-        stwt32(&m[i1], (m[i1] & ~lomask) | ((uint32_t)v >> (32 - off)));
-    } else if constexpr (sizeof(T) == 2) {
-        uint32_t vv = (uint16_t)v;
-        if (off <= 16) { uint32_t mask = 0xFFFFu << off; stwt32(&m[i0], (m[i0] & ~mask) | (vv << off)); }
-        else { size_t i1 = (size_t)(w + 1) * nc + id;
-               stwt32(&m[i0], (m[i0] & 0x00FFFFFFu) | (vv << 24));
-               stwt32(&m[i1], (m[i1] & 0xFFFFFF00u) | (vv >> 8)); }
-    } else { uint32_t mask = 0xFFu << off; stwt32(&m[i0], (m[i0] & ~mask) | ((uint32_t)(uint8_t)v << off)); }
-}
-#endif
-// Store router: framebuffer-region stores stream (write-through) when RVCUD_STREAM_FB is on; otherwise
-// identical to st_i (the compare folds away when the flag is off → zero cost on the default path).
-template<class T> static __device__ __forceinline__ void st_route(uint32_t* m, int nc, int id, uint32_t a, T v) {
-#if RVCUD_STREAM_FB
-    if (a >= FB_BASE) { sts_i<T>(m, nc, id, a, v); return; }
-#endif
-    st_i<T>(m, nc, id, a, v);
 }
 
 static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, uint32_t a2u,
@@ -255,8 +223,13 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_CONST=0x37, RC_LEA=0x1B, RC_ADDC=0x2B, RC_JAL=0x6F, RC_JALR=0x67, RC_NOP=0x0F,
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65,
-       RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_ILL=0x00 };
+       RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
+       RC_PALEXP=0x4F, RC_ILL=0x00 };
+       // RC_PALEXP: 8bpp→32bpp palette-expand loop (idx=src++; p=pal+3*idx; dst[0..2]=rgb; dst[3]=A; dst+=4)
+       //   → one native whole-loop uop. The 8→32 present/blit idiom; matched by structure, generic.
        // RC_BFE (RVCUD_BITFIELD): rd = (rs >> k) & mask  — fused srli+andi; 0x09 is a free sparse code.
+       // RC_DIVLOOP: clang's rv32i bit-serial restoring-division loop (the body shared by __udivsi3/__divsi3,
+       //   ~416 guest instrs) → ONE hardware divide. Q=N/D, R=N%D, counter→-1. CPU-validated 8M cases.
        // COPYLOOP: byte-memcpy loop; MEXT: mulh*/div*/rem*; MULLOOP: whole shift-add software-multiply loop → 1 hw multiply
 enum { RP_UNC=0, RP_GP=1, RP_GNP=2, RP_SETP=3 };   // uop predicate: unconditional / guard-P / guard-!P / set-P
 static constexpr uint32_t RC_BADUOP = 0x80000000u;   // pc2uop sentinel: not a uop leader → halt on landing
@@ -268,6 +241,9 @@ static constexpr uint32_t RC_BADUOP = 0x80000000u;   // pc2uop sentinel: not a u
      | ((uint32_t)(pred)<<26) | ((uint32_t)(selc)<<29))
 
 __device__ unsigned long long g_dev_iters = 0;   // DEBUG: total uop-loop iterations (core 0) — clock-independent
+#if RVCUD_HOTHIST
+__device__ unsigned long long* g_dev_hot = nullptr;   // profiling: per-uop execution count (core 0)
+#endif
 __global__ void __launch_bounds__(256)
 rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2* __restrict__ uops, const uint8_t* __restrict__ uw,
              const uint32_t* __restrict__ pc2uop, const uint32_t* __restrict__ uop2pc,
@@ -292,6 +268,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
     int gi = 0; unsigned long long iters = 0;
     for (; gi < budget && (int32_t)ui >= 0; ) {
         iters++;
+#if RVCUD_HOTHIST
+        if (id == 0 && g_dev_hot) g_dev_hot[ui]++;          // profiling only (perturbs MIPS; off by default)
+#endif
         const uint32_t w0 = __ldg(&uops[ui].x);     // two 32-bit loads, one cache line (never LDG.E.64)
         const uint32_t w1 = __ldg(&uops[ui].y);
         const uint32_t cls  = w0 & 0x7F;
@@ -331,9 +310,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
                           default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // f3==5 (translator validated {0,1,2,4,5})
         else if (cls == RC_ST) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
-            if (live) switch (f3) { case 0: st_route<uint8_t> (mem,ncores,id,a,(uint8_t)u2);  break;
-                                    case 1: st_route<uint16_t>(mem,ncores,id,a,(uint16_t)u2); break;
-                                    default:st_route<uint32_t>(mem,ncores,id,a,u2); }           // @p st.global when predicated
+            if (live) switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)u2);  break;
+                                    case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)u2); break;
+                                    default:st_i<uint32_t>(mem,ncores,id,a,u2); }           // @p st.global when predicated
             ui += 1; gi += live ? wt : 0; continue; }    // count only if the guest would have run it
         else if (cls == RC_BR) {
             int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
@@ -349,9 +328,9 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             regs[(w0>>12)&0x1F] = u1 + w1;               // rd != base (translator-enforced) → both writes safe
             pf_i(mem, ncores, id, u1 + w1); }            // prefetch next iteration's source (this loop's stride)
         else if (cls == RC_STOREPI) {                    // store[base] = rs2; base += w1  (store + post-increment)
-            switch (f3) { case 0: st_route<uint8_t> (mem,ncores,id,u1,(uint8_t)u2);  break;
-                          case 1: st_route<uint16_t>(mem,ncores,id,u1,(uint16_t)u2); break;
-                          default:st_route<uint32_t>(mem,ncores,id,u1,u2); }
+            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,u1,(uint8_t)u2);  break;
+                          case 1: st_i<uint16_t>(mem,ncores,id,u1,(uint16_t)u2); break;
+                          default:st_i<uint32_t>(mem,ncores,id,u1,u2); }
             regs[(w0>>12)&0x1F] = u1 + w1; ui += 1; gi += wt; continue; }
         else if (cls == RC_LDX) { uint32_t a = u1 + u2 + w1;          // rd = mem[ra+rb+imm]  (add + load → 1 uop)
             switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
@@ -363,11 +342,11 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_COPYPI) {                     // mem[dst]=mem[src]; rt=loaded; src+=Ks; dst+=Kd  (lb;sb;addi;addi → 1 uop)
             uint32_t t;                                  // u1=src base, u2=dst base; w1 = Ks(lo16) | Kd(hi16); rt = rd field
             switch (f3) {                                // t = sign/zero-extended load (mirrors lb/lbu/lh/lhu/lw); store uses low bits
-                case 0: t=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,u1); st_route<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
-                case 1: t=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,u1); st_route<uint16_t>(mem,ncores,id,u2,(uint16_t)t); break;
-                case 2: t=                   ld_i<uint32_t>(mem,ncores,id,u1); st_route<uint32_t>(mem,ncores,id,u2,t);           break;
-                case 4: t=                   ld_i<uint8_t> (mem,ncores,id,u1); st_route<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
-                default:t=                   ld_i<uint16_t>(mem,ncores,id,u1); st_route<uint16_t>(mem,ncores,id,u2,(uint16_t)t); }
+                case 0: t=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,u1); st_i<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
+                case 1: t=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,u1); st_i<uint16_t>(mem,ncores,id,u2,(uint16_t)t); break;
+                case 2: t=                   ld_i<uint32_t>(mem,ncores,id,u1); st_i<uint32_t>(mem,ncores,id,u2,t);           break;
+                case 4: t=                   ld_i<uint8_t> (mem,ncores,id,u1); st_i<uint8_t> (mem,ncores,id,u2,(uint8_t)t);  break;
+                default:t=                   ld_i<uint16_t>(mem,ncores,id,u1); st_i<uint16_t>(mem,ncores,id,u2,(uint16_t)t); }
             if (rd) regs[rd] = t;                                                  // rt = loaded value (rt != src,dst)
             regs[(w0>>12)&0x1F] = u1 + (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFF);   // src += Ks
             regs[(w0>>17)&0x1F] = u2 + (uint32_t)(int32_t)(int16_t)(w1 >> 16);      // dst += Kd
@@ -384,11 +363,22 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             uint32_t ft = w1 & 0x00FFFFFFu;
             if (ft == 0x00FFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 28; break; } // 7 words; unresolved → translate-on-miss
             ui = ft; continue; }
+        else if (cls == RC_DIVLOOP) {                    // bit-serial restoring-division loop → one hardware divide
+            uint32_t Rr=(w0>>12)&0x1F, Nr=(w0>>17)&0x1F; // rd=Q (quotient); rs1=R (remainder); rs2=N (dividend)
+            uint32_t Dr=(w1>>22)&0x1F, ir=(w1>>27)&0x1F; // D=divisor; i=down-counter (→ -1). Matcher verified the
+            uint32_t Nv=regs[Nr], Dv=regs[Dr];           // prologue sets R=0,Q=0,i=31,ONE=1,NEG1=-1 (32-bit udiv).
+            regs[rd] = Dv ? (Nv / Dv) : 0xFFFFFFFFu;     // Q = N / D
+            regs[Rr] = Dv ? (Nv % Dv) : Nv;              // R = N % D
+            regs[ir] = 0xFFFFFFFFu;                      // counter ends at -1
+            gi += 13u * 32u;                             // 13 instrs × 32 iterations (EXACT retired count)
+            uint32_t ft = w1 & 0x003FFFFFu;              // low 22 bits = fall-through uop index (baked Pass 3)
+            if (ft == 0x003FFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 13*4; break; }  // unresolved → translate-on-miss
+            ui = ft; continue; }
         else if (cls == RC_STX) { uint32_t a = u1 + u2 + w1;          // mem[ra+rb+imm] = rc  (add + store → 1 uop)
             uint32_t val = regs[(w0>>7)&0x1F];                        // rc carried in the rd field
-            switch (f3) { case 0: st_route<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
-                          case 1: st_route<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
-                          default:st_route<uint32_t>(mem,ncores,id,a,val); }
+            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
+                          case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
+                          default:st_i<uint32_t>(mem,ncores,id,a,val); }
             ui += 1; gi += wt; continue; }
         else if (cls == RC_INCBR) {                                             // counted loop: rc += K; if (rc cmp rX) goto T
             int32_t inc = (int32_t)w1 >> 24;                                     // signed high byte = increment
@@ -411,7 +401,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 __shared__ uint32_t s_cp[2][4];            // two 16-B stages, one thread (block==1) → +32 B shared
                 char* const gm = (char*)mem;
                 while ((s & 15u) && (cdst ? d : s) != L && gi < budget) {   // align src to 16 B (cp.async.cg wants 16-B align)
-                    st_route<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s)); s++; d++; gi += 5; }
+                    st_i<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s)); s++; d++; gi += 5; }
                 int cur = 0; bool inflight = false;
                 while ((L - (cdst ? d : s)) >= 16u && (((d>s)?(d-s):(s-d)) >= 16u) && gi < budget) {
                     if (!inflight) { __pipeline_memcpy_async(&s_cp[cur][0], gm + s, 16); __pipeline_commit(); }
@@ -419,10 +409,10 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                     bool haveNext = ((L - (cdst ? d : s) - 16u) >= 16u) && (gi + 80 < budget);
                     if (haveNext) { __pipeline_memcpy_async(&s_cp[nxt][0], gm + s + 16u, 16); __pipeline_commit(); }
                     __pipeline_wait_prior(haveNext ? 1 : 0);   // current stage filled
-                    st_route<uint32_t>(mem,ncores,id,d,    s_cp[cur][0]);
-                    st_route<uint32_t>(mem,ncores,id,d+4,  s_cp[cur][1]);
-                    st_route<uint32_t>(mem,ncores,id,d+8,  s_cp[cur][2]);
-                    st_route<uint32_t>(mem,ncores,id,d+12, s_cp[cur][3]);
+                    st_i<uint32_t>(mem,ncores,id,d,    s_cp[cur][0]);
+                    st_i<uint32_t>(mem,ncores,id,d+4,  s_cp[cur][1]);
+                    st_i<uint32_t>(mem,ncores,id,d+8,  s_cp[cur][2]);
+                    st_i<uint32_t>(mem,ncores,id,d+12, s_cp[cur][3]);
                     s += 16u; d += 16u; gi += 80;              // 16 bytes × 5 guest instrs
                     cur = nxt; inflight = haveNext;
                 }
@@ -433,10 +423,10 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 uint32_t cnt = cdst ? d : s, rem = L - cnt, adiff = (d > s) ? (d - s) : (s - d);
                 pf_i(mem, ncores, id, s + 96);                 // prefetch source ~96B ahead of the copy cursor
                 if (rem >= 4u && adiff >= 4u) {                // word copy: ≥4 to go AND non-overlapping within the word
-                    st_route<uint32_t>(mem,ncores,id,d, ld_i<uint32_t>(mem,ncores,id,s));
+                    st_i<uint32_t>(mem,ncores,id,d, ld_i<uint32_t>(mem,ncores,id,s));
                     s += 4; d += 4; gi += 20;                  // 4 byte-iterations (×5 guest instrs)
                 } else {                                       // byte copy (tail / overlap)
-                    st_route<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s));
+                    st_i<uint8_t>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t>(mem,ncores,id,s));
                     s += 1; d += 1; gi += 5;
                 }
             }
@@ -479,6 +469,24 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             // demand (translate-on-miss), then resume. tgt itself is a valid in-range code address.
             if (n2 & 0x80000000u) { resume_pc = (tw < (uint32_t)nwords) ? tgt : HALT_BIT; break; }
             ui = n2; continue; }
+        else if (cls == RC_PALEXP) {                     // 8bpp→32bpp palette expand: whole loop, native
+            uint32_t SRC=regs[(w0>>7)&0x1F], DST=regs[(w0>>12)&0x1F], PAL=regs[(w0>>17)&0x1F];
+            uint32_t END=regs[(w1>>22)&0x1F], A=regs[(w1>>27)&0x1F];   // END, ALPHA invariant; PAL invariant
+            while (SRC != END && gi < budget) {                       // mirrors the guest body in program order
+                uint32_t p = PAL + 3u * ld_i<uint8_t>(mem,ncores,id,SRC);
+                st_i<uint8_t>(mem,ncores,id,DST-3,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p));     // R
+                st_i<uint8_t>(mem,ncores,id,DST-2,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p+1));   // G
+                st_i<uint8_t>(mem,ncores,id,DST-1,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p+2));   // B
+                st_i<uint8_t>(mem,ncores,id,DST,(uint8_t)A);                                    // alpha (const)
+                SRC += 1; DST += 4; gi += 14;                          // 14 guest instrs/iteration
+            }
+            regs[(w0>>7)&0x1F] = SRC; regs[(w0>>12)&0x1F] = DST;       // SRC→END, DST advanced
+            if (SRC == END) {                                          // loop done → fall through
+                uint32_t ft = w1 & 0x003FFFFFu;
+                if (ft == 0x003FFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 14*4; break; }
+                ui = ft;
+            }                                                          // else budget-cut → ui stays, resume here
+            continue; }
         else if (cls == RC_NOP)  { ui += 1; gi += wt; continue; }
         else { ui |= HALT_BIT; continue; }                                       // RC_ILL
 
@@ -507,6 +515,9 @@ static int        g_nuops   = 0;
 static int        g_pc2words = 0;       // length of pc2uop[] = translated code words (NOT total memory words)
 static uint32_t   g_base    = 0;
 static unsigned long long* g_ret = nullptr;  // core-0 retired guest-instruction count (verify gate)
+#if RVCUD_HOTHIST
+static unsigned long long* g_hot_host = nullptr;   // managed mirror of the per-uop execution histogram
+#endif
 // Translate-on-miss state (host mirrors, so an untranslated indirect-jump target can be translated
 // lazily and appended without re-doing the whole image). g_uopcap = device capacity in uops.
 static std::vector<uint32_t> g_img;          // guest code words (persisted)
@@ -1123,6 +1134,141 @@ static int rvcud_try_mulloop(RvcudBuild& B, int w, uint32_t& ui) {
     return 7;
 }
 
+// SOFTWARE-DIVIDE LOOP → DIVLOOP. clang's rv32i bit-serial restoring division (the body shared by
+// __udivsi3 and __divsi3, and entered with R=0/Q=0/i=31/ONE=1/NEG1=-1) is a 13-instruction loop:
+//   slli R,R,1; srl T1,N,i; sll T2,ONE,i; addi i,i,-1; andi T1,T1,1; or R,T1,R; sltu T1,R,D;
+//   addi T1,T1,-1; and T2,T1,T2; and T1,T1,D; or Q,T2,Q; sub R,R,T1; bne i,NEG1,→top
+// computing Q=N/D, R=N%D over 32 bits MSB-first. Replaced by ONE uop doing a hardware divide and the
+// EXACT final state (Q=N/D, R=N%D, counter i→-1). The prologue inits (i=31,R=0,Q=0,ONE=1,NEG1=-1) are
+// VERIFIED so the closed form is exact (CPU-validated, 8M cases, test_divloop.cpp). Matches by structure
+// (any regs) so it fires on every call site of __udivsi3/__divsi3. Consumes 13 words. Generic — keys on
+// the division idiom, not on any guest address. weight = 13×32 = 416 retired guest instrs (exact).
+static int rvcud_try_divloop(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+13 >= N) return 0;                                          // 13 body words + a fall-through instr
+    uint32_t i0=img[w],i1=img[w+1],i2=img[w+2],i3=img[w+3],i4=img[w+4],i5=img[w+5],
+             i6=img[w+6],i7=img[w+7],i8=img[w+8],i9=img[w+9],i10=img[w+10],i11=img[w+11],i12=img[w+12];
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;};
+    if ((i0&0x7F)!=0x13 || F3(i0)!=1 || S2(i0)!=1) return 0;          // slli R,R,1
+    uint32_t R=RD(i0); if (S1(i0)!=R || R==0) return 0;
+    if ((i1&0x7F)!=0x33 || F3(i1)!=5 || F7(i1)!=0) return 0;          // srl T1,N,i
+    uint32_t T1=RD(i1), Nr=S1(i1), ir=S2(i1);
+    if ((i2&0x7F)!=0x33 || F3(i2)!=1 || F7(i2)!=0 || S2(i2)!=ir) return 0;   // sll T2,ONE,i
+    uint32_t T2=RD(i2), ONE=S1(i2);
+    if ((i3&0x7F)!=0x13 || F3(i3)!=0 || RD(i3)!=ir || S1(i3)!=ir || (int32_t)rv_iimm(i3)!=-1) return 0;  // addi i,i,-1
+    if ((i4&0x7F)!=0x13 || F3(i4)!=7 || RD(i4)!=T1 || S1(i4)!=T1 || rv_iimm(i4)!=1) return 0;            // andi T1,T1,1
+    if ((i5&0x7F)!=0x33 || F3(i5)!=6 || F7(i5)!=0 || RD(i5)!=R) return 0;                                // or R,T1,R
+    if (!((S1(i5)==T1&&S2(i5)==R)||(S1(i5)==R&&S2(i5)==T1))) return 0;
+    if ((i6&0x7F)!=0x33 || F3(i6)!=3 || F7(i6)!=0 || RD(i6)!=T1 || S1(i6)!=R) return 0;                  // sltu T1,R,D
+    uint32_t Dr=S2(i6);
+    if ((i7&0x7F)!=0x13 || F3(i7)!=0 || RD(i7)!=T1 || S1(i7)!=T1 || (int32_t)rv_iimm(i7)!=-1) return 0;   // addi T1,T1,-1
+    if ((i8&0x7F)!=0x33 || F3(i8)!=7 || F7(i8)!=0 || RD(i8)!=T2) return 0;                                // and T2,T1,T2
+    if (!((S1(i8)==T1&&S2(i8)==T2)||(S1(i8)==T2&&S2(i8)==T1))) return 0;
+    if ((i9&0x7F)!=0x33 || F3(i9)!=7 || F7(i9)!=0 || RD(i9)!=T1) return 0;                                // and T1,T1,D
+    if (!((S1(i9)==T1&&S2(i9)==Dr)||(S1(i9)==Dr&&S2(i9)==T1))) return 0;
+    if ((i10&0x7F)!=0x33 || F3(i10)!=6 || F7(i10)!=0) return 0;                                           // or Q,T2,Q
+    uint32_t Q=RD(i10);
+    if (!((S1(i10)==T2&&S2(i10)==Q)||(S1(i10)==Q&&S2(i10)==T2))) return 0;
+    if ((i11&0x7F)!=0x33 || F3(i11)!=0 || F7(i11)!=0x20 || RD(i11)!=R || S1(i11)!=R || S2(i11)!=T1) return 0;  // sub R,R,T1
+    if ((i12&0x7F)!=0x63 || F3(i12)!=1) return 0;                                                         // bne i,NEG1,→top
+    uint32_t bb1=S1(i12), bb2=S2(i12), NEG1;
+    if (bb1==ir) NEG1=bb2; else if (bb2==ir) NEG1=bb1; else return 0;
+    uint32_t bpc=B.base+(uint32_t)(w+12)*4, tw=(bpc+rv_bimm(i12)-B.base)>>2;
+    if ((int)tw != w) return 0;                                      // back-edge to the loop header
+    // role registers nonzero & the data regs distinct (consts ONE/NEG1 may not clash with data)
+    if (R==0||Nr==0||Dr==0||ir==0||Q==0||T1==0||T2==0||ONE==0||NEG1==0) return 0;
+    if (R==Nr||R==Dr||R==Q||R==ir||Nr==Dr||Q==ir||T1==T2||R==T1||R==T2) return 0;
+    // VERIFY the prologue establishes the standard entry (so the closed form is exact). Scan back within
+    // the block for li i,31 / li R,0 / li Q,0 / li ONE,1 / li NEG1,-1 (addi rd,x0,imm).
+    bool gI=false,gR=false,gQ=false,gONE=false,gNEG=false;
+    for (int j=w-1; j>=0 && j>=w-24; j--) {
+        uint32_t in=img[j];
+        bool li0 = ((in&0x7F)==0x13 && F3(in)==0 && S1(in)==0);      // addi rd,x0,imm == li rd,imm
+        if (li0) { uint32_t rd=RD(in); int32_t k=(int32_t)rv_iimm(in);
+            if (rd==ir   && k==31) gI=true;
+            if (rd==R    && k==0)  gR=true;
+            if (rd==Q    && k==0)  gQ=true;
+            if (rd==ONE  && k==1)  gONE=true;
+            if (rd==NEG1 && k==-1) gNEG=true; }
+        if (B.leader[j]) break;                                      // don't cross into another block
+    }
+    if (!(gI&&gR&&gQ&&gONE&&gNEG)) return 0;
+    B.pc2uop[w] = ui;
+    B.w0.push_back(RC_DIVLOOP | (Q<<7) | (R<<12) | (Nr<<17));         // rd=Q, rs1=R, rs2=N (pred bits 0 ⇒ RP_UNC)
+    B.w1.push_back((Dr<<22) | (ir<<27));                             // low 22 = fall-through (Pass 3); D[26:22]; i[31:27]
+    B.uw.push_back(13); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+13)); ui++;
+    return 13;
+}
+
+// PALETTE-EXPAND LOOP → PALEXP. The 8bpp→32bpp present/blit idiom clang emits as a 14-instruction loop:
+//   lbu IDX,0(SRC); addi SRC,SRC,1; slli T,IDX,1; add P,PAL,IDX; add P,P,T; lbu C,0(P); sb C,-3(DST);
+//   lbu C,1(P); sb C,-2(DST); lbu C,2(P); sb C,-1(DST); sb ALPHA,0(DST); addi DST,DST,4; bne SRC,END,top
+// i.e. for each source palette byte: P = PAL + 3*IDX; write {pal[P],pal[P+1],pal[P+2],ALPHA} as RGBA to
+// DST; SRC++; DST+=4. Replaced by ONE native whole-loop uop. PAL/ALPHA/END are loop-invariant. Matched by
+// structure (any regs) → generic (no guest addresses). Consumes 14 words. weight = 14 retired/iteration.
+static int rvcud_try_palexp(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+14 >= N) return 0;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;};
+    uint32_t i0=img[w],i1=img[w+1],i2=img[w+2],i3=img[w+3],i4=img[w+4],i5=img[w+5],i6=img[w+6],
+             i7=img[w+7],i8=img[w+8],i9=img[w+9],i10=img[w+10],i11=img[w+11],i12=img[w+12],i13=img[w+13];
+    // w+0: lbu IDX,0(SRC)
+    if ((i0&0x7F)!=0x03 || F3(i0)!=4 || rv_iimm(i0)!=0) return 0;
+    uint32_t IDX=RD(i0), SRC=S1(i0);
+    // w+1: addi SRC,SRC,1
+    if ((i1&0x7F)!=0x13 || F3(i1)!=0 || RD(i1)!=SRC || S1(i1)!=SRC || rv_iimm(i1)!=1) return 0;
+    // w+2: slli T,IDX,1
+    if ((i2&0x7F)!=0x13 || F3(i2)!=1 || S1(i2)!=IDX || S2(i2)!=1) return 0;
+    uint32_t T=RD(i2);
+    // w+3: add P,PAL,IDX  (one operand is IDX)
+    if ((i3&0x7F)!=0x33 || F3(i3)!=0 || F7(i3)!=0) return 0;
+    uint32_t P=RD(i3), PAL;
+    if (S1(i3)==IDX) PAL=S2(i3); else if (S2(i3)==IDX) PAL=S1(i3); else return 0;
+    // w+4: add P,P,T
+    if ((i4&0x7F)!=0x33 || F3(i4)!=0 || F7(i4)!=0 || RD(i4)!=P) return 0;
+    if (!((S1(i4)==P&&S2(i4)==T)||(S1(i4)==T&&S2(i4)==P))) return 0;
+    // w+5: lbu C0,0(P)
+    if ((i5&0x7F)!=0x03 || F3(i5)!=4 || S1(i5)!=P || rv_iimm(i5)!=0) return 0;
+    uint32_t C0=RD(i5);
+    // w+6: sb C0,-3(DST)
+    if ((i6&0x7F)!=0x23 || F3(i6)!=0 || S2(i6)!=C0 || (int32_t)rv_simm(i6)!=-3) return 0;
+    uint32_t DST=S1(i6);
+    // w+7: lbu C1,1(P)
+    if ((i7&0x7F)!=0x03 || F3(i7)!=4 || S1(i7)!=P || rv_iimm(i7)!=1) return 0;
+    uint32_t C1=RD(i7);
+    // w+8: sb C1,-2(DST)
+    if ((i8&0x7F)!=0x23 || F3(i8)!=0 || S1(i8)!=DST || S2(i8)!=C1 || (int32_t)rv_simm(i8)!=-2) return 0;
+    // w+9: lbu C2,2(P)
+    if ((i9&0x7F)!=0x03 || F3(i9)!=4 || S1(i9)!=P || rv_iimm(i9)!=2) return 0;
+    uint32_t C2=RD(i9);
+    // w+10: sb C2,-1(DST)
+    if ((i10&0x7F)!=0x23 || F3(i10)!=0 || S1(i10)!=DST || S2(i10)!=C2 || (int32_t)rv_simm(i10)!=-1) return 0;
+    // w+11: sb ALPHA,0(DST)
+    if ((i11&0x7F)!=0x23 || F3(i11)!=0 || S1(i11)!=DST || rv_simm(i11)!=0) return 0;
+    uint32_t ALPHA=S2(i11);
+    // w+12: addi DST,DST,4
+    if ((i12&0x7F)!=0x13 || F3(i12)!=0 || RD(i12)!=DST || S1(i12)!=DST || rv_iimm(i12)!=4) return 0;
+    // w+13: bne SRC,END,→w
+    if ((i13&0x7F)!=0x63 || F3(i13)!=1) return 0;
+    uint32_t END;
+    if (S1(i13)==SRC) END=S2(i13); else if (S2(i13)==SRC) END=S1(i13); else return 0;
+    uint32_t bpc=B.base+(uint32_t)(w+13)*4, tw=(bpc+rv_bimm(i13)-B.base)>>2;
+    if ((int)tw != w) return 0;                                      // back-edge to the loop header
+    // the five live registers must be distinct & nonzero (SRC,DST,PAL,END,ALPHA); PAL,END,ALPHA invariant
+    if (SRC==0||DST==0||PAL==0||END==0||ALPHA==0) return 0;
+    if (SRC==DST||SRC==PAL||SRC==END||DST==PAL||DST==END||DST==ALPHA||SRC==ALPHA) return 0;
+    if (PAL==SRC||PAL==DST) return 0;
+    B.pc2uop[w] = ui;
+    B.w0.push_back(RC_PALEXP | (SRC<<7) | (DST<<12) | (PAL<<17));     // rd=SRC, rs1=DST, rs2=PAL (pred bits 0)
+    B.w1.push_back((END<<22) | (ALPHA<<27));                         // low 22 = fall-through (Pass 3); END[26:22]; ALPHA[31:27]
+    B.uw.push_back(14); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+14)); ui++;
+    return 14;
+}
+
 #if RVCUD_LOADFWD
 // STATIC REDUNDANT-LOAD ELIMINATION (#5). A load whose (base,offset,width,sign=f3) matches an EARLIER
 // load in the SAME basic block — with the base register unchanged and NO store between (conservative
@@ -1178,6 +1324,8 @@ static void rvcud_build(RvcudBuild& B) {
     uint32_t ui = 0;
     for (int w = 0; w < N; ) {
         int consumed = rvcud_try_mulloop(B, w, ui);                // shift-add software-multiply loop → 1 hw multiply
+        if (consumed == 0) consumed = rvcud_try_divloop(B, w, ui);  // bit-serial software-divide loop → 1 hw divide
+        if (consumed == 0) consumed = rvcud_try_palexp(B, w, ui);   // 8bpp→32bpp palette-expand loop → 1 native loop uop
         if (consumed == 0) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
         if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
@@ -1214,6 +1362,11 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t tw = B.tgt[i];
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x00FFFFFFu) : 0x00FFFFFFu;
             B.w1[i] = (B.w1[i] & 0xFF000000u) | idx;
+        }
+        else if (cls == RC_DIVLOOP || cls == RC_PALEXP) {            // preserve bits[31:22] (regs); bake fall-through into low 22
+            uint32_t tw = B.tgt[i];
+            uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x003FFFFFu) : 0x003FFFFFu;
+            B.w1[i] = (B.w1[i] & 0xFFC00000u) | idx;
         }
     }
 }
@@ -1301,6 +1454,11 @@ static bool rvcud_translate_miss(uint32_t pc) {
 API int cuda_rvcud_step_all(int budget) {
     if (g_ncores <= 0 || g_nuops <= 0) return -1;
     if (!g_ret) cudaMallocManaged(&g_ret, sizeof(unsigned long long));
+#if RVCUD_HOTHIST
+    { static unsigned long long* hot = nullptr;
+      if (!hot) { cudaMallocManaged(&hot, (size_t)g_uopcap * 8); cudaMemset(hot, 0, (size_t)g_uopcap * 8);
+                  cudaMemcpyToSymbol(g_dev_hot, &hot, sizeof(hot)); g_hot_host = hot; } }
+#endif
     int block = g_ncores < 64 ? g_ncores : 64;       // 2-warp blocks (SM coverage)
     int grid  = (g_ncores + block - 1) / block;
     size_t shmem = (size_t)block * 33 * sizeof(uint32_t);   // 33-stride regfile
@@ -1335,6 +1493,16 @@ API unsigned long long cuda_rvcud_retired() { return g_ret ? *g_ret : 0ull; }
 API unsigned long long cuda_rvcud_iters() { unsigned long long h=0; cudaMemcpyFromSymbol(&h,g_dev_iters,sizeof(h)); return h; }
 
 API void cuda_rv32i_shutdown() {
+#if RVCUD_HOTHIST
+    if (g_hot_host && !g_u2pch.empty()) {
+        cudaDeviceSynchronize();
+        FILE* f = fopen("C:\\work\\RiscV\\RiscVEmulator\\RiscVEmulator-RV32I-CUDA\\Native\\hot.csv", "w");
+        if (f) { fprintf(f, "ui,pc,class,count\n");
+            for (int i = 0; i < g_nuops; i++)
+                if (g_hot_host[i]) fprintf(f, "%d,%u,0x%02X,%llu\n", i, g_u2pch[i], g_w0h[i] & 0x7F, g_hot_host[i]);
+            fclose(f); }
+    }
+#endif
     rvcud_free();
     if (g_ret) { cudaFree(g_ret); g_ret = nullptr; }
     if (g_mem)  { cudaFree(g_mem);  g_mem  = nullptr; }
