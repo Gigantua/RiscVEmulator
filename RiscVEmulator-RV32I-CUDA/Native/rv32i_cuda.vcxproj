@@ -41,7 +41,7 @@
     <VcVars Condition="'$(VsInstallRoot)'==''">"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"</VcVars>
     <NvccArch Condition="'$(Configuration)'=='Debug'">-G -g</NvccArch>
     <NvccArch Condition="'$(Configuration)'=='Release'">-O3</NvccArch>
-    <NMakeBuildCommandLine>call $(VcVars) &gt;nul 2&gt;&amp;1 &amp;&amp; nvcc $(NvccArch) -std=c++20 --expt-relaxed-constexpr -arch=sm_86 -shared -cudart static -o "$(OutDir)rv32i_cuda.dll" "$(ProjectDir)rv32i_cuda.cu" -lcuda
+    <NMakeBuildCommandLine>call $(VcVars) &gt;nul 2&gt;&amp;1 &amp;&amp; nvcc $(NvccArch) -std=c++20 --expt-relaxed-constexpr -arch=sm_86 -diag-suppress 549 -shared -cudart static -o "$(OutDir)rv32i_cuda.dll" "$(ProjectDir)rv32i_cuda.cu" -lcuda</NMakeBuildCommandLine>
     <NMakeReBuildCommandLine>$(NMakeBuildCommandLine)</NMakeReBuildCommandLine>
     <NMakeCleanCommandLine>if exist "$(OutDir)rv32i_cuda.dll" del /q "$(OutDir)rv32i_cuda.dll"</NMakeCleanCommandLine>
     <NMakeOutput>$(OutDir)rv32i_cuda.dll</NMakeOutput>
