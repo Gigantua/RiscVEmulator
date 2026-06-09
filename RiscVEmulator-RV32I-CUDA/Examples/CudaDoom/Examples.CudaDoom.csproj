@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Core\RiscVEmulator.Core.csproj" />
+    <ProjectReference Include="..\..\Frontend\RiscVEmulator.Frontend.csproj" />
+    <ProjectReference Include="..\..\Native\rv32i_cuda.vcxproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Examples.CudaDoom</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\Native\bin\Release\rv32i_cuda.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>rv32i_cuda.dll</Link>
+      <Visible>false</Visible>
+    </Content>
+    <!-- Shareware DOOM WAD (lives beside this example). -->
+    <Content Include="doom1.wad">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>doom1.wad</Link>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+</Project>

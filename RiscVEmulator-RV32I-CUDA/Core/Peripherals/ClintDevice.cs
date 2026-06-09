@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 
 namespace RiscVEmulator.Core.Peripherals
 {
@@ -13,8 +12,8 @@ namespace RiscVEmulator.Core.Peripherals
     /// only has an MTIP interrupt input pin, exactly like the MEIP pin the
     /// PLIC drives.
     ///
-    /// <see cref="Tick"/> is polled by the <see cref="Emulator"/> between CPU
-    /// step batches: it raises/lowers MTIP when mtime crosses mtimecmp.
+    /// <see cref="Tick"/> is polled between CPU step batches: it raises/lowers
+    /// MTIP when mtime crosses mtimecmp.
     /// </summary>
     public sealed class ClintDevice : IPeripheral
     {
@@ -26,8 +25,6 @@ namespace RiscVEmulator.Core.Peripherals
         public bool IsGuarded   => true;
 
         public ClintDevice(uint baseAddress = 0x02000000u) { BaseAddress = baseAddress; }
-
-        [DllImport("rv32i_core")] private static extern void rv32i_set_mtip(int level);
 
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private ulong _mtimecmp = ulong.MaxValue;
@@ -51,11 +48,10 @@ namespace RiscVEmulator.Core.Peripherals
         public void Tick() => RefreshMtip();
 
         // MTIP is level-sensitive on (mtime >= mtimecmp), like a real CLINT
-        // comparator: it must be re-evaluated whenever either input changes —
-        // both as time advances (Tick) and the instant the guest rearms
-        // mtimecmp (Write), or a just-rearmed timer interrupt re-fires in a
-        // storm because the stale level is still asserted.
-        private void RefreshMtip() => rv32i_set_mtip(Mtime >= _mtimecmp ? 1 : 0);
+        // comparator. The CUDA core drives its own timer pin via
+        // cuda_rv32i_set_mtime, so this peripheral no longer injects MTIP into
+        // the host CPU — it only serves mtime/mtimecmp over MMIO.
+        private void RefreshMtip() { }
 
         public uint Read(uint offset, int width) => offset switch
         {

@@ -162,7 +162,10 @@ namespace RiscVEmulator.Core.Peripherals
         /// <summary>Toggle MEIP based on whether the M-mode context has a deliverable IRQ.</summary>
         private void UpdateCpuLines()
         {
-            Emulator.SetMachineExtIrq   (HighestPendingEnabled(0) != 0);
+            // The CUDA core owns its own external-interrupt pin
+            // (cuda_rv32i_set_meip); this peripheral no longer injects MEIP
+            // into a host CPU.
+            _ = HighestPendingEnabled(0);
         }
     }
 }

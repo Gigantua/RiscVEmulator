@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Examples.CudaBench": {
+      "commandName": "Project",
+      "commandLineArgs": "--rvcud --sweep"
+    }
+  }
+}

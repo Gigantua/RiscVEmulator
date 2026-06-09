@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "Examples.CudaTinyCC": {
+      "commandName": "Project",
+      "commandLineArgs": ""
+    }
+  }
+}

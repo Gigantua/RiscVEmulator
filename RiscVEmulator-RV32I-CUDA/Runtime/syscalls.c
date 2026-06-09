@@ -58,16 +58,22 @@ int _kill(int pid, int sig)
  * I/O — FILE DESCRIPTOR OPERATIONS
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* _write: send bytes to fd. fd=1 (stdout) and fd=2 (stderr) go to UART THR.
- * Each byte write is a guarded MMIO access — the host VEH catches the AV
- * and routes through UartDevice.Write → OutputHandler. No ecall needed. */
+/* _write: send bytes to fd. fd=1 (stdout) and fd=2 (stderr) append to the UART
+ * output ring (a head counter + 2 KiB buffer in plain memory). The CUDA core
+ * just executes these stores as ordinary memory writes; the host drains the ring
+ * after each launch. No MMIO, no device — pure memory. */
 int _write(int fd, const void *buf, unsigned int count)
 {
     if (fd == 1 || fd == 2) {
-        volatile unsigned char *uart_thr = (volatile unsigned char *)0x10000000;
+        volatile unsigned int  *uart_head = (volatile unsigned int  *)0x10000000;
+        volatile unsigned char *uart_ring = (volatile unsigned char *)0x10000800;
         const unsigned char *p = (const unsigned char *)buf;
-        for (unsigned int i = 0; i < count; i++)
-            *uart_thr = p[i];
+        unsigned int h = *uart_head;
+        for (unsigned int i = 0; i < count; i++) {
+            uart_ring[h & 0x7FF] = p[i];
+            h++;
+        }
+        *uart_head = h;
         return (int)count;
     }
     return -1;

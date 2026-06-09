@@ -10,26 +10,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Native\rv32i_core.vcxproj">
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
     <ProjectReference Include="..\Native\slirp_bridge.vcxproj">
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
     </ProjectReference>
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="..\Native\bin\$(Configuration)\rv32i_core.dll">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>rv32i_core.dll</Link>
-      <Visible>false</Visible>
-    </Content>
-    <Content Condition="'$(Configuration)'=='Debug' And Exists('..\Native\bin\Debug\rv32i_core.pdb')"
-             Include="..\Native\bin\Debug\rv32i_core.pdb">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>rv32i_core.pdb</Link>
-      <Visible>false</Visible>
-    </Content>
     <Content Include="..\Native\bin\$(Configuration)\slirp_bridge.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Link>slirp_bridge.dll</Link>

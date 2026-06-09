@@ -9,10 +9,10 @@ namespace RiscVEmulator.Core.Peripherals
     /// register file and the trap cause into the landing pad here, then jumps
     /// to the handler at <c>TRAP_VECTOR</c>; on return it reloads the file
     /// from a handler-supplied frame. Peripherals only ever *raise an
-    /// interrupt pin* (see <see cref="Emulator.SetMachineExtIrq"/> and the
-    /// CLINT's MTIP) — the CPU does the context switch itself.
+    /// interrupt pin* (MEIP from the PLIC and the CLINT's MTIP) — the CPU does
+    /// the context switch itself.
     ///
-    /// Layout (see Native/rv32i_core.cpp for the authoritative copy):
+    /// Layout (see Native/rv32i_cuda.cu for the authoritative copy):
     ///   +0x000  IE_FLAG      interrupt enable, mstatus image (bit3 MIE = on)
     ///   +0x004  TRAP_VECTOR  handler entry PC (guest writes once at boot)
     ///   +0x008  IE_MASK      per-source enable (bit7 = MTIP, bit11 = MEIP)
