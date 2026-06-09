@@ -258,7 +258,11 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
-       RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61, RC_ILL=0x00 };
+       RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61,
+       RC_WORDFILL=0x35, RC_ILL=0x00 };
+       // RC_WORDFILL: direct-form fill loop (sX VAL,0(D); addi D,D,K; bne D,END) → 1 native loop uop.
+       //   The byte-MEMSET arm matches clang's addi-temp form; this matches the temp-less direct form
+       //   (the profile's sw-based screen fill, 2 dispatched uops/iter today). Generic, any width/stride.
        // RC_TEXCOL: textured-column loop (R_DrawColumn): pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=stride;
        //   frac+=step → 1 native loop. 1D vertical TEXSPAN; params (regs/offsets/shifts/stride) in g_ext, generic.
        // RC_COPYLOOPS: strided copy loop (load rt,0(src); store rt,0(dst); src+=Ks; dst+=Kd; bne cnt,lim) → 1
@@ -446,6 +450,21 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 if (ft == 0x00FFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 16; break; }   // 4 words; unresolved → translate-on-miss
                 ui = ft; }
             continue; }
+        else if (cls == RC_WORDFILL) {                   // direct-form fill loop: sX VAL,0(D); D+=K; bne D,END,→top
+            uint32_t D = regs[rd], VAL = u1, END = u2; int32_t K = (int32_t)w1 >> 24;   // rd=D, rs1=VAL (may be x0), rs2=END
+            { uint32_t ftp = w1 & 0x00FFFFFFu;           // warm the exit dispatch's descriptor loads (hint only)
+              if (ftp != 0x00FFFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
+            do {                                         // guest stores BEFORE testing the bne (do-while shape)
+                switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,D,(uint8_t)VAL);  break;
+                              case 1: st_i<uint16_t,NC1>(mem,ncores,id,D,(uint16_t)VAL); break;
+                              default:st_i<uint32_t,NC1>(mem,ncores,id,D,VAL); }
+                D += (uint32_t)K; gi += 3;               // store + addi + bne
+            } while (D != END && gi < budget);
+            regs[rd] = D;
+            if (D == END) { uint32_t ft = w1 & 0x00FFFFFFu;
+                if (ft == 0x00FFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 12; break; }   // 3 words; unresolved → translate-on-miss
+                ui = ft; }
+            continue; }                                  // else budget-cut → ui stays, resume re-enters the loop
         else if (cls == RC_STX) { uint32_t a = u1 + u2 + w1;          // mem[ra+rb+imm] = rc  (add + store → 1 uop)
             uint32_t val = regs[(w0>>7)&0x1F];                        // rc carried in the rd field
             switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)val);  break;
@@ -1240,6 +1259,33 @@ static int rvcud_try_memset(RvcudBuild& B, int w, uint32_t& ui) {
     return 4;
 }
 
+// DIRECT-FORM FILL LOOP → WORDFILL. The temp-less fill clang emits for word/half screen clears:
+//   sX VAL,0(D) ; addi D,D,K ; bne D,END,→top   →  fill stride-K with VAL (3 instrs/iter).
+// rvcud_try_memset matches the addi-temp byte form; this matches the direct form (the ttf30 profile's
+// sw-based fill at 2 dispatched uops/iter). VAL/END loop-invariant (VAL may be x0 = zero fill); D is
+// the only written register, so the closed form is exact. Consumes 3 words; weight 3/iteration.
+static int rvcud_try_wordfill(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+3 >= N) return 0;                                          // 3 body words + a fall-through instr
+    uint32_t i0=img[w], i1=img[w+1], i2=img[w+2];
+    if ((i0&0x7F)!=0x23 || ((i0>>12)&7)>2 || rv_simm(i0)!=0) return 0;          // sb/sh/sw VAL,0(D)
+    uint32_t f3=(i0>>12)&7, D=(i0>>15)&0x1F, VAL=(i0>>20)&0x1F;
+    if (B.leader[w+1] || B.leader[w+2]) return 0;
+    if ((i1&0x7F)!=0x13 || ((i1>>12)&7)!=0 || ((i1>>7)&0x1F)!=D || ((i1>>15)&0x1F)!=D) return 0;  // addi D,D,K
+    int32_t K=(int32_t)rv_iimm(i1); if (K<-128||K>127||K==0) return 0;          // K fits w1's signed hi byte
+    if ((i2&0x7F)!=0x63 || ((i2>>12)&7)!=1) return 0;                           // bne D,END,→top
+    uint32_t b1=(i2>>15)&0x1F, b2=(i2>>20)&0x1F, END;
+    if (b1==D) END=b2; else if (b2==D) END=b1; else return 0;
+    uint32_t bpc=B.base+(uint32_t)(w+2)*4, tw=(bpc+rv_bimm(i2)-B.base)>>2;
+    if ((int)tw != w) return 0;                                                 // back-edge to the loop header
+    if (D==0 || VAL==D || END==D || END==0) return 0;                           // VAL may be x0
+    B.pc2uop[w] = ui;
+    B.w0.push_back(RCW0(RC_WORDFILL, D, VAL, END, f3, 0, RP_UNC, 0));           // rd=D, rs1=VAL, rs2=END
+    B.w1.push_back(((uint32_t)(K & 0xFF)) << 24);                               // K hi byte; low 24 = fall-through (Pass 3)
+    B.uw.push_back(3); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+3)); ui++;
+    return 3;
+}
+
 // MEMCPY LOOP → COPYLOOP. A forward unit-stride BYTE copy step `lbu/lb rt,0(src); sb rt,0(dst);
 // addi src,1; addi dst,1` (w..w+3, any order) immediately followed by `bne creg,rlim, →w` (back-edge
 // to this loop header) becomes ONE uop that runs the whole copy in-kernel, word-widened (4 bytes/step
@@ -1747,6 +1793,7 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
         if (consumed == 0) consumed = rvcud_try_memset(B, w, ui);    // whole byte-fill (memset) loop → 1 native uop
+        if (consumed == 0) consumed = rvcud_try_wordfill(B, w, ui);  // direct-form sX-fill loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
         if (consumed == 0) consumed = rvcud_try_copyloops(B, w, ui); // whole strided copy loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
@@ -1778,7 +1825,7 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x00FFFFFFu) : 0x00FFFFFFu;
             B.w1[i] = (B.w1[i] & 0xFF000000u) | idx;
         }
-        else if (cls == RC_COPYLOOP || cls == RC_MULLOOP || cls == RC_MEMSET) {   // preserve hi byte (reg); bake fall-through into low 24
+        else if (cls == RC_COPYLOOP || cls == RC_MULLOOP || cls == RC_MEMSET || cls == RC_WORDFILL) {   // preserve hi byte (reg/K); bake fall-through into low 24
             uint32_t tw = B.tgt[i];
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x00FFFFFFu) : 0x00FFFFFFu;
             B.w1[i] = (B.w1[i] & 0xFF000000u) | idx;
