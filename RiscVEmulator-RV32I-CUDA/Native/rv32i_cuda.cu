@@ -224,8 +224,13 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
-       RC_MEMSET=0x39, RC_ILL=0x00 };
-       // RC_MEMSET: byte-fill loop (libc memset/bzero: sb VAL,0(DST); DST++; bne DST,END) → 1 native loop uop.
+       RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_ILL=0x00 };
+       // RC_MEMSET: byte-fill loop (libc memset/bzero) → 1 native loop uop.
+       // NATIVE_LOOP transform kinds (#13/#20 — generic strided gather→transform→scatter loops; the loop's KIND
+       // is recognized structurally and its params (regs/offsets/shifts/strides) are READ from the matched
+       // instructions, never hardcoded → generic across guests):
+       // RC_TEXSPAN: texture-span loop  pix=cmap[tex[((y>>shY)&mask)+((x<<shX1)>>shX2)]]; *dst++=pix; x+=xs; y+=ys.
+       // RC_PALEXP:  LUT-expand loop     idx=src++; p=tbl+3*idx; dst[0..2]=p[0..2]; dst[3]=const; dst+=4.
        // RC_BFE (RVCUD_BITFIELD): rd = (rs >> k) & mask  — fused srli+andi; 0x09 is a free sparse code.
        // RC_DIVLOOP: clang's rv32i bit-serial restoring-division loop (the body shared by __udivsi3/__divsi3,
        //   ~416 guest instrs) → ONE hardware divide. Q=N/D, R=N%D, counter→-1. CPU-validated 8M cases.
@@ -246,6 +251,7 @@ __device__ unsigned long long* g_dev_hot = nullptr;   // profiling: per-uop exec
 __global__ void __launch_bounds__(256)
 rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2* __restrict__ uops, const uint8_t* __restrict__ uw,
              const uint32_t* __restrict__ pc2uop, const uint32_t* __restrict__ uop2pc,
+             const uint32_t* __restrict__ ext,
              int ncores, int nwords, uint32_t base, int budget, unsigned long long* __restrict__ retd) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncores) return;
@@ -491,6 +497,47 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             // demand (translate-on-miss), then resume. tgt itself is a valid in-range code address.
             if (n2 & 0x80000000u) { resume_pc = (tw < (uint32_t)nwords) ? tgt : HALT_BIT; break; }
             ui = n2; continue; }
+        else if (cls == RC_PALEXP) {                     // 8bpp→32bpp palette expand: whole loop, native
+            uint32_t SRC=regs[(w0>>7)&0x1F], DST=regs[(w0>>12)&0x1F], PAL=regs[(w0>>17)&0x1F];
+            uint32_t END=regs[(w1>>22)&0x1F], A=regs[(w1>>27)&0x1F];   // END, ALPHA invariant; PAL invariant
+            while (SRC != END && gi < budget) {                       // mirrors the guest body in program order
+                uint32_t p = PAL + 3u * ld_i<uint8_t>(mem,ncores,id,SRC);
+                st_i<uint8_t>(mem,ncores,id,DST-3,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p));     // R
+                st_i<uint8_t>(mem,ncores,id,DST-2,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p+1));   // G
+                st_i<uint8_t>(mem,ncores,id,DST-1,(uint8_t)ld_i<uint8_t>(mem,ncores,id,p+2));   // B
+                st_i<uint8_t>(mem,ncores,id,DST,(uint8_t)A);                                    // alpha (const)
+                SRC += 1; DST += 4; gi += 14;                          // 14 guest instrs/iteration
+            }
+            regs[(w0>>7)&0x1F] = SRC; regs[(w0>>12)&0x1F] = DST;       // SRC→END, DST advanced
+            if (SRC == END) {                                          // loop done → fall through
+                uint32_t ft = w1 & 0x003FFFFFu;
+                if (ft == 0x003FFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 14*4; break; }
+                ui = ft;
+            }                                                          // else budget-cut → ui stays, resume here
+            continue; }
+        else if (cls == RC_TEXSPAN) {                    // texture-mapped span: whole loop, native (params in ext[])
+            uint32_t e = w0 >> 7;                                              // ext base index
+            uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]), p2=__ldg(&ext[e+2]), p3=__ldg(&ext[e+3]);
+            uint32_t Xr=p0&31, Yr=(p0>>5)&31, Dr=(p0>>10)&31, Er=(p0>>15)&31, Mr=(p0>>20)&31, Br=(p0>>25)&31;
+            uint32_t oC=p1&0xFFF, oT=(p1>>12)&0xFFF, oX=p2&0xFFF, oY=(p2>>12)&0xFFF;
+            uint32_t shY=p3&31, shX1=(p3>>5)&31, shX2=(p3>>10)&31;
+            uint32_t X=regs[Xr], Y=regs[Yr], D=regs[Dr], END=regs[Er], MASK=regs[Mr], BASE=regs[Br];
+            while (D != END && gi < budget) {                                 // mirrors the 19 guest instrs in program order
+                uint32_t CMAP = ld_i<uint32_t>(mem,ncores,id,BASE+oC);        // re-loaded each iter (alias-safe; matches guest)
+                uint32_t TEX  = ld_i<uint32_t>(mem,ncores,id,BASE+oT);
+                uint32_t off  = ((Y>>shY)&MASK) + ((X<<shX1)>>shX2);
+                uint32_t pidx = ld_i<uint8_t>(mem,ncores,id, TEX + off);
+                uint32_t pix  = ld_i<uint8_t>(mem,ncores,id, CMAP + pidx);
+                st_i<uint8_t>(mem,ncores,id, D, (uint8_t)pix);
+                uint32_t XS = ld_i<uint32_t>(mem,ncores,id,BASE+oX);
+                uint32_t YS = ld_i<uint32_t>(mem,ncores,id,BASE+oY);
+                X += XS; Y += YS; D += 1; gi += 19;                           // 19 guest instrs/iteration
+            }
+            regs[Xr]=X; regs[Yr]=Y; regs[Dr]=D;                               // XPOS,YPOS final; DST→END
+            if (D == END) { uint32_t ft = w1;
+                if (ft == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 19*4; break; }
+                ui = ft; }
+            continue; }
         else if (cls == RC_NOP)  { ui += 1; gi += wt; continue; }
         else { ui |= HALT_BIT; continue; }                                       // RC_ILL
 
@@ -515,6 +562,7 @@ static uint2*     g_uops    = nullptr;  // {w0,w1} per uop
 static uint8_t*   g_uw      = nullptr;  // guest-instruction weight per uop
 static uint32_t*  g_pc2uop  = nullptr;  // guest-word → uop index (or RC_BADUOP)
 static uint32_t*  g_uop2pc  = nullptr;  // uop index → guest pc
+static uint32_t*  g_ext     = nullptr;  // side params for fat fusions (TEXSPAN); indexed by uop's ext base
 static int        g_nuops   = 0;
 static int        g_pc2words = 0;       // length of pc2uop[] = translated code words (NOT total memory words)
 static uint32_t   g_base    = 0;
@@ -588,6 +636,7 @@ struct RvcudBuild {
     std::vector<uint32_t> pc2uop;            // size nwords
     std::vector<uint32_t> w0, w1, u2pc, tgt; // per-uop (tgt = pending target word for BR/JAL)
     std::vector<uint8_t>  uw;
+    std::vector<uint32_t> ext;               // side params for fat fusions (TEXSPAN); uop carries the base index
 };
 
 // Backward-dataflow liveness over the guest word stream (for safe fusion: an intermediate
@@ -1280,6 +1329,147 @@ static int rvcud_try_divloop(RvcudBuild& B, int w, uint32_t& ui) {
     return 13;
 }
 
+// PALETTE-EXPAND LOOP → PALEXP. The 8bpp→32bpp present/blit idiom clang emits as a 14-instruction loop:
+//   lbu IDX,0(SRC); addi SRC,SRC,1; slli T,IDX,1; add P,PAL,IDX; add P,P,T; lbu C,0(P); sb C,-3(DST);
+//   lbu C,1(P); sb C,-2(DST); lbu C,2(P); sb C,-1(DST); sb ALPHA,0(DST); addi DST,DST,4; bne SRC,END,top
+// i.e. for each source palette byte: P = PAL + 3*IDX; write {pal[P],pal[P+1],pal[P+2],ALPHA} as RGBA to
+// DST; SRC++; DST+=4. Replaced by ONE native whole-loop uop. PAL/ALPHA/END are loop-invariant. Matched by
+// structure (any regs) → generic (no guest addresses). Consumes 14 words. weight = 14 retired/iteration.
+static int rvcud_try_palexp(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+14 >= N) return 0;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;};
+    uint32_t i0=img[w],i1=img[w+1],i2=img[w+2],i3=img[w+3],i4=img[w+4],i5=img[w+5],i6=img[w+6],
+             i7=img[w+7],i8=img[w+8],i9=img[w+9],i10=img[w+10],i11=img[w+11],i12=img[w+12],i13=img[w+13];
+    // w+0: lbu IDX,0(SRC)
+    if ((i0&0x7F)!=0x03 || F3(i0)!=4 || rv_iimm(i0)!=0) return 0;
+    uint32_t IDX=RD(i0), SRC=S1(i0);
+    // w+1: addi SRC,SRC,1
+    if ((i1&0x7F)!=0x13 || F3(i1)!=0 || RD(i1)!=SRC || S1(i1)!=SRC || rv_iimm(i1)!=1) return 0;
+    // w+2: slli T,IDX,1
+    if ((i2&0x7F)!=0x13 || F3(i2)!=1 || S1(i2)!=IDX || S2(i2)!=1) return 0;
+    uint32_t T=RD(i2);
+    // w+3: add P,PAL,IDX  (one operand is IDX)
+    if ((i3&0x7F)!=0x33 || F3(i3)!=0 || F7(i3)!=0) return 0;
+    uint32_t P=RD(i3), PAL;
+    if (S1(i3)==IDX) PAL=S2(i3); else if (S2(i3)==IDX) PAL=S1(i3); else return 0;
+    // w+4: add P,P,T
+    if ((i4&0x7F)!=0x33 || F3(i4)!=0 || F7(i4)!=0 || RD(i4)!=P) return 0;
+    if (!((S1(i4)==P&&S2(i4)==T)||(S1(i4)==T&&S2(i4)==P))) return 0;
+    // w+5: lbu C0,0(P)
+    if ((i5&0x7F)!=0x03 || F3(i5)!=4 || S1(i5)!=P || rv_iimm(i5)!=0) return 0;
+    uint32_t C0=RD(i5);
+    // w+6: sb C0,-3(DST)
+    if ((i6&0x7F)!=0x23 || F3(i6)!=0 || S2(i6)!=C0 || (int32_t)rv_simm(i6)!=-3) return 0;
+    uint32_t DST=S1(i6);
+    // w+7: lbu C1,1(P)
+    if ((i7&0x7F)!=0x03 || F3(i7)!=4 || S1(i7)!=P || rv_iimm(i7)!=1) return 0;
+    uint32_t C1=RD(i7);
+    // w+8: sb C1,-2(DST)
+    if ((i8&0x7F)!=0x23 || F3(i8)!=0 || S1(i8)!=DST || S2(i8)!=C1 || (int32_t)rv_simm(i8)!=-2) return 0;
+    // w+9: lbu C2,2(P)
+    if ((i9&0x7F)!=0x03 || F3(i9)!=4 || S1(i9)!=P || rv_iimm(i9)!=2) return 0;
+    uint32_t C2=RD(i9);
+    // w+10: sb C2,-1(DST)
+    if ((i10&0x7F)!=0x23 || F3(i10)!=0 || S1(i10)!=DST || S2(i10)!=C2 || (int32_t)rv_simm(i10)!=-1) return 0;
+    // w+11: sb ALPHA,0(DST)
+    if ((i11&0x7F)!=0x23 || F3(i11)!=0 || S1(i11)!=DST || rv_simm(i11)!=0) return 0;
+    uint32_t ALPHA=S2(i11);
+    // w+12: addi DST,DST,4
+    if ((i12&0x7F)!=0x13 || F3(i12)!=0 || RD(i12)!=DST || S1(i12)!=DST || rv_iimm(i12)!=4) return 0;
+    // w+13: bne SRC,END,→w
+    if ((i13&0x7F)!=0x63 || F3(i13)!=1) return 0;
+    uint32_t END;
+    if (S1(i13)==SRC) END=S2(i13); else if (S2(i13)==SRC) END=S1(i13); else return 0;
+    uint32_t bpc=B.base+(uint32_t)(w+13)*4, tw=(bpc+rv_bimm(i13)-B.base)>>2;
+    if ((int)tw != w) return 0;                                      // back-edge to the loop header
+    // the five live registers must be distinct & nonzero (SRC,DST,PAL,END,ALPHA); PAL,END,ALPHA invariant
+    if (SRC==0||DST==0||PAL==0||END==0||ALPHA==0) return 0;
+    if (SRC==DST||SRC==PAL||SRC==END||DST==PAL||DST==END||DST==ALPHA||SRC==ALPHA) return 0;
+    if (PAL==SRC||PAL==DST) return 0;
+    B.pc2uop[w] = ui;
+    B.w0.push_back(RC_PALEXP | (SRC<<7) | (DST<<12) | (PAL<<17));     // rd=SRC, rs1=DST, rs2=PAL (pred bits 0)
+    B.w1.push_back((END<<22) | (ALPHA<<27));                         // low 22 = fall-through (Pass 3); END[26:22]; ALPHA[31:27]
+    B.uw.push_back(14); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+14)); ui++;
+    return 14;
+}
+
+// TEXTURE-MAPPED SPAN LOOP → TEXSPAN. clang's R_DrawSpan inner loop (19 instructions):
+//   srli Yt,YPOS,shY; slli Xt,XPOS,shX1; lw CMAP,oC(BASE); lw TEX,oT(BASE); and Yt,Yt,MASK;
+//   srli Xt,Xt,shX2; add OFF,Yt,Xt; add TA,TEX,OFF; lbu PIDX,0(TA); add CA,CMAP,PIDX; lbu PIX,0(CA);
+//   sb PIX,0(DST); lw XS,oX(BASE); lw YS,oY(BASE); addi nD,DST,1; add XPOS,XS,XPOS; add YPOS,YS,YPOS;
+//   mv DST,nD; bne nD,END,top
+// i.e. pix = cmap[ tex[ ((YPOS>>shY)&MASK) + ((XPOS<<shX1)>>shX2) ] ]; *DST++ = pix; XPOS+=xstep; YPOS+=ystep.
+// → ONE native whole-loop uop. Shifts/offsets/regs are READ from the matched instrs (not hardcoded → generic)
+// and stored in g_ext (too many for a uint2). Re-loads the 4 invariants each iter in guest order (alias-safe →
+// bit-identical). Consumes 19 words; weight = 19 retired/iteration.
+static int rvcud_try_texspan(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+19 >= N) return 0;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;}; auto SH=[](uint32_t x){return (x>>20)&0x1F;};
+    uint32_t a[19]; for (int k=0;k<19;k++) a[k]=img[w+k];
+    // w+0 srli Yt,YPOS,shY ; w+1 slli Xt,XPOS,shX1
+    if ((a[0]&0x7F)!=0x13||F3(a[0])!=5||F7(a[0])!=0) return 0;  uint32_t Yt=RD(a[0]),YPOS=S1(a[0]),shY=SH(a[0]);
+    if ((a[1]&0x7F)!=0x13||F3(a[1])!=1) return 0;               uint32_t Xt=RD(a[1]),XPOS=S1(a[1]),shX1=SH(a[1]);
+    // w+2 lw CMAP,oC(BASE) ; w+3 lw TEX,oT(BASE)
+    if ((a[2]&0x7F)!=0x03||F3(a[2])!=2) return 0;  uint32_t CMAP=RD(a[2]),BASE=S1(a[2]),oC=rv_iimm(a[2]);
+    if ((a[3]&0x7F)!=0x03||F3(a[3])!=2||S1(a[3])!=BASE) return 0;  uint32_t TEX=RD(a[3]),oT=rv_iimm(a[3]);
+    // w+4 and Yt,Yt,MASK
+    if ((a[4]&0x7F)!=0x33||F3(a[4])!=7||F7(a[4])!=0||RD(a[4])!=Yt) return 0;
+    uint32_t MASK; if (S1(a[4])==Yt) MASK=S2(a[4]); else if (S2(a[4])==Yt) MASK=S1(a[4]); else return 0;
+    // w+5 srli Xt,Xt,shX2
+    if ((a[5]&0x7F)!=0x13||F3(a[5])!=5||F7(a[5])!=0||RD(a[5])!=Xt||S1(a[5])!=Xt) return 0;  uint32_t shX2=SH(a[5]);
+    // w+6 add OFF,Yt,Xt
+    if ((a[6]&0x7F)!=0x33||F3(a[6])!=0||F7(a[6])!=0) return 0;  uint32_t OFF=RD(a[6]);
+    if (!((S1(a[6])==Yt&&S2(a[6])==Xt)||(S1(a[6])==Xt&&S2(a[6])==Yt))) return 0;
+    // w+7 add TA,TEX,OFF
+    if ((a[7]&0x7F)!=0x33||F3(a[7])!=0||F7(a[7])!=0) return 0;  uint32_t TA=RD(a[7]);
+    if (!((S1(a[7])==TEX&&S2(a[7])==OFF)||(S1(a[7])==OFF&&S2(a[7])==TEX))) return 0;
+    // w+8 lbu PIDX,0(TA)
+    if ((a[8]&0x7F)!=0x03||F3(a[8])!=4||S1(a[8])!=TA||rv_iimm(a[8])!=0) return 0;  uint32_t PIDX=RD(a[8]);
+    // w+9 add CA,CMAP,PIDX
+    if ((a[9]&0x7F)!=0x33||F3(a[9])!=0||F7(a[9])!=0) return 0;  uint32_t CA=RD(a[9]);
+    if (!((S1(a[9])==CMAP&&S2(a[9])==PIDX)||(S1(a[9])==PIDX&&S2(a[9])==CMAP))) return 0;
+    // w+10 lbu PIX,0(CA)
+    if ((a[10]&0x7F)!=0x03||F3(a[10])!=4||S1(a[10])!=CA||rv_iimm(a[10])!=0) return 0;  uint32_t PIX=RD(a[10]);
+    // w+11 sb PIX,0(DST)
+    if ((a[11]&0x7F)!=0x23||F3(a[11])!=0||S2(a[11])!=PIX||rv_simm(a[11])!=0) return 0;  uint32_t DST=S1(a[11]);
+    // w+12 lw XS,oX(BASE) ; w+13 lw YS,oY(BASE)
+    if ((a[12]&0x7F)!=0x03||F3(a[12])!=2||S1(a[12])!=BASE) return 0;  uint32_t XS=RD(a[12]),oX=rv_iimm(a[12]);
+    if ((a[13]&0x7F)!=0x03||F3(a[13])!=2||S1(a[13])!=BASE) return 0;  uint32_t YS=RD(a[13]),oY=rv_iimm(a[13]);
+    // w+14 addi nD,DST,1
+    if ((a[14]&0x7F)!=0x13||F3(a[14])!=0||S1(a[14])!=DST||rv_iimm(a[14])!=1) return 0;  uint32_t nD=RD(a[14]);
+    // w+15 add XPOS,XS,XPOS ; w+16 add YPOS,YS,YPOS
+    if ((a[15]&0x7F)!=0x33||F3(a[15])!=0||F7(a[15])!=0||RD(a[15])!=XPOS) return 0;
+    if (!((S1(a[15])==XS&&S2(a[15])==XPOS)||(S1(a[15])==XPOS&&S2(a[15])==XS))) return 0;
+    if ((a[16]&0x7F)!=0x33||F3(a[16])!=0||F7(a[16])!=0||RD(a[16])!=YPOS) return 0;
+    if (!((S1(a[16])==YS&&S2(a[16])==YPOS)||(S1(a[16])==YPOS&&S2(a[16])==YS))) return 0;
+    // w+17 mv DST,nD  (addi DST,nD,0) ; w+18 bne nD,END,top
+    if ((a[17]&0x7F)!=0x13||F3(a[17])!=0||RD(a[17])!=DST||S1(a[17])!=nD||rv_iimm(a[17])!=0) return 0;
+    if ((a[18]&0x7F)!=0x63||F3(a[18])!=1) return 0;
+    uint32_t END; if (S1(a[18])==nD) END=S2(a[18]); else if (S2(a[18])==nD) END=S1(a[18]); else return 0;
+    uint32_t bpc=B.base+(uint32_t)(w+18)*4, tw=(bpc+rv_bimm(a[18])-B.base)>>2;
+    if ((int)tw != w) return 0;                                      // back-edge to the loop header
+    // the live registers (XPOS,YPOS,DST,END,MASK,BASE) must be distinct & nonzero
+    uint32_t lv[6]={XPOS,YPOS,DST,END,MASK,BASE};
+    for (int p=0;p<6;p++){ if(lv[p]==0) return 0; for(int q=p+1;q<6;q++) if(lv[p]==lv[q]) return 0; }
+    if (oC>0xFFF||oT>0xFFF||oX>0xFFF||oY>0xFFF) return 0;            // offsets must fit the ext packing
+    uint32_t e = (uint32_t)B.ext.size();
+    B.ext.push_back((XPOS&31)|((YPOS&31)<<5)|((DST&31)<<10)|((END&31)<<15)|((MASK&31)<<20)|((BASE&31)<<25));
+    B.ext.push_back((oC&0xFFF)|((oT&0xFFF)<<12));
+    B.ext.push_back((oX&0xFFF)|((oY&0xFFF)<<12));
+    B.ext.push_back((shY&31)|((shX1&31)<<5)|((shX2&31)<<10));
+    B.pc2uop[w] = ui;
+    B.w0.push_back(RC_TEXSPAN | (e<<7));                             // ext base index in bits[31:7]
+    B.w1.push_back(0);                                              // fall-through baked in Pass 3 (full w1)
+    B.uw.push_back(19); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+19)); ui++;
+    return 19;
+}
+
 #if RVCUD_LOADFWD
 // STATIC REDUNDANT-LOAD ELIMINATION (#5). A load whose (base,offset,width,sign=f3) matches an EARLIER
 // load in the SAME basic block — with the base register unchanged and NO store between (conservative
@@ -1336,6 +1526,8 @@ static void rvcud_build(RvcudBuild& B) {
     for (int w = 0; w < N; ) {
         int consumed = rvcud_try_mulloop(B, w, ui);                // shift-add software-multiply loop → 1 hw multiply
         if (consumed == 0) consumed = rvcud_try_divloop(B, w, ui);  // bit-serial software-divide loop → 1 hw divide
+        if (consumed == 0) consumed = rvcud_try_palexp(B, w, ui);   // 8bpp→32bpp palette-expand loop → 1 native loop uop
+        if (consumed == 0) consumed = rvcud_try_texspan(B, w, ui);  // texture-mapped span loop (R_DrawSpan) → 1 native loop uop
         if (consumed == 0) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
         if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
@@ -1375,10 +1567,14 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x00FFFFFFu) : 0x00FFFFFFu;
             B.w1[i] = (B.w1[i] & 0xFF000000u) | idx;
         }
-        else if (cls == RC_DIVLOOP) {                                // preserve bits[31:22] (regs); bake fall-through into low 22
+        else if (cls == RC_DIVLOOP || cls == RC_PALEXP) {            // preserve bits[31:22] (regs); bake fall-through into low 22
             uint32_t tw = B.tgt[i];
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x003FFFFFu) : 0x003FFFFFu;
             B.w1[i] = (B.w1[i] & 0xFFC00000u) | idx;
+        }
+        else if (cls == RC_TEXSPAN) {                                // w1 = full fall-through uop index (params live in ext[])
+            uint32_t tw = B.tgt[i];
+            B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
         }
     }
 }
@@ -1388,6 +1584,7 @@ static void rvcud_free() {
     if (g_uw)     { cudaFree(g_uw);     g_uw     = nullptr; }
     if (g_pc2uop) { cudaFree(g_pc2uop); g_pc2uop = nullptr; }
     if (g_uop2pc) { cudaFree(g_uop2pc); g_uop2pc = nullptr; }
+    if (g_ext)    { cudaFree(g_ext);    g_ext    = nullptr; }
     g_nuops = 0; g_uopcap = 0;
     g_img.clear(); g_pc2uop_h.clear(); g_w0h.clear(); g_w1h.clear(); g_u2pch.clear(); g_uwh.clear();
 }
@@ -1415,6 +1612,9 @@ API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base
     if ((e = cudaMalloc(&g_uw,     (size_t)g_uopcap))                  != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_uop2pc, (size_t)g_uopcap * 4))             != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_pc2uop, (size_t)N * 4))                    != cudaSuccess) return (int)e;
+    size_t next = B.ext.empty() ? 1 : B.ext.size();                   // ≥1 so the kernel always has a valid ptr
+    if ((e = cudaMalloc(&g_ext, next * 4)) != cudaSuccess) return (int)e;
+    if (!B.ext.empty()) cudaMemcpy(g_ext, B.ext.data(), B.ext.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(g_uops,   uops.data(),     (size_t)g_nuops * sizeof(uint2), cudaMemcpyHostToDevice);
     cudaMemcpy(g_uw,     g_uwh.data(),    (size_t)g_nuops,                cudaMemcpyHostToDevice);
     cudaMemcpy(g_uop2pc, g_u2pch.data(),  (size_t)g_nuops * 4,            cudaMemcpyHostToDevice);
@@ -1481,7 +1681,7 @@ API int cuda_rvcud_step_all(int budget) {
     for (int guard = 0; guard < 1 << 20; guard++) {
         int rem = budget - (int)total;
         if (rem <= 0) break;
-        rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc,
+        rvcud_kernel<<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
                                              g_ncores, g_pc2words, g_base, rem, g_ret);
         cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
         if (le != cudaSuccess) return (int)le;
