@@ -356,6 +356,11 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         // matters a lot. Universally-hot (ALUI/ALUR/LOAD/ST/BR) lead; Doom's fusions next; compute-only
         // (XSH/ADDC/MULC) and dormant-on-rv32i (MULR/MEXT) at the tail. Reorder is semantically identical.
         if      (cls == RC_ALUI)  r = alu(f3, u1, w1, w1 & 0x1F, false, sra);
+        else if (cls == RC_BR) {                         // 2nd: 17.6% of ttf30 execs (was 5th)
+            int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
+                                 case 5:t=s1>=s2;break; case 6:t=u1<u2;break; default:t=u1>=u2; }
+            ui = t ? w1 : ui + 1; gi += wt; continue;                            // w1 = baked target uop-index
+        }
         else if (cls == RC_ALUR)  r = alu(f3, u1, u2, (uint32_t)(s2 & 0x1F), false, sra);
         else if (cls == RC_LOAD) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
             switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
@@ -363,15 +368,20 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 2: r=                   ld_i<uint32_t,NC1>(mem,ncores,id,a); break;
                           case 4: r=                   ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
                           default:r=                   ld_i<uint16_t,NC1>(mem,ncores,id,a); } }   // f3==5 (translator validated {0,1,2,4,5})
+        else if (cls == RC_SUB)   r = u1 - u2;           // 5th: 5.7% of ttf30 execs (was tail)
         else if (cls == RC_ST) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
             if (live) switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)u2);  break;
                                     case 1: st_i<uint16_t,NC1>(mem,ncores,id,a,(uint16_t)u2); break;
                                     default:st_i<uint32_t,NC1>(mem,ncores,id,a,u2); }           // @p st.global when predicated
             ui += 1; gi += live ? wt : 0; continue; }    // count only if the guest would have run it
-        else if (cls == RC_BR) {
-            int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
-                                 case 5:t=s1>=s2;break; case 6:t=u1<u2;break; default:t=u1>=u2; }
-            ui = t ? w1 : ui + 1; gi += wt; continue;                            // w1 = baked target uop-index
+        else if (cls == RC_INCBR) {                                             // counted loop: rc += K; if (rc cmp rX) goto T
+            int32_t inc = (int32_t)w1 >> 24;                                     // signed high byte = increment
+            uint32_t tgt = w1 & 0x00FFFFFFu;                                     // low 24 = baked target uop-index (0xFFFFFF = unresolved → halt)
+            uint32_t nv = u1 + (uint32_t)inc; int32_t sv = (int32_t)nv;
+            if (rd) regs[rd] = nv;                                              // write the (incremented) counter
+            int t; switch (f3) { case 0:t=nv==u2;break; case 1:t=nv!=u2;break; case 4:t=sv<s2;break;
+                                 case 5:t=sv>=s2;break; case 6:t=nv<u2;break; default:t=nv>=u2; }
+            ui = t ? (tgt==0x00FFFFFFu ? HALT_BIT : tgt) : ui + 1; gi += wt; continue;
         }
         else if (cls == RC_LOADPI) {                     // r = load[base]; base += w1  (load + post-increment)
             switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,u1); break;
@@ -522,15 +532,6 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 1: st_i<uint16_t,NC1>(mem,ncores,id,a,(uint16_t)val); break;
                           default:st_i<uint32_t,NC1>(mem,ncores,id,a,val); }
             ui += 1; gi += wt; continue; }
-        else if (cls == RC_INCBR) {                                             // counted loop: rc += K; if (rc cmp rX) goto T
-            int32_t inc = (int32_t)w1 >> 24;                                     // signed high byte = increment
-            uint32_t tgt = w1 & 0x00FFFFFFu;                                     // low 24 = baked target uop-index (0xFFFFFF = unresolved → halt)
-            uint32_t nv = u1 + (uint32_t)inc; int32_t sv = (int32_t)nv;
-            if (rd) regs[rd] = nv;                                              // write the (incremented) counter
-            int t; switch (f3) { case 0:t=nv==u2;break; case 1:t=nv!=u2;break; case 4:t=sv<s2;break;
-                                 case 5:t=sv>=s2;break; case 6:t=nv<u2;break; default:t=nv>=u2; }
-            ui = t ? (tgt==0x00FFFFFFu ? HALT_BIT : tgt) : ui + 1; gi += wt; continue;
-        }
         else if (cls == RC_COPYLOOP) {                   // whole forward unit-stride byte memcpy loop, word-widened
             uint32_t s = u1, d = u2, L = regs[(w1>>24)&0x1F];  // src, dst, limit; counter = src or dst
             const bool cdst = (w0>>25)&1;                      // which pointer the bne compares to L
@@ -591,7 +592,6 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_MULC)  r = u1 * w1;                                   // strength-reduced ×const → 1 IMAD
         else if (cls == RC_LEA)   r = (u1 << (w1 & 31)) + u2;                    // slli+add fused
         else if (cls == RC_CONST) r = w1;
-        else if (cls == RC_SUB)   r = u1 - u2;                                   // R-type SUB (own class)
         else if (cls == RC_MULR)  r = u1 * u2;                                   // M-ext MUL (low 32)
         else if (cls == RC_MEXT) {                                               // M-ext high-mul / div / rem (exact RV semantics)
             switch (f3) {
