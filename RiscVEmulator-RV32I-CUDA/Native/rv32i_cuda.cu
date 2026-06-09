@@ -224,7 +224,9 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
-       RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_ILL=0x00 };
+       RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61, RC_ILL=0x00 };
+       // RC_TEXCOL: textured-column loop (R_DrawColumn): pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=stride;
+       //   frac+=step → 1 native loop. 1D vertical TEXSPAN; params (regs/offsets/shifts/stride) in g_ext, generic.
        // RC_COPYLOOPS: strided copy loop (load rt,0(src); store rt,0(dst); src+=Ks; dst+=Kd; bne cnt,lim) → 1
        //   native loop. Generic (any element size + arbitrary strides); captures column/span blits. Params in g_ext.
        // RC_MEMSET: byte-fill loop (libc memset/bzero) → 1 native loop uop.
@@ -556,6 +558,26 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             regs[sR]=s; regs[dR]=d; if (rtR) regs[rtR]=last;          // src,dst advanced; rt = last loaded (sign/zero-ext)
             if ((cdst?d:s) == L) { uint32_t ft = w1;
                 if (ft == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 5*4; break; }
+                ui = ft; }
+            continue; }
+        else if (cls == RC_TEXCOL) {                     // textured-column loop: whole loop, native (params in ext[])
+            uint32_t e = w0 >> 7; uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]), p2=__ldg(&ext[e+2]);
+            uint32_t Fr=p0&31, Dr=(p0>>5)&31, Er=(p0>>10)&31, Br=(p0>>15)&31, Sr=(p0>>20)&31;   // FRAC,DST,END,BASE,STEP
+            uint32_t oT=p1&0xFFF, oC=(p1>>12)&0xFFF;
+            uint32_t sa=p2&31, sb=(p2>>5)&31; int32_t STR=(int32_t)(int16_t)((p2>>10)&0xFFFF);
+            uint32_t F=regs[Fr], D=regs[Dr], END=regs[Er], BASE=regs[Br], STEP=regs[Sr];
+            while (D != END && gi < budget) {                                  // mirrors the 12 guest instrs in order
+                uint32_t TEX  = ld_i<uint32_t>(mem,ncores,id,BASE+oT);         // invariants re-loaded each iter (alias-safe)
+                uint32_t CMAP = ld_i<uint32_t>(mem,ncores,id,BASE+oC);
+                uint32_t t    = (F << sa) >> sb;
+                uint32_t pidx = ld_i<uint8_t>(mem,ncores,id, TEX + t);
+                uint32_t pix  = ld_i<uint8_t>(mem,ncores,id, CMAP + pidx);
+                st_i<uint8_t>(mem,ncores,id, D, (uint8_t)pix);
+                D += (uint32_t)STR; F += STEP; gi += 12;                       // 12 guest instrs/iteration
+            }
+            regs[Dr]=D; regs[Fr]=F;                                            // DST→END; FRAC advanced
+            if (D == END) { uint32_t ft = w1;
+                if (ft == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 12*4; break; }
                 ui = ft; }
             continue; }
         else if (cls == RC_NOP)  { ui += 1; gi += wt; continue; }
@@ -1540,6 +1562,50 @@ static int rvcud_try_texspan(RvcudBuild& B, int w, uint32_t& ui) {
     return 19;
 }
 
+// TEXTURED-COLUMN LOOP → TEXCOL. clang's R_DrawColumn inner loop (12 instrs):
+//   lw TEX,oT(BASE); lw CMAP,oC(BASE); slli C,FRAC,sa; srli C,C,sb; add TA,TEX,C; lbu PIDX,0(TA);
+//   add CA,CMAP,PIDX; lbu PIX,0(CA); sb PIX,0(DST); addi DST,DST,STR; add FRAC,FRAC,STEP; bne DST,END,top
+// = vertical 1D textured column: pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=STR; frac+=STEP. Params
+// (regs/offsets/shifts/stride read from the matched instrs, never hardcoded) live in g_ext. Consumes 12.
+static int rvcud_try_texcol(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+12 >= N) return 0;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;}; auto SH=[](uint32_t x){return (x>>20)&0x1F;};
+    uint32_t a[12]; for (int k=0;k<12;k++) a[k]=img[w+k];
+    if ((a[0]&0x7F)!=0x03||F3(a[0])!=2) return 0;  uint32_t TEX=RD(a[0]),BASE=S1(a[0]),oT=rv_iimm(a[0]);   // lw TEX,oT(BASE)
+    if ((a[1]&0x7F)!=0x03||F3(a[1])!=2||S1(a[1])!=BASE) return 0;  uint32_t CMAP=RD(a[1]),oC=rv_iimm(a[1]);// lw CMAP,oC(BASE)
+    if ((a[2]&0x7F)!=0x13||F3(a[2])!=1) return 0;  uint32_t C=RD(a[2]),FRAC=S1(a[2]),sa=SH(a[2]);          // slli C,FRAC,sa
+    if ((a[3]&0x7F)!=0x13||F3(a[3])!=5||F7(a[3])!=0||RD(a[3])!=C||S1(a[3])!=C) return 0;  uint32_t sb=SH(a[3]);// srli C,C,sb
+    if ((a[4]&0x7F)!=0x33||F3(a[4])!=0||F7(a[4])!=0) return 0;  uint32_t TA=RD(a[4]);                      // add TA,TEX,C
+    if (!((S1(a[4])==TEX&&S2(a[4])==C)||(S1(a[4])==C&&S2(a[4])==TEX))) return 0;
+    if ((a[5]&0x7F)!=0x03||F3(a[5])!=4||S1(a[5])!=TA||rv_iimm(a[5])!=0) return 0;  uint32_t PIDX=RD(a[5]); // lbu PIDX,0(TA)
+    if ((a[6]&0x7F)!=0x33||F3(a[6])!=0||F7(a[6])!=0) return 0;  uint32_t CA=RD(a[6]);                      // add CA,CMAP,PIDX
+    if (!((S1(a[6])==CMAP&&S2(a[6])==PIDX)||(S1(a[6])==PIDX&&S2(a[6])==CMAP))) return 0;
+    if ((a[7]&0x7F)!=0x03||F3(a[7])!=4||S1(a[7])!=CA||rv_iimm(a[7])!=0) return 0;  uint32_t PIX=RD(a[7]);  // lbu PIX,0(CA)
+    if ((a[8]&0x7F)!=0x23||F3(a[8])!=0||S2(a[8])!=PIX||rv_simm(a[8])!=0) return 0;  uint32_t DST=S1(a[8]); // sb PIX,0(DST)
+    if ((a[9]&0x7F)!=0x13||F3(a[9])!=0||RD(a[9])!=DST||S1(a[9])!=DST) return 0;  int32_t STR=(int32_t)rv_iimm(a[9]); // addi DST,DST,STR
+    if ((a[10]&0x7F)!=0x33||F3(a[10])!=0||F7(a[10])!=0||RD(a[10])!=FRAC) return 0;                        // add FRAC,FRAC,STEP
+    uint32_t STEP; if (S1(a[10])==FRAC) STEP=S2(a[10]); else if (S2(a[10])==FRAC) STEP=S1(a[10]); else return 0;
+    if ((a[11]&0x7F)!=0x63||F3(a[11])!=1) return 0;                                                       // bne DST,END,top
+    uint32_t END; if (S1(a[11])==DST) END=S2(a[11]); else if (S2(a[11])==DST) END=S1(a[11]); else return 0;
+    uint32_t bpc=B.base+(uint32_t)(w+11)*4, tw=(bpc+rv_bimm(a[11])-B.base)>>2;
+    if ((int)tw != w) return 0;                                                                          // back-edge to header
+    uint32_t lv[5]={FRAC,DST,END,BASE,STEP};
+    for (int p=0;p<5;p++){ if(lv[p]==0) return 0; for(int q=p+1;q<5;q++) if(lv[p]==lv[q]) return 0; }
+    if (oT>0xFFF || oC>0xFFF || STR<-32768 || STR>32767) return 0;
+    uint32_t e=(uint32_t)B.ext.size();
+    B.ext.push_back((FRAC&31)|((DST&31)<<5)|((END&31)<<10)|((BASE&31)<<15)|((STEP&31)<<20));
+    B.ext.push_back((oT&0xFFF)|((oC&0xFFF)<<12));
+    B.ext.push_back((sa&31)|((sb&31)<<5)|(((uint32_t)STR&0xFFFF)<<10));
+    B.pc2uop[w]=ui;
+    B.w0.push_back(RC_TEXCOL | (e<<7));
+    B.w1.push_back(0);                                              // fall-through baked Pass 3 (full w1)
+    B.uw.push_back(12); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+12)); ui++;
+    return 12;
+}
+
 #if RVCUD_LOADFWD
 // STATIC REDUNDANT-LOAD ELIMINATION (#5). A load whose (base,offset,width,sign=f3) matches an EARLIER
 // load in the SAME basic block — with the base register unchanged and NO store between (conservative
@@ -1598,6 +1664,7 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) consumed = rvcud_try_divloop(B, w, ui);  // bit-serial software-divide loop → 1 hw divide
         if (consumed == 0) consumed = rvcud_try_palexp(B, w, ui);   // 8bpp→32bpp palette-expand loop → 1 native loop uop
         if (consumed == 0) consumed = rvcud_try_texspan(B, w, ui);  // texture-mapped span loop (R_DrawSpan) → 1 native loop uop
+        if (consumed == 0) consumed = rvcud_try_texcol(B, w, ui);   // textured-column loop (R_DrawColumn) → 1 native loop uop
         if (consumed == 0) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
         if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
@@ -1643,7 +1710,7 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x003FFFFFu) : 0x003FFFFFu;
             B.w1[i] = (B.w1[i] & 0xFFC00000u) | idx;
         }
-        else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS) {         // w1 = full fall-through uop index (params live in ext[])
+        else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS || cls == RC_TEXCOL) {  // w1 = full fall-through uop index (params in ext[])
             uint32_t tw = B.tgt[i];
             B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
         }
