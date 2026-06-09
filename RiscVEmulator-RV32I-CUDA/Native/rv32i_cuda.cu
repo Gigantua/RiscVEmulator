@@ -14,6 +14,12 @@ struct CoreState { uint32_t regs[32], pc; };
 // same guest address hit consecutive words → one coalesced 128 B transaction.
 // Sub-word access reads/masks the containing word(s); a core owns its own words,
 // so the read-modify-write on a store has no cross-lane race.
+// Software prefetch of a guest byte address into L2 (hint; non-blocking). Used to warm the next
+// loop iteration's source while the current one computes — hides global latency on a single warp.
+static __device__ __forceinline__ void pf_i(const uint32_t* m, int nc, int id, uint32_t a) {
+    const uint32_t* p = m + (size_t)(a >> 2) * nc + id;
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
 template<class T> static __device__ __forceinline__ T ld_i(const uint32_t* m, int nc, int id, uint32_t a) {
     uint32_t w = a >> 2, off = (a & 3u) << 3;
     uint32_t lo = m[(size_t)w * nc + id];
@@ -280,7 +286,8 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 2: r=                   ld_i<uint32_t>(mem,ncores,id,u1); break;
                           case 4: r=                   ld_i<uint8_t> (mem,ncores,id,u1); break;
                           default:r=                   ld_i<uint16_t>(mem,ncores,id,u1); }
-            regs[(w0>>12)&0x1F] = u1 + w1; }             // rd != base (translator-enforced) → both writes safe
+            regs[(w0>>12)&0x1F] = u1 + w1;               // rd != base (translator-enforced) → both writes safe
+            pf_i(mem, ncores, id, u1 + w1); }            // prefetch next iteration's source (this loop's stride)
         else if (cls == RC_STOREPI) {                    // store[base] = rs2; base += w1  (store + post-increment)
             switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,u1,(uint8_t)u2);  break;
                           case 1: st_i<uint16_t>(mem,ncores,id,u1,(uint16_t)u2); break;
@@ -304,6 +311,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             if (rd) regs[rd] = t;                                                  // rt = loaded value (rt != src,dst)
             regs[(w0>>12)&0x1F] = u1 + (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFF);   // src += Ks
             regs[(w0>>17)&0x1F] = u2 + (uint32_t)(int32_t)(int16_t)(w1 >> 16);      // dst += Kd
+            pf_i(mem, ncores, id, u1 + (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFF));  // prefetch next iteration's source
             ui += 1; gi += wt; continue; }
         else if (cls == RC_MULLOOP) {                    // whole shift-add software-multiply loop → 1 hardware multiply
             uint32_t M0 = u1, B0 = u2, ACC0 = regs[rd];  // rs1=multiplier(→0), rs2=multiplicand(<<iters), rd=accumulator
@@ -336,6 +344,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             const bool cdst = (w0>>25)&1;                      // which pointer the bne compares to L
             do {                                               // do-while mirrors the guest body-then-bne (entered with gi<budget)
                 uint32_t cnt = cdst ? d : s, rem = L - cnt, adiff = (d > s) ? (d - s) : (s - d);
+                pf_i(mem, ncores, id, s + 96);                 // prefetch source ~96B ahead of the copy cursor
                 if (rem >= 4u && adiff >= 4u) {                // word copy: ≥4 to go AND non-overlapping within the word
                     st_i<uint32_t>(mem,ncores,id,d, ld_i<uint32_t>(mem,ncores,id,s));
                     s += 4; d += 4; gi += 20;                  // 4 byte-iterations (×5 guest instrs)
