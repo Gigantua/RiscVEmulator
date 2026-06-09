@@ -2332,6 +2332,13 @@ static int rvx_load_module(const std::string& ptx, CUmodule* mod, CUfunction* fn
 #endif
 static void rvxblk_build() {
     g_xblk_ok = 0;
+    // OPT-IN (set RVX_ON=1 to build): at ~24k compiled words the single-function ptxas assemble sits
+    // past its super-linear memory knee — measured ~13 GB transient host commit. The driver's disk JIT
+    // cache makes that a ONE-TIME cost per generated-PTX change (cache-hit runs assemble at ~1.4 GB),
+    // but any translator change re-pays it, and a 13 GB spike can OOM a loaded machine. exec-ON is worth
+    // ~+5% ttf30 over the interpreter today — opt in via RVX_ON=1 when that trade is wanted. Default OFF
+    // until the multi-function (MULTIMOD) codegen lands and removes the knee.
+    if (!getenv("RVX_ON")) return;
     if (g_ncores != 1 || g_img.empty()) return;
     int N = g_pc2words;
     std::vector<uint8_t> comp(N, 0), seen(N, 0);
