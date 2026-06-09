@@ -259,10 +259,13 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
        RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61,
-       RC_WORDFILL=0x35, RC_ILL=0x00 };
+       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_ILL=0x00 };
        // RC_WORDFILL: direct-form fill loop (sX VAL,0(D); addi D,D,K; bne D,END) → 1 native loop uop.
        //   The byte-MEMSET arm matches clang's addi-temp form; this matches the temp-less direct form
        //   (the profile's sw-based screen fill, 2 dispatched uops/iter today). Generic, any width/stride.
+       // RC_WORDSCAN: counted search loop (addi C,C,Kc; addi P,P,Kp; b<cc> C,Z,→EXIT; lw V,off(P);
+       //   bne V,KEY,→top) → 1 native loop uop (params in g_ext; the ttf30 profile's lump-name scan,
+       //   ~15% of all uop-execs at 4 dispatched uops/iter). Two exits, EXACT per-path weights (3 vs 5).
        // RC_TEXCOL: textured-column loop (R_DrawColumn): pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=stride;
        //   frac+=step → 1 native loop. 1D vertical TEXSPAN; params (regs/offsets/shifts/stride) in g_ext, generic.
        // RC_COPYLOOPS: strided copy loop (load rt,0(src); store rt,0(dst); src+=Ks; dst+=Kd; bne cnt,lim) → 1
@@ -465,6 +468,32 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 if (ft == 0x00FFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 12; break; }   // 3 words; unresolved → translate-on-miss
                 ui = ft; }
             continue; }                                  // else budget-cut → ui stays, resume re-enters the loop
+        else if (cls == RC_WORDSCAN) {                   // counted search loop: whole loop, native (params in ext[])
+            uint32_t e = w0 >> 7;                                              // ext base index
+            uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]), xt=__ldg(&ext[e+2]);
+            uint32_t Cr=p0&31, Pr=(p0>>5)&31, Vr=(p0>>10)&31, Kr=(p0>>15)&31, Zr=(p0>>20)&31, cf3=(p0>>25)&7;
+            int32_t Kc=(int32_t)(int8_t)(p1&0xFF), Kp=(int32_t)(int8_t)((p1>>8)&0xFF);
+            int32_t off=((int32_t)p1)>>20;                                     // signed 12-bit load offset (hi 12 of p1)
+            uint32_t C=regs[Cr], P=regs[Pr], V=regs[Vr], KEY=regs[Kr], Z=regs[Zr];
+            { if (w1 != 0xFFFFFFFFu) { pf_h(&uops[w1]); pf_h(&uw[w1]); } }     // warm fall-through dispatch (hint)
+            uint32_t exited = 0;                                               // 1 = C-branch taken (forward exit)
+            do {                                                               // guest order: addi C; addi P; b<cc>; lw; bne
+                C += (uint32_t)Kc; P += (uint32_t)Kp;
+                int32_t sc=(int32_t)C, sz=(int32_t)Z; int t;
+                switch (cf3) { case 0:t=C==Z;break; case 1:t=C!=Z;break; case 4:t=sc<sz;break;
+                               case 5:t=sc>=sz;break; case 6:t=C<Z;break; default:t=C>=Z; }
+                if (t) { gi += 3; exited = 1; break; }                         // exit branch taken: 3 retired this iter
+                V = ld_i<uint32_t,NC1>(mem,ncores,id, P + (uint32_t)off);
+                gi += 5;                                                       // full iteration: 5 retired
+            } while (V != KEY && gi < budget);
+            regs[Cr]=C; regs[Pr]=P; regs[Vr]=V;                                // KEY/Z read-only
+            if (exited) {                                                      // → baked forward-exit uop
+                if (xt == 0xFFFFFFFFu) { ui |= HALT_BIT; continue; }           // unresolved exit target → halt (translator bakes it)
+                ui = xt; continue; }
+            if (V == KEY) {                                                    // match → fall through past the bne
+                if (w1 == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 5*4; break; }
+                ui = w1; continue; }
+            continue; }                                                        // budget-cut → ui stays, resume re-enters
         else if (cls == RC_STX) { uint32_t a = u1 + u2 + w1;          // mem[ra+rb+imm] = rc  (add + store → 1 uop)
             uint32_t val = regs[(w0>>7)&0x1F];                        // rc carried in the rd field
             switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)val);  break;
@@ -1286,6 +1315,56 @@ static int rvcud_try_wordfill(RvcudBuild& B, int w, uint32_t& ui) {
     return 3;
 }
 
+// COUNTED SEARCH LOOP → WORDSCAN. The lump-name-scan shape (W_CheckNumForName-style, ~15% of the
+// ttf30 profile's uop-execs at 4 dispatched uops/iter):
+//   addi C,C,Kc ; addi P,P,Kp ; b<cc> C,Z,→EXIT(fwd) ; lw V,off(P) ; bne V,KEY,→top
+// → ONE native loop uop (params in g_ext: regs + strides + offset; exit-target baked into ext[e+2]
+// in Pass 3, fall-through in w1). Two exits with EXACT per-path weights: exit-branch iter retires 3,
+// full iter 5. Matched by structure (any regs/strides/offset/cmp) → generic. Consumes 5 words.
+static int rvcud_try_wordscan(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+5 >= N) return 0;                                          // 5 body words + a fall-through instr
+    uint32_t i0=img[w],i1=img[w+1],i2=img[w+2],i3=img[w+3],i4=img[w+4];
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    if ((i0&0x7F)!=0x13 || F3(i0)!=0) return 0;                      // addi C,C,Kc
+    uint32_t C=RD(i0); if (C==0 || S1(i0)!=C) return 0;
+    int32_t Kc=(int32_t)rv_iimm(i0); if (Kc<-128||Kc>127) return 0;
+    for (int j=w+1; j<=w+4; j++) if (B.leader[j]) return 0;
+    if ((i1&0x7F)!=0x13 || F3(i1)!=0) return 0;                      // addi P,P,Kp
+    uint32_t P=RD(i1); if (P==0 || P==C || S1(i1)!=P) return 0;
+    int32_t Kp=(int32_t)rv_iimm(i1); if (Kp<-128||Kp>127) return 0;
+    if ((i2&0x7F)!=0x63) return 0;                                   // b<cc> C,Z,→EXIT (forward)
+    uint32_t cf3=F3(i2); if (cf3==2||cf3==3) return 0;
+    uint32_t Z;
+    if      (S1(i2)==C) Z=S2(i2);
+    else return 0;                                                   // C must be the FIRST operand (cmp polarity fixed)
+    if (Z==C || Z==P) return 0;                                      // Z loop-invariant (x0 allowed)
+    int32_t bofs=(int32_t)rv_bimm(i2); if (bofs<=0) return 0;        // forward exit only
+    uint32_t twx=(uint32_t)((B.base+(uint32_t)(w+2)*4 + (uint32_t)bofs - B.base)>>2);
+    if ((int)twx >= N) return 0;
+    if ((i3&0x7F)!=0x03 || F3(i3)!=2 || S1(i3)!=P) return 0;         // lw V,off(P)
+    uint32_t V=RD(i3); int32_t off=(int32_t)rv_iimm(i3);
+    if (V==0 || V==C || V==P || V==Z) return 0;
+    if ((i4&0x7F)!=0x63 || F3(i4)!=1) return 0;                      // bne V,KEY,→top
+    uint32_t KEY;
+    if      (S1(i4)==V) KEY=S2(i4);
+    else if (S2(i4)==V) KEY=S1(i4);
+    else return 0;
+    if (KEY==C || KEY==P || KEY==V) return 0;                        // KEY loop-invariant (x0 allowed)
+    uint32_t bpc=B.base+(uint32_t)(w+4)*4, twb=(bpc+rv_bimm(i4)-B.base)>>2;
+    if ((int)twb != w) return 0;                                     // back-edge to the loop header
+    uint32_t e=(uint32_t)B.ext.size();
+    B.ext.push_back((C&31)|((P&31)<<5)|((V&31)<<10)|((KEY&31)<<15)|((Z&31)<<20)|((cf3&7)<<25));
+    B.ext.push_back(((uint32_t)Kc&0xFF) | (((uint32_t)Kp&0xFF)<<8) | (((uint32_t)off&0xFFF)<<20));
+    B.ext.push_back(twx);                                            // exit-target WORD; Pass 3 rewrites to uop idx
+    B.pc2uop[w]=ui;
+    B.w0.push_back(RC_WORDSCAN | (e<<7));                            // ext base index in bits[31:7]
+    B.w1.push_back(0);                                              // fall-through baked in Pass 3 (full w1)
+    B.uw.push_back(5); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+5)); ui++;
+    return 5;
+}
+
 // MEMCPY LOOP → COPYLOOP. A forward unit-stride BYTE copy step `lbu/lb rt,0(src); sb rt,0(dst);
 // addi src,1; addi dst,1` (w..w+3, any order) immediately followed by `bne creg,rlim, →w` (back-edge
 // to this loop header) becomes ONE uop that runs the whole copy in-kernel, word-widened (4 bytes/step
@@ -1794,6 +1873,7 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
         if (consumed == 0) consumed = rvcud_try_memset(B, w, ui);    // whole byte-fill (memset) loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_wordfill(B, w, ui);  // direct-form sX-fill loop → 1 native uop
+        if (consumed == 0) consumed = rvcud_try_wordscan(B, w, ui);  // counted search loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
         if (consumed == 0) consumed = rvcud_try_copyloops(B, w, ui); // whole strided copy loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
@@ -1838,6 +1918,12 @@ static void rvcud_build(RvcudBuild& B) {
         else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS || cls == RC_TEXCOL) {  // w1 = full fall-through uop index (params in ext[])
             uint32_t tw = B.tgt[i];
             B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
+        }
+        else if (cls == RC_WORDSCAN) {                               // w1 = fall-through; ext[e+2] word → exit-target uop idx
+            uint32_t tw = B.tgt[i];
+            B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
+            uint32_t e = B.w0[i] >> 7, xw = B.ext[e+2];
+            B.ext[e+2] = ((int)xw < N && B.pc2uop[xw] != RC_BADUOP) ? B.pc2uop[xw] : 0xFFFFFFFFu;
         }
     }
 }
