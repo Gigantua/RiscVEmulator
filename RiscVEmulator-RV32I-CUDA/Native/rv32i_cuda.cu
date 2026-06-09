@@ -222,7 +222,7 @@ rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
 enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST=0x23,
        RC_CONST=0x37, RC_LEA=0x1B, RC_ADDC=0x2B, RC_JAL=0x6F, RC_JALR=0x67, RC_NOP=0x0F,
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
-       RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65,
+       RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49, RC_ILL=0x00 };
        // RC_BFE (RVCUD_BITFIELD): rd = (rs >> k) & mask  — fused srli+andi; 0x09 is a free sparse code.
        // RC_DIVLOOP: clang's rv32i bit-serial restoring-division loop (the body shared by __udivsi3/__divsi3,
@@ -335,6 +335,21 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 2: r=                   ld_i<uint32_t>(mem,ncores,id,a); break;
                           case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
                           default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // falls through to rd writeback
+        else if (cls == RC_LDXS) {                                    // rd = mem[(ra<<k)+rb+imm]  (slli+add+load → 1 uop)
+            uint32_t k = (w1>>24)&0x1F; int32_t imm = ((int32_t)(w1 & 0x00FFFFFF) << 8) >> 8;   // scale k; sign-ext 24→32
+            uint32_t a = (u1 << k) + u2 + (uint32_t)imm;              // scaled address lives only in this CUDA register
+            switch (f3) { case 0: r=(uint32_t)(int8_t) ld_i<uint8_t> (mem,ncores,id,a); break;
+                          case 1: r=(uint32_t)(int16_t)ld_i<uint16_t>(mem,ncores,id,a); break;
+                          case 2: r=                   ld_i<uint32_t>(mem,ncores,id,a); break;
+                          case 4: r=                   ld_i<uint8_t> (mem,ncores,id,a); break;
+                          default:r=                   ld_i<uint16_t>(mem,ncores,id,a); } }   // falls through to rd writeback
+        else if (cls == RC_STXS) {                                    // mem[(ra<<k)+rb+imm] = rc  (slli+add+store → 1 uop)
+            uint32_t k = (w1>>24)&0x1F; int32_t imm = ((int32_t)(w1 & 0x00FFFFFF) << 8) >> 8;
+            uint32_t a = (u1 << k) + u2 + (uint32_t)imm; uint32_t val = regs[(w0>>7)&0x1F];   // rc carried in rd field
+            switch (f3) { case 0: st_i<uint8_t> (mem,ncores,id,a,(uint8_t)val);  break;
+                          case 1: st_i<uint16_t>(mem,ncores,id,a,(uint16_t)val); break;
+                          default:st_i<uint32_t>(mem,ncores,id,a,val); }
+            ui += 1; gi += wt; continue; }
         else if (cls == RC_MULADD) r = u1 * w1 + u2;                             // affine ×const tree + live const-reg → 1 IMAD
         else if (cls == RC_COPYPI) {                     // mem[dst]=mem[src]; rt=loaded; src+=Ks; dst+=Kd  (lb;sb;addi;addi → 1 uop)
             uint32_t t;                                  // u1=src base, u2=dst base; w1 = Ks(lo16) | Kd(hi16); rt = rd field
@@ -1012,6 +1027,50 @@ static int rvcud_try_copyloop(RvcudBuild& B, int w, uint32_t& ui) {
     return 5;
 }
 
+// SCALED-INDEXED LOAD (virtual-register address). `slli T,ra,k ; add T2,T,rb ; lX rd,imm(T2)` → ONE uop:
+// rd = mem[(ra<<k) + rb + imm]. The scaled address (T, T2) lives only in CUDA registers inside the uop —
+// a "virtual register" beyond the guest's 32 — cutting two shared writes + two shared reads. Universal
+// array-indexing idiom (element size 2^k). ra,rb are read at their live-in values exactly as the original
+// three instructions did (operands kept distinct from the temps); T/T2 must be dead after (or == rd).
+static int rvcud_try_ldxs(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+2 >= N) return 0;
+    uint32_t i0 = img[w];
+    if ((i0 & 0x7F) != 0x13 || ((i0>>12)&7) != 1) return 0;          // slli T,ra,k
+    uint32_t T=(i0>>7)&0x1F, ra=(i0>>15)&0x1F, k=(i0>>20)&0x1F;
+    if (T == 0 || B.leader[w+1]) return 0;
+    uint32_t i1 = img[w+1];
+    if ((i1 & 0x7F) != 0x33 || ((i1>>25)&0x7F) != 0 || ((i1>>12)&7) != 0) return 0;  // add T2, {T, rb}
+    uint32_t T2=(i1>>7)&0x1F, a1=(i1>>15)&0x1F, b1=(i1>>20)&0x1F, rb;
+    if      (a1==T) rb=b1;
+    else if (b1==T) rb=a1;
+    else return 0;
+    if (B.leader[w+2]) return 0;
+    uint32_t i2=img[w+2], op2=i2&0x7F, f3=(i2>>12)&7, base=(i2>>15)&0x1F;
+    if (base != T2) return 0;                                       // the mem op must address through T2
+    if (ra==T || ra==T2 || rb==T || rb==T2) return 0;               // ra,rb must be clean live-ins (not the temps)
+    if (op2 == 0x03 && (f3==0||f3==1||f3==2||f3==4||f3==5)) {        // scaled-indexed LOAD
+        uint32_t rd=(i2>>7)&0x1F;
+        if (rd == 0) return 0;
+        bool T2dead = !((B.liveout[w+2] >> T2) & 1u);
+        if (!(T2dead || T2==rd)) return 0;                          // address temp must not escape
+        if (T != T2) { bool Tdead = !((B.liveout[w+2] >> T) & 1u); if (!(Tdead || T==rd)) return 0; }
+        B.pc2uop[w] = ui;
+        B.w0.push_back(RCW0(RC_LDXS, rd, ra, rb, f3, 0, RP_UNC, 0));
+        B.w1.push_back(((uint32_t)k << 24) | (rv_iimm(i2) & 0x00FFFFFFu));   // k in hi byte; 12-bit imm sign-ext-to-24 in low
+    } else if (op2 == 0x23 && f3 <= 2) {                            // scaled-indexed STORE
+        uint32_t rc=(i2>>20)&0x1F;                                  // stored value (carried in the rd field)
+        if (rc==T || rc==T2) return 0;                              // stored value must be a clean live-in
+        bool T2dead = !((B.liveout[w+2] >> T2) & 1u); if (!T2dead) return 0;   // store writes no reg → temp must die
+        if (T != T2) { bool Tdead = !((B.liveout[w+2] >> T) & 1u); if (!Tdead) return 0; }
+        B.pc2uop[w] = ui;
+        B.w0.push_back(RCW0(RC_STXS, rc, ra, rb, f3, 0, RP_UNC, 0));
+        B.w1.push_back(((uint32_t)k << 24) | (rv_simm(i2) & 0x00FFFFFFu));
+    } else return 0;
+    B.uw.push_back(3); B.u2pc.push_back(B.base + (uint32_t)w*4); B.tgt.push_back(RC_NOTGT); ui++;
+    return 3;
+}
+
 // INDEXED LOAD/STORE (virtual-register address). `add rt,ra,rb; lX rd,imm(rt)` (or a store) → ONE uop:
 // rd = mem[ra+rb+imm] / mem[ra+rb+imm] = rc. The address temp rt never reaches the shared regfile — it
 // lives only in a CUDA register inside the uop, cutting one shared write + one shared read (the regfile
@@ -1242,6 +1301,7 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
         if (consumed == 0) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
         if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
+        if (consumed == 0) consumed = rvcud_try_ldxs(B, w, ui);     // slli + add + load → scaled-indexed load (1 uop)
         if (consumed == 0) consumed = rvcud_try_ldx(B, w, ui);      // add + load/store → indexed mem op (1 uop)
         if (consumed == 0) consumed = rvcud_try_postinc(B, w, ui);  // load/store + base post-increment → 1 uop
 #if RVCUD_LOADFWD
