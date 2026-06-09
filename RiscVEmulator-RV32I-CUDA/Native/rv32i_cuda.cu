@@ -259,7 +259,11 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
        RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61,
-       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_ILL=0x00 };
+       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_MELTCOL=0x55, RC_ILL=0x00 };
+       // RC_MELTCOL: strided copy whose src-advance goes through a temp (lX V,0(S); addi S2,S,Ks;
+       //   sX V,0(D); addi D,D,Kd; mv S,S2; bne S2,LIM) → 1 native loop uop (params in g_ext).
+       //   The COPYLOOPS matcher requires in-place addi src bumps and misses this 6-word form
+       //   (the ttf30 profile's screen-melt column, 5 dispatched uops/iter today). Generic.
        // RC_WORDFILL: direct-form fill loop (sX VAL,0(D); addi D,D,K; bne D,END) → 1 native loop uop.
        //   The byte-MEMSET arm matches clang's addi-temp form; this matches the temp-less direct form
        //   (the profile's sw-based screen fill, 2 dispatched uops/iter today). Generic, any width/stride.
@@ -494,6 +498,24 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 if (w1 == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 5*4; break; }
                 ui = w1; continue; }
             continue; }                                                        // budget-cut → ui stays, resume re-enters
+        else if (cls == RC_MELTCOL) {                    // temp-advance strided copy: whole loop, native (params in ext[])
+            uint32_t e = w0 >> 7; uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]);
+            uint32_t Sr=p0&31, Dr=(p0>>5)&31, Vr=(p0>>10)&31, S2r=(p0>>15)&31, Lr=(p0>>20)&31, lf3=(p0>>25)&7;
+            int32_t Ks=(int32_t)(int16_t)(p1&0xFFFF), Kd=(int32_t)(int16_t)(p1>>16);
+            uint32_t S=regs[Sr], D=regs[Dr], LIM=regs[Lr], v=0, S2v;
+            { if (w1 != 0xFFFFFFFFu) { pf_h(&uops[w1]); pf_h(&uw[w1]); } }     // warm exit dispatch (hint)
+            do {                                                               // guest order: load; S2=S+Ks; store; D+=Kd; S=S2; bne
+                switch (lf3) { case 0: v=(uint32_t)(int8_t) ld_i<uint8_t,NC1> (mem,ncores,id,S); st_i<uint8_t,NC1> (mem,ncores,id,D,(uint8_t)v);  break;
+                               case 1: v=(uint32_t)(int16_t)ld_i<uint16_t,NC1>(mem,ncores,id,S); st_i<uint16_t,NC1>(mem,ncores,id,D,(uint16_t)v); break;
+                               case 2: v=                   ld_i<uint32_t,NC1>(mem,ncores,id,S); st_i<uint32_t,NC1>(mem,ncores,id,D,v);           break;
+                               case 4: v=                   ld_i<uint8_t,NC1> (mem,ncores,id,S); st_i<uint8_t,NC1> (mem,ncores,id,D,(uint8_t)v);  break;
+                               default:v=                   ld_i<uint16_t,NC1>(mem,ncores,id,S); st_i<uint16_t,NC1>(mem,ncores,id,D,(uint16_t)v); }
+                S2v = S + (uint32_t)Ks; D += (uint32_t)Kd; S = S2v; gi += 6;   // 6 guest instrs/iteration
+            } while (S2v != LIM && gi < budget);
+            regs[Sr]=S; regs[Dr]=D; regs[Vr]=v; regs[S2r]=S2v;                 // LIM read-only
+            if (S2v == LIM) { if (w1 == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 6*4; break; }
+                ui = w1; }
+            continue; }                                                        // else budget-cut → ui stays, resume re-enters
         else if (cls == RC_STX) { uint32_t a = u1 + u2 + w1;          // mem[ra+rb+imm] = rc  (add + store → 1 uop)
             uint32_t val = regs[(w0>>7)&0x1F];                        // rc carried in the rd field
             switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)val);  break;
@@ -1365,6 +1387,48 @@ static int rvcud_try_wordscan(RvcudBuild& B, int w, uint32_t& ui) {
     return 5;
 }
 
+// TEMP-ADVANCE STRIDED COPY → MELTCOL. The screen-melt column shape (5 dispatched uops/iter in the
+// ttf30 profile) — a strided copy whose src-advance goes through a TEMP, defeating COPYLOOPS:
+//   lX V,0(S) ; addi S2,S,Ks ; sX V,0(D) ; addi D,D,Kd ; mv S,S2 ; bne S2,LIM,→top
+// → ONE native loop uop (params in g_ext; strides signed 16-bit). All four written regs (V,S2,D,S)
+// reproduced exactly each iteration; LIM read-only. Matched by structure → generic. Consumes 6 words.
+static int rvcud_try_meltcol(RvcudBuild& B, int w, uint32_t& ui) {
+    const int N = B.nwords; const uint32_t* img = B.img;
+    if (w+6 >= N) return 0;                                          // 6 body words + a fall-through instr
+    uint32_t i0=img[w],i1=img[w+1],i2=img[w+2],i3=img[w+3],i4=img[w+4],i5=img[w+5];
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2_=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    uint32_t lf3=F3(i0);
+    if ((i0&0x7F)!=0x03 || !(lf3==0||lf3==1||lf3==2||lf3==4||lf3==5) || rv_iimm(i0)!=0) return 0;  // lX V,0(S)
+    uint32_t V=RD(i0), S=S1(i0);
+    if (V==0 || S==0 || V==S) return 0;
+    for (int j=w+1; j<=w+5; j++) if (B.leader[j]) return 0;
+    if ((i1&0x7F)!=0x13 || F3(i1)!=0 || S1(i1)!=S) return 0;          // addi S2,S,Ks (next-src into a temp)
+    uint32_t S2=RD(i1); int32_t Ks=(int32_t)rv_iimm(i1);
+    if (S2==0 || S2==S || S2==V || Ks<-32768 || Ks>32767) return 0;
+    if ((i2&0x7F)!=0x23 || S2_(i2)!=V || rv_simm(i2)!=0) return 0;    // sX V,0(D)
+    uint32_t sf3=F3(i2), D=S1(i2);
+    bool okw = ((lf3==0||lf3==4)&&sf3==0) || ((lf3==1||lf3==5)&&sf3==1) || (lf3==2&&sf3==2);
+    if (!okw || D==0 || D==S || D==S2 || D==V) return 0;
+    if ((i3&0x7F)!=0x13 || F3(i3)!=0 || RD(i3)!=D || S1(i3)!=D) return 0;  // addi D,D,Kd
+    int32_t Kd=(int32_t)rv_iimm(i3); if (Kd<-32768 || Kd>32767) return 0;
+    if ((i4&0x7F)!=0x13 || F3(i4)!=0 || RD(i4)!=S || S1(i4)!=S2 || rv_iimm(i4)!=0) return 0;  // mv S,S2
+    if ((i5&0x7F)!=0x63 || F3(i5)!=1) return 0;                       // bne S2,LIM,→top
+    uint32_t b1=S1(i5), b2=S2_(i5), LIM;
+    if (b1==S2) LIM=b2; else if (b2==S2) LIM=b1; else return 0;
+    if (LIM==V || LIM==S || LIM==S2 || LIM==D) return 0;              // LIM loop-invariant (x0 allowed)
+    uint32_t bpc=B.base+(uint32_t)(w+5)*4, twb=(bpc+rv_bimm(i5)-B.base)>>2;
+    if ((int)twb != w) return 0;                                      // back-edge to the loop header
+    uint32_t e=(uint32_t)B.ext.size();
+    B.ext.push_back((S&31)|((D&31)<<5)|((V&31)<<10)|((S2&31)<<15)|((LIM&31)<<20)|((lf3&7)<<25));
+    B.ext.push_back(((uint32_t)Ks&0xFFFF) | (((uint32_t)Kd&0xFFFF)<<16));
+    B.pc2uop[w]=ui;
+    B.w0.push_back(RC_MELTCOL | (e<<7));                              // ext base index in bits[31:7]
+    B.w1.push_back(0);                                               // fall-through baked in Pass 3 (full w1)
+    B.uw.push_back(6); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+6)); ui++;
+    return 6;
+}
+
 // MEMCPY LOOP → COPYLOOP. A forward unit-stride BYTE copy step `lbu/lb rt,0(src); sb rt,0(dst);
 // addi src,1; addi dst,1` (w..w+3, any order) immediately followed by `bne creg,rlim, →w` (back-edge
 // to this loop header) becomes ONE uop that runs the whole copy in-kernel, word-widened (4 bytes/step
@@ -1874,6 +1938,7 @@ static void rvcud_build(RvcudBuild& B) {
         if (consumed == 0) consumed = rvcud_try_memset(B, w, ui);    // whole byte-fill (memset) loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_wordfill(B, w, ui);  // direct-form sX-fill loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_wordscan(B, w, ui);  // counted search loop → 1 native uop
+        if (consumed == 0) consumed = rvcud_try_meltcol(B, w, ui);   // temp-advance strided copy loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
         if (consumed == 0) consumed = rvcud_try_copyloops(B, w, ui); // whole strided copy loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
@@ -1915,7 +1980,7 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x003FFFFFu) : 0x003FFFFFu;
             B.w1[i] = (B.w1[i] & 0xFFC00000u) | idx;
         }
-        else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS || cls == RC_TEXCOL) {  // w1 = full fall-through uop index (params in ext[])
+        else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS || cls == RC_TEXCOL || cls == RC_MELTCOL) {  // w1 = full fall-through uop index (params in ext[])
             uint32_t tw = B.tgt[i];
             B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
         }
