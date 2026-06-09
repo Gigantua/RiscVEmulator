@@ -59,3 +59,19 @@ Leftover hot loops the fusion playbook still owns (exact, from hot.csv):
 commit to 6+7 as one program (they unlock each other AND re-land ~6 archived units), with 8 as the
 parallel render-side ceiling break. Validation discipline unchanged: bit-identical gate, exact
 weights, deterministic `--ttf`, pixel-exact shots.
+
+## MEASURED OUTCOMES (branch `structural`, same session)
+
+| # | Mechanism | ttf30 best | Verdict |
+|---|---|---:|---|
+| — | baseline (post-batch 2bcfc64) | 14.08 | reference |
+| 1 | WORDFILL | 14.05 | KEPT (sub-noise solo, ~1.4% of execs; correct loop collapse, tail arm) |
+| 2 | WORDSCAN | 14.47 | **KEPT (+2.8%)** |
+| 3 | MELTCOL | 14.96 | **KEPT (+3.4%)** |
+| 4 | dispatch ladder reorder (BR 2nd, SUB 5th, INCBR 7th) | **16.30** | **KEPT (+8.9% — the round's biggest win)**; the two-level gate variant is subsumed (hot 4 classes ≤4 compares) |
+| 5 | MACROBLOCK/BLOCKRUN (overlay super-uop) | 15.71 | **REVERTED (−3.6%)** — after the reorder, 1:1 ALUI dispatch costs ONE compare, so the per-member ext loads cost more than the saved ladder walks; the "per-uop machinery regresses" lesson re-confirmed |
+| 6–8 | MULTIMOD / cheap handoffs / WARPSPAN | — | multi-session builds, de-risked by this session's probes (maxw8k: low coverage thrashes 20×; knee: any PTX perturbation explodes at 24k → the .func-in-one-module design is the only viable MULTIMOD) |
+
+Net this round: ttf30 14.08 → 16.30 (+15.8%); ttf90 15.61 → 16.60; aggregate diverge ratio improved
+0.773 → 0.804 (BR 2nd helps the branchy guest), compute 3.42 → 3.58, data within noise. Gate
+bit-identical throughout; f1 = 60,589 px pixel-exact; f40 clean.
