@@ -1914,27 +1914,40 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                 switch(f3){case 0:cc="eq";break;case 1:cc="ne";break;case 4:cc="lt";sg=true;break;case 5:cc="ge";sg=true;break;case 6:cc="lt";break;default:cc="ge";}
                 rvx_app(s,"setp.%s.%s %%p0, %%x%u, %%x%u;\n",cc,sg?"s32":"u32",rs1,rs2);
                 xfer("@%p0 ",t); } break;                                                            // not-taken falls through to next emitted word
-    case 0x03:{ if(!rd) break; addr((int)rv_iimm(instr));
-                switch(f3){
-                  case 0: rvx_app(s,"ld.global.s8 %%x%u, [%%a0];\n",rd); break;                       // lb
-                  case 4: rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\n",rd); break;                       // lbu
-                  case 1: rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\nld.global.s8 %%t1, [%%a0+1];\nshl.b32 %%t1, %%t1, 8;\nor.b32 %%x%u, %%x%u, %%t1;\n",rd,rd,rd); break;          // lh
-                  case 5: rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\nld.global.u8 %%t1, [%%a0+1];\nshl.b32 %%t1, %%t1, 8;\nor.b32 %%x%u, %%x%u, %%t1;\n",rd,rd,rd); break;          // lhu
-                  default: // lw: byte-wise, fault-free regardless of alignment
-                    rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\n"
-                              "ld.global.u8 %%t1, [%%a0+1];\nshl.b32 %%t1, %%t1, 8;\nor.b32 %%x%u, %%x%u, %%t1;\n"
-                              "ld.global.u8 %%t1, [%%a0+2];\nshl.b32 %%t1, %%t1, 16;\nor.b32 %%x%u, %%x%u, %%t1;\n"
-                              "ld.global.u8 %%t1, [%%a0+3];\nshl.b32 %%t1, %%t1, 24;\nor.b32 %%x%u, %%x%u, %%t1;\n",rd,rd,rd,rd,rd,rd,rd); }
+    case 0x03:{ if(!rd) break; addr((int)rv_iimm(instr));                                             // %t0=guest addr, %a0=M+addr
+                if(f3==0){ rvx_app(s,"ld.global.s8 %%x%u, [%%a0];\n",rd); break; }                     // lb (always 1-aligned)
+                if(f3==4){ rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\n",rd); break; }                     // lbu
+                if(f3==1||f3==5){ // lh/lhu: aligned ld.u16 fast path, else byte-wise (predicated ⇒ misaligned ld.u16 skipped)
+                    const char* sty=(f3==1)?"s16":"u16"; const char* hib=(f3==1)?"s8":"u8";
+                    rvx_app(s,"and.b32 %%t1, %%t0, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                              "@%%p0 ld.global.%s %%x%u, [%%a0];\n"
+                              "@!%%p0 ld.global.u8 %%x%u, [%%a0];\n@!%%p0 ld.global.%s %%t1, [%%a0+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
+                              sty,rd, rd,hib,rd,rd); break; }
+                // lw: aligned ld.u32 fast path (the common case), else byte-wise — predication makes the
+                //     misaligned ld.u32 a no-op, so the unrecoverable misaligned fault can never fire.
+                rvx_app(s,"and.b32 %%t1, %%t0, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                          "@%%p0 ld.global.u32 %%x%u, [%%a0];\n"
+                          "@!%%p0 ld.global.u8 %%x%u, [%%a0];\n"
+                          "@!%%p0 ld.global.u8 %%t1, [%%a0+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
+                          "@!%%p0 ld.global.u8 %%t1, [%%a0+2];\n@!%%p0 shl.b32 %%t1, %%t1, 16;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
+                          "@!%%p0 ld.global.u8 %%t1, [%%a0+3];\n@!%%p0 shl.b32 %%t1, %%t1, 24;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
+                          rd, rd, rd,rd, rd,rd, rd,rd);
               } break;
     case 0x23:{ addr((int)rv_simm(instr));
-                switch(f3){
-                  case 0: rvx_app(s,"st.global.u8 [%%a0], %%x%u;\n",rs2); break;                      // sb
-                  case 1: rvx_app(s,"st.global.u8 [%%a0], %%x%u;\nshr.b32 %%t1, %%x%u, 8;\nst.global.u8 [%%a0+1], %%t1;\n",rs2,rs2); break;   // sh
-                  default: // sw: byte-wise
-                    rvx_app(s,"st.global.u8 [%%a0], %%x%u;\n"
-                              "shr.b32 %%t1, %%x%u, 8;\nst.global.u8 [%%a0+1], %%t1;\n"
-                              "shr.b32 %%t1, %%x%u, 16;\nst.global.u8 [%%a0+2], %%t1;\n"
-                              "shr.b32 %%t1, %%x%u, 24;\nst.global.u8 [%%a0+3], %%t1;\n",rs2,rs2,rs2,rs2); }
+                if(f3==0){ rvx_app(s,"st.global.u8 [%%a0], %%x%u;\n",rs2); break; }                    // sb
+                if(f3==1){ // sh: aligned st.u16 fast path, else byte-wise
+                    rvx_app(s,"and.b32 %%t1, %%t0, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                              "@%%p0 st.global.u16 [%%a0], %%x%u;\n"
+                              "@!%%p0 st.global.u8 [%%a0], %%x%u;\n@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%%a0+1], %%t1;\n",
+                              rs2,rs2,rs2); break; }
+                // sw: aligned st.u32 fast path, else byte-wise
+                rvx_app(s,"and.b32 %%t1, %%t0, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                          "@%%p0 st.global.u32 [%%a0], %%x%u;\n"
+                          "@!%%p0 st.global.u8 [%%a0], %%x%u;\n"
+                          "@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%%a0+1], %%t1;\n"
+                          "@!%%p0 shr.b32 %%t1, %%x%u, 16;\n@!%%p0 st.global.u8 [%%a0+2], %%t1;\n"
+                          "@!%%p0 shr.b32 %%t1, %%x%u, 24;\n@!%%p0 st.global.u8 [%%a0+3], %%t1;\n",
+                          rs2, rs2, rs2,rs2,rs2);
               } break;
     case 0x13:{ if(!rd) break; int im=(int)rv_iimm(instr); uint32_t sh=im&0x1F;
                 switch(f3){
