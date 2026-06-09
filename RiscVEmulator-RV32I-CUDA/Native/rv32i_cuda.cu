@@ -2505,13 +2505,9 @@ static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod,
 #endif
 static void rvxblk_build() {
     g_xblk_ok = 0;
-    // OPT-IN (set RVX_ON=1 to build): at ~24k compiled words the single-function ptxas assemble sits
-    // past its super-linear memory knee — measured ~13 GB transient host commit. The driver's disk JIT
-    // cache makes that a ONE-TIME cost per generated-PTX change (cache-hit runs assemble at ~1.4 GB),
-    // but any translator change re-pays it, and a 13 GB spike can OOM a loaded machine. exec-ON is worth
-    // ~+5% ttf30 over the interpreter today — opt in via RVX_ON=1 when that trade is wanted. Default OFF
-    // until the multi-function (MULTIMOD) codegen lands and removes the knee.
-    if (!getenv("RVX_ON")) return;
+    // Default ON again: MULTIMOD's per-region out-of-process assembly removed the single-function ptxas
+    // memory knee (the old monolith transiently committed ~13 GB on any PTX change; now ≤~1.4 GB peak
+    // with each region assembled in a spawned ptxas). RVX_OFF=1 still disables exec entirely.
     if (g_ncores != 1 || g_img.empty()) return;
     int maxw = RVX_MAXW; if (const char* e=getenv("RVX_MAXW")) { int v=atoi(e); if (v>0) maxw=v; }
     int N = g_pc2words;
