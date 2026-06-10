@@ -96,3 +96,5 @@ bit-identical throughout; f1 = 60,589 px pixel-exact; f40 clean.
 | h1 | ttf harness: 8-byte-wide frame detection (was byte-wise FNV ≈ 0.4 ms/batch ≈ 20% of wall) | 97.3 → 105.2 printed, GPU unchanged | KEPT — measurement overhead, guest work identical |
 | h2 | Pinned staging bounce for bulk host transfers | 105 vs 105 | REVERTED (tie) — FB copy was already cheap; the gap is WDDM submissions |
 | h3 | Staged-MMIO mailbox: pinned page + on-stream stage/drain micro-kernels replace ~12 sync memcpys/StepN | 105.2 → **110.7–115.5** | KEPT — host gap 132 → ~68 ms; subagent's top recommendation. CUDA-graphics interop evaluated and DROPPED (zero benchmark gain, SDL2 has no public D3D texture access). |
+| r2 | Budget-count batching, retried at 122 MIPS kernel | 112.0 vs 111.8 | REVERTED (tie again) — %cnt adds stay hidden even now |
+| r3 | Branch-free funnel lw (2 overlapping aligned loads + shf.r, +8 B buffer guard) for alignment-unproven flat-layout loads | **120.5 vs 112.2 (+7.4%)** | KEPT — wins all pairs; replaces the ~14-instr predicated checked path with 9 branch-free instrs, loads issue independently |

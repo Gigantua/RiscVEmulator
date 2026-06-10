@@ -735,9 +735,12 @@ API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     // shared/PTX registers), but the host reads pc after EVERY launch — and on Windows/WDDM managed
     // memory migrates wholesale at every launch/sync boundary (~0.5 ms per step_all call measured).
     if ((e = cudaHostAlloc((void**)&g_state, (size_t)nCores * sizeof(CoreState), cudaHostAllocMapped)) != cudaSuccess) return (int)e;
-    if ((e = cudaMalloc(&g_mem, (size_t)nCores * memBytes)) != cudaSuccess) return (int)e;
+    // +8 guard bytes: the exec_block's branch-free funnel load reads the aligned word PAIR
+    // overlapping a (possibly misaligned) guest address — the high word of the last in-bounds
+    // access lands just past the buffer end.
+    if ((e = cudaMalloc(&g_mem, (size_t)nCores * memBytes + 8)) != cudaSuccess) return (int)e;
     memset(g_state, 0, (size_t)nCores * sizeof(CoreState));
-    cudaMemset(g_mem, 0, (size_t)nCores * memBytes);
+    cudaMemset(g_mem, 0, (size_t)nCores * memBytes + 8);
     cudaDeviceSynchronize();
     return (int)cudaGetLastError();
 }
@@ -2316,7 +2319,22 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                 switch(f3){case 0:cc="eq";break;case 1:cc="ne";break;case 4:cc="lt";sg=true;break;case 5:cc="ge";sg=true;break;case 6:cc="lt";break;default:cc="ge";}
                 rvx_app(s,"setp.%s.%s %%p0, %%x%u, %%x%u;\n",cc,sg?"s32":"u32",rs1,rs2);
                 xfer(true,t); } break;                                                               // not-taken falls through to next emitted word
-    case 0x03:{ if(!rd) break; addr((int)rv_iimm(instr), f3==2?4:(f3==1||f3==5)?2:1); wr(rd,0xFF);     // loaded value: unknown mod 4
+    case 0x03:{ if(!rd) break;
+                { int32_t im=(int)rv_iimm(instr);
+                  bool al4 = cse.mod4[rs1]!=0xFF && ((((uint32_t)cse.mod4[rs1]+(uint32_t)im)&3u)==0);
+                  if (f3==2 && !al4 && nc==1) {
+                      // lw, alignment unproven, flat layout: BRANCH-FREE funnel load — the two aligned
+                      // words overlapping the address (the +8 B buffer guard makes the high word safe)
+                      // and one shf.r. 9 instructions, no predication, both loads issue independently;
+                      // the checked path was ~14 with a predicated 4×byte fallback.
+                      rvx_app(s,"add.s32 %%t0, %%x%u, %d;\n"
+                                "and.b32 %%t1, %%t0, -4;\ncvt.u64.u32 %%a1, %%t1;\nadd.u64 %%a1, %%a1, %%M;\n"
+                                "ld.global.u32 %%t1, [%%a1];\nld.global.u32 %%t2, [%%a1+4];\n"
+                                "and.b32 %%t0, %%t0, 3;\nshl.b32 %%t0, %%t0, 3;\n"
+                                "shf.r.wrap.b32 %%x%u, %%t1, %%t2, %%t0;\n", rs1, im, rd);
+                      cse.t0Valid=false; wr(rd,0xFF); break;
+                  } }
+                addr((int)rv_iimm(instr), f3==2?4:(f3==1||f3==5)?2:1); wr(rd,0xFF);     // loaded value: unknown mod 4
                 if(f3==0){ rvx_app(s,"ld.global.s8 %%x%u, [%s];\n",rd,A); break; }                     // lb (always 1-aligned)
                 if(f3==4){ rvx_app(s,"ld.global.u8 %%x%u, [%s];\n",rd,A); break; }                     // lbu
                 if(f3==1||f3==5){ // lh/lhu: proven-aligned → bare ld; else runtime check + byte-wise fallback
