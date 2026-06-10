@@ -2522,6 +2522,34 @@ static bool rvx_match_divloop(const uint32_t* img, int Nw, uint32_t base, int w,
     return true;
 }
 
+// Byte-copy loop shape: lb/lbu RT,0(S); sb RT,0(D); addi D,D,1; addi S,S,1; bne D,END,→top
+// (the two addis in either order). This is the present-path screen copy in the boot/menu workload
+// (~24% of guest-pc samples, 64000 iterations per frame). Replaced by a CALL into the tiny dedicated
+// `xcopy` unit (word-widened funnel copy; knee-ISOLATED — that unit assembles alone in microseconds)
+// plus a straight-line closed form for the guest registers: D→END, S+=len, RT=last byte copied.
+struct RvxCpy { uint32_t S,D,END,RT; bool sext; };
+static bool rvx_match_copyloop(const uint32_t* img, int Nw, uint32_t base, int w, RvxCpy& o) {
+    if (w+5 >= Nw) return false;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    const uint32_t* i = img + w;
+    if ((i[0]&0x7F)!=0x03 || (F3(i[0])!=0 && F3(i[0])!=4) || rv_iimm(i[0])!=0) return false;
+    o.sext = F3(i[0])==0; o.RT=RD(i[0]); o.S=S1(i[0]);
+    if ((i[1]&0x7F)!=0x23 || F3(i[1])!=0 || S2(i[1])!=o.RT || rv_simm(i[1])!=0) return false;
+    o.D=S1(i[1]);
+    auto isInc=[&](uint32_t in, uint32_t r){ return (in&0x7F)==0x13 && F3(in)==0 && RD(in)==r && S1(in)==r && rv_iimm(in)==1; };
+    if (isInc(i[2],o.D)      && isInc(i[3],o.S)) {}
+    else if (isInc(i[2],o.S) && isInc(i[3],o.D)) {}
+    else return false;
+    if ((i[4]&0x7F)!=0x63 || F3(i[4])!=1) return false;
+    if (S1(i[4])==o.D) o.END=S2(i[4]); else if (S2(i[4])==o.D) o.END=S1(i[4]); else return false;
+    uint32_t bpc=base+(uint32_t)(w+4)*4;
+    if ((int)((bpc+rv_bimm(i[4])-base)>>2) != w) return false;
+    if (o.S==0||o.D==0||o.END==0||o.RT==0) return false;
+    if (o.S==o.D||o.S==o.END||o.S==o.RT||o.D==o.END||o.D==o.RT||o.END==o.RT) return false;
+    return true;
+}
+
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
 // linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
@@ -2631,15 +2659,46 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         uint32_t t = base + (uint32_t)w*4 + (o==0x63 ? rv_bimm(in) : rv_jimm(in));
         if (t>=base && ((t-base)&3)==0 && ((t-base)>>2) < (uint32_t)N) targ[(t-base)>>2] = 1;
     }
-    // DIVLOOP pre-scan: the hardware-divide replacement jumps to the loop exit with different
-    // scratch/cache state than the per-instruction path, so the exit must be a reset point.
-    std::vector<uint8_t> divhit(N, 0);
-    { RvxDiv dr;
+    // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
+    // state than the per-instruction path, so the exits must be reset points.
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0);
+    int ncpy = 0;
+    { RvxDiv dr; RvxCpy cr;
       for (int w=0; w+13 < N; w++)
-          if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; } }
+          if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
+      if (nc == 1)
+          for (int w=0; w+5 < N; w++)
+              if (comp[w] && rvx_match_copyloop(img, N, base, w, cr)) { cpyhit[w] = 1; targ[w+5] = 1; ncpy++; } }
+    if (getenv("RVX_STATS") && ncpy) fprintf(stderr, "[xblk] copyloop sites: %d\n", ncpy);
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    units.assign(1+K, std::string());
+    units.assign(1+K + (ncpy ? 1 : 0), std::string());
+    // ── xcopy unit (knee-ISOLATED: assembles alone in microseconds). Word-widened forward byte copy:
+    //    byte head until DST is 4-aligned, then a funnel-shift body (the +8 B buffer guard covers the
+    //    high word of an unaligned source), then a byte tail. Callers guarantee n ≥ 1 and NO forward
+    //    overlap (D-S ≥ n unsigned) — overlapping copies keep the original byte-propagation loop.
+    if (ncpy) {
+        std::string& xc = units[1+K];
+        xc  = hdr;
+        xc += ".visible .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn)\n{\n"
+              ".reg .b64 %s,%d,%b,%bo;\n.reg .b32 %n,%v,%w0,%w1,%sh,%t;\n.reg .pred %q;\n"
+              "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u32 %n,[pn];\n"
+              "CH:\ncvt.u32.u64 %t, %d;\nand.b32 %t, %t, 3;\nsetp.eq.u32 %q, %t, 0;\n@%q bra CB;\n"
+              "setp.eq.u32 %q, %n, 0;\n@%q bra CE;\n"
+              "ld.global.u8 %v, [%s];\nst.global.u8 [%d], %v;\n"
+              "add.u64 %s, %s, 1;\nadd.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra CH;\n"
+              "CB:\nsetp.lt.u32 %q, %n, 4;\n@%q bra CT;\n"
+              "cvt.u32.u64 %t, %s;\nand.b32 %t, %t, 3;\nshl.b32 %sh, %t, 3;\n"
+              "cvt.u64.u32 %bo, %t;\nsub.u64 %b, %s, %bo;\n"
+              "CL:\nld.global.u32 %w0, [%b];\nld.global.u32 %w1, [%b+4];\n"
+              "shf.r.wrap.b32 %v, %w0, %w1, %sh;\nst.global.u32 [%d], %v;\n"
+              "add.u64 %b, %b, 4;\nadd.u64 %d, %d, 4;\nadd.u64 %s, %s, 4;\nsub.u32 %n, %n, 4;\n"
+              "setp.ge.u32 %q, %n, 4;\n@%q bra CL;\n"
+              "CT:\nsetp.eq.u32 %q, %n, 0;\n@%q bra CE;\n"
+              "ld.global.u8 %v, [%s];\nst.global.u8 [%d], %v;\n"
+              "add.u64 %s, %s, 1;\nadd.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra CT;\n"
+              "CE:\nret;\n}\n";
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -2648,6 +2707,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         std::string& ptx = units[1+r];
         ptx  = hdr;
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
+        if (ncpy) ptx += ".extern .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
         ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss;\n.reg .b32 %x<32>,%t0,%t1,%t2,%pc,%budget,%cnt;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
@@ -2690,6 +2750,37 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 rvx_app(ptx, "bra L%u;\n", base+(w+13)*4);
                 rvx_app(ptx, "DORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();                                  // the test clobbered scratch state
+            }
+            // Byte-copy loop → xcopy call (word-widened). Guards route to the kept original loop:
+            // len==0 (the do-while would wrap 2^32 — pathological, keep original semantics), forward
+            // OVERLAP (D-S < len: the byte loop PROPAGATES bytes, a block copy would not), and wild
+            // lengths (>16 M: bound the atomic retire). Exact closed form after the call: retire
+            // 5·len, RT = last byte (re-read from src — the no-overlap guard makes it unclobbered),
+            // S += len, D = END.
+            else if (cpyhit[w] && (int)w+5 < N && regof[w+5]==r && comp[w+5]) {
+                RvxCpy C0; rvx_match_copyloop(img, N, base, (int)w, C0);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"                      // len = END - D
+                             "setp.eq.u32 %%p0, %%t0, 0;\n"
+                             "setp.gt.u32 %%p1, %%t0, 16777216;\nor.pred %%p0, %%p0, %%p1;\n"
+                             "sub.u32 %%t1, %%x%u, %%x%u;\n"                      // D - S (forward overlap test)
+                             "setp.lt.u32 %%p1, %%t1, %%t0;\nor.pred %%p0, %%p0, %%p1;\n"
+                             "@%%p0 bra CPORIG%u;\n",
+                             C0.END, C0.D, C0.D, C0.S, pc);
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, 5;\nadd.s32 %%cnt, %%cnt, %%t1;\n");
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "cvt.u64.u32 %%a1, %%x%u;\nadd.u64 %%a1, %%a1, %%M;\n", C0.S, C0.D);
+                ptx += "{ .param .b64 ps; .param .b64 pd; .param .b32 pn;\n"
+                       "st.param.b64 [ps], %a0;\nst.param.b64 [pd], %a1;\nst.param.b32 [pn], %t0;\n"
+                       "call.uni xcopy, (ps, pd, pn);\n}\n";
+                rvx_app(ptx, "add.u32 %%t1, %%x%u, %%t0;\nsub.u32 %%t1, %%t1, 1;\n"
+                             "cvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "ld.global.%s %%x%u, [%%a0];\n", C0.S, C0.sext ? "s8" : "u8", C0.RT);
+                rvx_app(ptx, "add.u32 %%x%u, %%x%u, %%t0;\nmov.b32 %%x%u, %%x%u;\n",
+                             C0.S, C0.S, C0.D, C0.END);
+                rvx_app(ptx, "bra L%u;\n", base+(w+5)*4);
+                rvx_app(ptx, "CPORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
             }
             else rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
             rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc, pc2idx, cold);
