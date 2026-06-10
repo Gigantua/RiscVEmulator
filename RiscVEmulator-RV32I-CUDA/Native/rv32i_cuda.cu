@@ -68,7 +68,20 @@ template<class T, bool NC1> static __device__ __forceinline__ T ld_i(const uint3
         return (T)((lo >> off) | (hi << (32 - off)));
     } else return (T)(lo >> off);
 }
+// Dynamic-code dirty tracking (TinyCC-class guests; IDEA_SelfmodifyingCodeJit.md): stores into the
+// watch window — the page range holding runtime-TRANSLATED code — mark a per-4KB-page dirty byte.
+// The host polls the (4 KB) dirty array between launches ONLY while the window is active, so
+// static guests pay just two constant-cache loads + an untaken branch per store. Wide stores that
+// straddle a page boundary mark only their first page; invalidation compensates by also
+// invalidating the successor of every dirty page.
+__constant__ uint32_t c_wlo = 0xFFFFFFFFu;
+__constant__ uint32_t c_whi = 0;
+__constant__ uint8_t* c_dirty = nullptr;
+static __device__ __forceinline__ void smc_mark(uint32_t a) {
+    if (a >= c_wlo && a < c_whi) c_dirty[a >> 12] = 1;
+}
 template<class T, bool NC1> static __device__ __forceinline__ void st_i(uint32_t* m, int nc, int id, uint32_t a, T v) {
+    smc_mark(a);
     if constexpr (NC1) {
         uint8_t* b = (uint8_t*)m;
         if constexpr (sizeof(T) == 4) {
@@ -258,7 +271,7 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
        RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_DIVLOOP=0x49,
        RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61,
-       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_COPYLOOPT=0x55, RC_ILL=0x00 };
+       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_COPYLOOPT=0x55, RC_FENCEI=0x29, RC_ILL=0x00 };
        // RC_COPYLOOPT: strided copy whose src-advance goes through a temp (lX V,0(S); addi S2,S,Ks;
        //   sX V,0(D); addi D,D,Kd; mv S,S2; bne S2,LIM) → 1 native loop uop (params in g_ext).
        //   The COPYLOOPS matcher requires in-place addi src bumps and misses this 6-word form
@@ -363,6 +376,11 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         else if (cls == RC_BR) {                         // 2nd: 17.6% of profiled execs (was 5th)
             int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
                                  case 5:t=s1>=s2;break; case 6:t=u1<u2;break; default:t=u1>=u2; }
+            if (t && (int32_t)w1 < 0) {                  // unresolved direct target (0x80000000|word)
+                gi += wt;
+                if (w1 == 0xFFFFFFFFu) { ui = HALT_BIT; continue; }   // beyond RAM → genuine halt
+                resume_pc = base + ((w1 & 0x7FFFFFFFu) << 2); break;  // host translates target, resumes there
+            }
             ui = t ? w1 : ui + 1; gi += wt; continue;                            // w1 = baked target uop-index
         }
         else if (cls == RC_ALUR)  r = alu(f3, u1, u2, (uint32_t)(s2 & 0x1F), false, sra);
@@ -577,7 +595,14 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 case 6: r = (u2==0) ? u1 : (s1==(int32_t)0x80000000 && s2==-1) ? 0u : (uint32_t)(s1%s2); break;  // rem
                 default:r = (u2==0) ? u1 : (u1%u2); }                                                      // remu
         }
-        else if (cls == RC_JAL)  { if (rd && live) regs[rd] = __ldg(&uop2pc[ui]) + 4; ui = w1; gi += wt; continue; }  // skip the link load for `j` (rd==0)
+        else if (cls == RC_JAL)  {                       // skip the link load for `j` (rd==0)
+            if (rd && live) regs[rd] = __ldg(&uop2pc[ui]) + 4;
+            gi += wt;
+            if ((int32_t)w1 < 0) {                       // unresolved direct target (0x80000000|word)
+                if (w1 == 0xFFFFFFFFu) { ui = HALT_BIT; continue; }
+                resume_pc = base + ((w1 & 0x7FFFFFFFu) << 2); break;
+            }
+            ui = w1; continue; }
         else if (cls == RC_JALR) { uint32_t tgt = (uint32_t)(s1 + (int32_t)w1) & ~1u;
             uint32_t tw = (tgt - base) >> 2;
             uint32_t n2 = (tw < (uint32_t)nwords) ? __ldg(&pc2uop[tw]) : RC_BADUOP;
@@ -690,6 +715,10 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 ui = ft; }
             continue; }
         else if (cls == RC_NOP)  { ui += 1; gi += wt; continue; }
+        else if (cls == RC_FENCEI) {                     // fence.i: the architectural code-write sync
+            gi += wt;                                    // point. With dynamic translations live, exit
+            if (c_whi != 0) { resume_pc = __ldg(&uop2pc[ui]) + 4; break; }   // so the host invalidates
+            ui += 1; continue; }                         // dirty pages; otherwise a NOP.
         else { ui |= HALT_BIT; continue; }                                       // RC_ILL
 
         if (rd && live) regs[rd] = r;                // predicated store (@p st.shared) — no regs[rd] read-back
@@ -720,7 +749,7 @@ static uint32_t*  g_pc2uop  = nullptr;  // guest-word → uop index (or RC_BADUO
 static uint32_t*  g_uop2pc  = nullptr;  // uop index → guest pc
 static uint32_t*  g_ext     = nullptr;  // side params for fat fusions (TEXSPAN); indexed by uop's ext base
 static int        g_nuops   = 0;
-static int        g_pc2words = 0;       // length of pc2uop[] = translated code words (NOT total memory words)
+static int        g_pc2words = 0;       // length of pc2uop[] — covers ALL guest RAM words from g_base
 static uint32_t   g_base    = 0;
 static unsigned long long* g_ret = nullptr;  // core-0 retired guest-instruction count (verify gate); PINNED zero-copy
 #if RVCUD_HOTHIST
@@ -728,11 +757,31 @@ static unsigned long long* g_hot_host = nullptr;   // managed mirror of the per-
 #endif
 // Translate-on-miss state (host mirrors, so an untranslated indirect-jump target can be translated
 // lazily and appended without re-doing the whole image). g_uopcap = device capacity in uops.
-static std::vector<uint32_t> g_img;          // guest code words (persisted)
-static std::vector<uint32_t> g_pc2uop_h;     // host mirror of pc2uop[]
+static std::vector<uint32_t> g_img;          // STATIC guest code words (persisted)
+static std::vector<uint32_t> g_pc2uop_h;     // host mirror of pc2uop[] — covers ALL RAM words from g_base
 static std::vector<uint32_t> g_w0h, g_w1h, g_u2pch;  // host mirrors of the uop arrays
 static std::vector<uint8_t>  g_uwh;
 static int        g_uopcap  = 0;
+static unsigned   g_membytes = 0;            // per-core guest RAM bytes (init)
+static int        g_imgwords = 0;            // STATIC image words (g_img.size()); g_pc2words covers all RAM
+// Dynamic-code support (TinyCC-class guests; see IDEA_SelfmodifyingCodeJit.md):
+//  - g_fixups: every direct branch/jal baked UNRESOLVED (w1 = 0x80000000|targetWord). Entries are
+//    kept after patching so invalidation can UNPATCH them (w1 back to the sentinel).
+//  - g_unpatched: count of entries whose w1 still carries the sentinel (drives the driver's patch pass).
+struct RvcudFixup { uint32_t ui, tw; };
+static std::vector<RvcudFixup> g_fixups;
+static int        g_unpatched = 0;
+//  - SMC dirty tracking: g_dirty = device byte-per-4KB-page array (+8 B at the tail: the
+//    {rangeLo, rangeHi} cells the exec helper units record bulk-store ranges into via red.min/max).
+//    g_dynpage marks pages holding dynamic translations; [g_wlo, g_whi) is their bounding window —
+//    the per-store check every engine performs. g_xdw = the exec module's XDW mirror of all of it.
+static uint8_t*   g_dirty = nullptr;
+static std::vector<uint8_t> g_dynpage;
+static uint32_t   g_wlo = 0xFFFFFFFFu, g_whi = 0;
+static CUdeviceptr g_xdw = 0;
+static int        g_dyncode = 0;             // RVX_DYNCODE / cuda_rvcud_set_dyncode: bake exec SMC checks
+static void rvcud_update_window();
+static bool rvx_dyncode();
 
 // TIERED exec_block (defined far below): cross-compile a BOUNDED set of statically-reached rv32i words
 // to ONE PTX kernel (guest regs → PTX registers, no per-uop interpreter tax), dispatched by pc via
@@ -751,6 +800,7 @@ static bool       rvx_sp_writer_ok(uint32_t in);
 
 API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     g_ncores = nCores;
+    g_membytes = memBytes;
     cudaError_t e;
     // PINNED zero-copy, not managed: kernels touch CoreState only at launch entry/exit (regs go to
     // shared/PTX registers), but the host reads pc after EVERY launch — and on Windows/WDDM managed
@@ -785,6 +835,12 @@ API unsigned int cuda_rv32i_get_reg(int core, int i) { return g_state ? g_state[
 // rows is a 64,000-descriptor strided transfer for a 256 KB framebuffer read and
 // dominated the per-StepN host cost (~3.8 ms/batch measured end-to-end).
 API int cuda_rv32i_write_mem(int core, const void* src, unsigned int off, unsigned int len) {
+    // SMC: host writes into the watch window dirty the touched pages, same as guest stores.
+    if (g_whi && g_dirty && len && off < g_whi && off + len > g_wlo) {
+        int npages = (int)(g_membytes >> 12);
+        for (uint32_t p = off >> 12; p <= ((off + len - 1) >> 12) && (int)p < npages; p++)
+            cudaMemset(g_dirty + p, 1, 1);
+    }
     if (g_ncores == 1)
         return (int)cudaMemcpy((uint8_t*)g_mem + off, src, len, cudaMemcpyHostToDevice);
     uint8_t* dst = (uint8_t*)(g_mem + (size_t)(off >> 2) * g_ncores + core);
@@ -968,9 +1024,10 @@ static void rvcud_liveness(RvcudBuild& B) {
 // Classify ONE guest word into one uop (the 1:1 base case; fusion passes may
 // consume more words and are layered on top in later phases). Returns the number
 // of guest words consumed (always 1 here). Fills w0/w1/weight/tgt for the uop.
-static int rvcud_classify(const RvcudBuild& B, int w,
-                          uint32_t& w0, uint32_t& w1, uint8_t& weight, uint32_t& tgt) {
-    const uint32_t instr = B.img[w], pcw = B.base + (uint32_t)w*4;
+// The word-based core lets translate-on-miss classify DYNAMIC code fetched from
+// device RAM (outside g_img).
+static int rvcud_classify_word(uint32_t instr, uint32_t pcw, uint32_t base,
+                               uint32_t& w0, uint32_t& w1, uint8_t& weight, uint32_t& tgt) {
     const uint32_t op = instr & 0x7F, rd = (instr>>7)&0x1F, f3 = (instr>>12)&7;
     const uint32_t rs1 = (instr>>15)&0x1F, rs2 = (instr>>20)&0x1F, f7 = (instr>>25)&0x7F;
     uint32_t cls = RC_ILL, sra = 0; w1 = 0; weight = 1; tgt = RC_NOTGT;
@@ -983,17 +1040,21 @@ static int rvcud_classify(const RvcudBuild& B, int w,
                    else if (f7==0)             cls = RC_ALUR;
                    else                        cls = RC_ILL; break;
         case 0x03: if (f3==0||f3==1||f3==2||f3==4||f3==5) { cls = RC_LOAD; w1 = rv_iimm(instr); } break;
-        case 0x63: if (f3!=2 && f3!=3) { cls = RC_BR; tgt = (pcw + rv_bimm(instr) - B.base) >> 2; } break;
+        case 0x63: if (f3!=2 && f3!=3) { cls = RC_BR; tgt = (pcw + rv_bimm(instr) - base) >> 2; } break;
         case 0x23: if (f3<=2) { cls = RC_ST; w1 = rv_simm(instr); } break;
-        case 0x6F: cls = RC_JAL;  tgt = (pcw + rv_jimm(instr) - B.base) >> 2; break;
+        case 0x6F: cls = RC_JAL;  tgt = (pcw + rv_jimm(instr) - base) >> 2; break;
         case 0x67: cls = RC_JALR; w1 = rv_iimm(instr); break;
         case 0x37: cls = RC_CONST; w1 = instr & 0xFFFFF000u; break;             // LUI  → baked constant
         case 0x17: cls = RC_CONST; w1 = pcw + (instr & 0xFFFFF000u); break;      // AUIPC→ pc-folded constant
-        case 0x0F: cls = RC_NOP; break;
+        case 0x0F: cls = (f3==1) ? RC_FENCEI : RC_NOP; break;                    // fence.i = SMC sync point
         default:   cls = RC_ILL; break;
     }
     w0 = RCW0(cls, rd, rs1, rs2, f3, sra, RP_UNC, 0);
     return 1;
+}
+static int rvcud_classify(const RvcudBuild& B, int w,
+                          uint32_t& w0, uint32_t& w1, uint8_t& weight, uint32_t& tgt) {
+    return rvcud_classify_word(B.img[w], B.base + (uint32_t)w*4, B.base, w0, w1, weight, tgt);
 }
 
 // COUNTED-LOOP FUSION. `addi rc,rc,K` … `b<cc> rc,rX,T` in one block (independent instrs may sit
@@ -2005,12 +2066,20 @@ static void rvcud_build(RvcudBuild& B) {
         }
         w += consumed;
     }
-    // Pass 3 — bake direct branch/JAL targets to uop indices (halt sentinel if target isn't a leader).
+    // Pass 3 — bake direct branch/JAL targets to uop indices. Unresolved targets that are still
+    // inside guest RAM bake the UNRESOLVED sentinel (0x80000000 | target WORD): taking one exits
+    // to the host, which translates the target lazily (dynamic-code guests). Targets beyond RAM
+    // bake 0xFFFFFFFF = genuine halt.
+    uint32_t mapCap3 = 32u << 20;                       // mirror of set_code's executable-map cap
+    if (const char* e = getenv("RVX_DYNMAP_MB")) { int v = atoi(e); if (v > 0) mapCap3 = (uint32_t)v << 20; }
+    uint32_t mapB3 = g_membytes > mapCap3 ? mapCap3 : g_membytes;
+    uint32_t ramWords = (mapB3 > B.base) ? ((mapB3 - B.base) >> 2) : (uint32_t)N;
     for (size_t i = 0; i < B.w0.size(); i++) {
         uint32_t cls = B.w0[i] & 0x7F;
         if (cls == RC_BR || cls == RC_JAL) {
             uint32_t tw = B.tgt[i];
-            B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
+            B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw]
+                    : (tw < ramWords) ? (0x80000000u | tw) : 0xFFFFFFFFu;
         }
         else if (cls == RC_INCBR) {                                  // preserve K (high 8 bits); bake target into low 24
             uint32_t tw = B.tgt[i];
@@ -2046,8 +2115,11 @@ static void rvcud_free() {
     if (g_pc2uop) { cudaFree(g_pc2uop); g_pc2uop = nullptr; }
     if (g_uop2pc) { cudaFree(g_uop2pc); g_uop2pc = nullptr; }
     if (g_ext)    { cudaFree(g_ext);    g_ext    = nullptr; }
+    if (g_dirty)  { cudaFree(g_dirty);  g_dirty  = nullptr; }
     g_nuops = 0; g_uopcap = 0;
+    g_wlo = 0xFFFFFFFFu; g_whi = 0; g_xdw = 0;
     g_img.clear(); g_pc2uop_h.clear(); g_w0h.clear(); g_w1h.clear(); g_u2pch.clear(); g_uwh.clear();
+    g_fixups.clear(); g_unpatched = 0; g_dynpage.clear();
 }
 
 // Translate the guest image into the rvcud uop stream and upload it. `base` is the
@@ -2059,12 +2131,43 @@ API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base
     memcpy(g_img.data(), src, (size_t)N * 4);
     RvcudBuild B; B.nwords = N; B.base = base; B.entry = entry; B.img = g_img.data();
     rvcud_build(B);
-    g_nuops = (int)B.w0.size(); g_base = base; g_pc2words = N;
+    g_nuops = (int)B.w0.size(); g_base = base; g_imgwords = N;
+    // The pc map covers the EXECUTABLE address space (not just the static image) so runtime-
+    // generated code is mappable: words beyond the image start RC_BADUOP and translate lazily on
+    // first entry. g_membytes spans the whole guest ADDRESS space incl. high MMIO (≈1 GB for the
+    // examples) — code can only live in low DRAM, so the map caps at 32 MB (RVX_DYNMAP_MB to widen).
+    uint32_t mapCap = 32u << 20;
+    if (const char* e = getenv("RVX_DYNMAP_MB")) { int v = atoi(e); if (v > 0) mapCap = (uint32_t)v << 20; }
+    uint32_t mapBytes = g_membytes > mapCap ? mapCap : g_membytes;
+    int mapWords = N;
+    if (mapBytes > base && (int)((mapBytes - base) >> 2) > N) mapWords = (int)((mapBytes - base) >> 2);
+    g_pc2words = mapWords;
     // Persist host mirrors so missed (indirect) targets can be translated lazily and appended.
-    g_w0h = B.w0; g_w1h = B.w1; g_uwh = B.uw; g_u2pch = B.u2pc; g_pc2uop_h = B.pc2uop;
-    // Device capacity has headroom for translate-on-miss: each code word can be re-emitted once as a
-    // 1:1 uop, plus up to one rejoin-JAL per block → ≤ 2N appended.
-    g_uopcap = g_nuops + 2 * N + 16;
+    g_w0h = B.w0; g_w1h = B.w1; g_uwh = B.uw; g_u2pch = B.u2pc;
+    g_pc2uop_h.assign((size_t)mapWords, RC_BADUOP);
+    memcpy(g_pc2uop_h.data(), B.pc2uop.data(), (size_t)N * 4);
+    // Record every unresolved direct edge (w1 = 0x80000000|targetWord) so the driver can patch it
+    // when its target gets translated — and UNPATCH it if the target page is later invalidated.
+    g_fixups.clear(); g_unpatched = 0;
+    for (size_t i = 0; i < g_w1h.size(); i++) {
+        uint32_t cls = g_w0h[i] & 0x7F;
+        if ((cls == RC_BR || cls == RC_JAL) && (g_w1h[i] & 0x80000000u) && g_w1h[i] != 0xFFFFFFFFu)
+            { g_fixups.push_back({ (uint32_t)i, g_w1h[i] & 0x7FFFFFFFu }); g_unpatched++; }
+    }
+    // SMC dirty tracking state: device page array (+8 B range cells), empty watch window.
+    { int npages = (int)(g_membytes >> 12);
+      if (!g_dirty && npages > 0 && cudaMalloc(&g_dirty, (size_t)npages + 8) == cudaSuccess) {
+          cudaMemset(g_dirty, 0, (size_t)npages);
+          uint32_t init2[2] = { 0xFFFFFFFFu, 0 };
+          cudaMemcpy((char*)g_dirty + npages, init2, 8, cudaMemcpyHostToDevice);
+      }
+      g_dynpage.assign((size_t)(npages > 0 ? npages : 0), 0);
+      g_wlo = 0xFFFFFFFFu; g_whi = 0; g_xdw = 0;
+      rvcud_update_window(); }
+    // Device capacity has headroom for translate-on-miss: each static word can be re-emitted once
+    // as a 1:1 uop plus a rejoin-JAL per block, and dynamic guests append further (growable —
+    // rvcud_grow reallocs in chunks between launches).
+    g_uopcap = g_nuops + 2 * N + 65536;
     std::vector<uint2> uops(g_nuops);
     for (int i = 0; i < g_nuops; i++) uops[i] = make_uint2(g_w0h[i], g_w1h[i]);
 
@@ -2072,49 +2175,164 @@ API int cuda_rvcud_set_code(const void* src, unsigned int len, unsigned int base
     if ((e = cudaMalloc(&g_uops,   (size_t)g_uopcap * sizeof(uint2)))  != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_uw,     (size_t)g_uopcap))                  != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_uop2pc, (size_t)g_uopcap * 4))             != cudaSuccess) return (int)e;
-    if ((e = cudaMalloc(&g_pc2uop, (size_t)N * 4))                    != cudaSuccess) return (int)e;
+    if ((e = cudaMalloc(&g_pc2uop, (size_t)mapWords * 4))             != cudaSuccess) return (int)e;
     size_t next = B.ext.empty() ? 1 : B.ext.size();                   // ≥1 so the kernel always has a valid ptr
     if ((e = cudaMalloc(&g_ext, next * 4)) != cudaSuccess) return (int)e;
     if (!B.ext.empty()) cudaMemcpy(g_ext, B.ext.data(), B.ext.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(g_uops,   uops.data(),     (size_t)g_nuops * sizeof(uint2), cudaMemcpyHostToDevice);
     cudaMemcpy(g_uw,     g_uwh.data(),    (size_t)g_nuops,                cudaMemcpyHostToDevice);
     cudaMemcpy(g_uop2pc, g_u2pch.data(),  (size_t)g_nuops * 4,            cudaMemcpyHostToDevice);
-    cudaMemcpy(g_pc2uop, g_pc2uop_h.data(), (size_t)N * 4,               cudaMemcpyHostToDevice);
+    cudaMemcpy(g_pc2uop, g_pc2uop_h.data(), (size_t)mapWords * 4,        cudaMemcpyHostToDevice);
     int rc = (int)cudaDeviceSynchronize();
     rvxblk_build();                          // cross-compile the statically-reached hot words to an exec_block PTX kernel
     return rc;
 }
 
-// Translate-on-miss: an indirect (JALR) jump landed on code with no uop. Lazily translate from `pc`
-// as a straight-line 1:1 run — continuing through conditional branches (their fall-through is the
-// next appended uop) and stopping at an unconditional jal/jalr, code end, or where it rejoins an
-// already-translated word (emit a jump to it). Direct targets are baked against the live pc2uop.
-// Appends to the (capacity-reserved) device buffers and patches the changed pc2uop range.
+// Grow the device uop buffers (chunked) — called only between launches (translation is host-side).
+static void rvcud_grow(int need) {
+    if (g_nuops + need <= g_uopcap) return;
+    int newcap = g_nuops + need + 65536;
+    uint2* nu = nullptr; uint8_t* nw = nullptr; uint32_t* np = nullptr;
+    if (cudaMalloc(&nu, (size_t)newcap * sizeof(uint2)) != cudaSuccess) return;       // OOM: keep old cap
+    if (cudaMalloc(&nw, (size_t)newcap) != cudaSuccess) { cudaFree(nu); return; }
+    if (cudaMalloc(&np, (size_t)newcap * 4) != cudaSuccess) { cudaFree(nu); cudaFree(nw); return; }
+    cudaMemcpy(nu, g_uops,   (size_t)g_nuops * sizeof(uint2), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(nw, g_uw,     (size_t)g_nuops,                 cudaMemcpyDeviceToDevice);
+    cudaMemcpy(np, g_uop2pc, (size_t)g_nuops * 4,             cudaMemcpyDeviceToDevice);
+    cudaFree(g_uops); cudaFree(g_uw); cudaFree(g_uop2pc);
+    g_uops = nu; g_uw = nw; g_uop2pc = np; g_uopcap = newcap;
+}
+
+// Push the watch window + dirty pointer to BOTH engines: the __constant__ symbols the CUDA-C
+// kernels read (st_i's smc_mark, the fence.i arm) and the exec module's XDW global.
+static void rvcud_update_window() {
+    cudaMemcpyToSymbol(c_wlo, &g_wlo, 4);
+    cudaMemcpyToSymbol(c_whi, &g_whi, 4);
+    cudaMemcpyToSymbol(c_dirty, &g_dirty, sizeof(void*));
+    if (g_xdw) {
+        struct { uint32_t lo, hi; unsigned long long dp; } w
+            { g_wlo, g_whi, (unsigned long long)(size_t)g_dirty };
+        cuMemcpyHtoD(g_xdw, &w, 16);
+    }
+}
+
+// Invalidate every dirty page that holds dynamic translations: reset its pc2uop words to BADUOP
+// (the next jump in re-translates from the CURRENT bytes — "mark dirty on write, translate before
+// the next entry") and UNPATCH all edges into it. Called between launches whenever the window is
+// active; fence.i forces the launch boundary at the architecturally-correct moment.
+static void rvcud_invalidate_dirty() {
+    if (!g_dirty || g_whi == 0) return;
+    int npages = (int)(g_membytes >> 12);
+    std::vector<uint8_t> d((size_t)npages + 8);
+    cudaMemcpy(d.data(), g_dirty, (size_t)npages + 8, cudaMemcpyDeviceToHost);
+    uint32_t rlo, rhi; memcpy(&rlo, d.data()+npages, 4); memcpy(&rhi, d.data()+npages+4, 4);
+    if (rlo != 0xFFFFFFFFu && rlo <= rhi)                    // exec helper bulk-store range → expand
+        for (uint32_t p = rlo >> 12; p <= (rhi >> 12) && (int)p < npages; p++) d[p] = 1;
+    bool any = false;
+    for (int p = 0; p < npages && !any; p++) any = d[p] != 0;
+    if (!any) return;
+    auto invalidate_page = [&](int p) {
+        if (p < 0 || p >= (int)g_dynpage.size() || !g_dynpage[p]) return;
+        g_dynpage[p] = 0;
+        uint32_t a0 = (uint32_t)p << 12, a1 = a0 + 0x1000;
+        if (a1 <= g_base) return;
+        uint32_t w0 = (a0 > g_base) ? (a0 - g_base) >> 2 : 0;
+        uint32_t w1e = (a1 - g_base) >> 2; if (w1e > (uint32_t)g_pc2words) w1e = (uint32_t)g_pc2words;
+        for (uint32_t w = w0; w < w1e; w++) g_pc2uop_h[w] = RC_BADUOP;
+        cudaMemcpy(g_pc2uop + w0, g_pc2uop_h.data() + w0, (size_t)(w1e - w0) * 4, cudaMemcpyHostToDevice);
+        for (auto& f : g_fixups) {                           // unpatch edges INTO the page; edges FROM
+            uint32_t ta = g_base + f.tw * 4;                 // it lead to unreachable uops — harmless
+            if ((ta >> 12) == (uint32_t)p && !(g_w1h[f.ui] & 0x80000000u)) {
+                g_w1h[f.ui] = 0x80000000u | f.tw;
+                cudaMemcpy((char*)g_uops + (size_t)f.ui * sizeof(uint2) + 4, &g_w1h[f.ui], 4, cudaMemcpyHostToDevice);
+                g_unpatched++;
+            }
+        }
+    };
+    // wide stores straddling a page boundary mark only their first page → invalidate successors too
+    for (int p = npages - 1; p >= 0; p--) if (d[p]) { invalidate_page(p); invalidate_page(p + 1); }
+    cudaMemset(g_dirty, 0, npages);
+    uint32_t init2[2] = { 0xFFFFFFFFu, 0 };
+    cudaMemcpy((char*)g_dirty + npages, init2, 8, cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+}
+
+// Patch every unresolved edge whose target word is now translated (single-u32 device pokes).
+// Entries stay in the list after patching so invalidation can UNPATCH them later.
+static void rvcud_patch_fixups() {
+    if (!g_unpatched) return;
+    for (auto& f : g_fixups) {
+        if (!(g_w1h[f.ui] & 0x80000000u)) continue;                  // already patched
+        if (f.tw < (uint32_t)g_pc2words && g_pc2uop_h[f.tw] != RC_BADUOP) {
+            g_w1h[f.ui] = g_pc2uop_h[f.tw];
+            cudaMemcpy((char*)g_uops + (size_t)f.ui * sizeof(uint2) + 4, &g_w1h[f.ui], 4, cudaMemcpyHostToDevice);
+            g_unpatched--;
+        }
+    }
+}
+
+// Read one guest code word for translation: static image words from the host copy, DYNAMIC words
+// (runtime-generated code) from device RAM, cached in 256-word chunks — translation is a cold path.
+// Flat addressing: dynamic translation is restricted to ncores==1.
+struct RvcudDynCache { uint32_t lo = 0, n = 0; uint32_t buf[256]; };
+static uint32_t rvcud_code_word(int j, RvcudDynCache& c) {
+    if (j < g_imgwords) return g_img[j];
+    uint32_t w = (uint32_t)j;
+    if (w < c.lo || w >= c.lo + c.n) {
+        c.lo = w; c.n = 256;
+        if (c.lo + c.n > (uint32_t)g_pc2words) c.n = (uint32_t)g_pc2words - c.lo;
+        cudaMemcpy(c.buf, (const char*)g_mem + (size_t)g_base + (size_t)c.lo * 4,
+                   (size_t)c.n * 4, cudaMemcpyDeviceToHost);
+    }
+    return c.buf[w - c.lo];
+}
+
+// Translate-on-miss: a jump landed on code with no uop (untranslated indirect target, an unresolved
+// direct edge's target, or runtime-generated code). Lazily translate from `pc` as a straight-line
+// 1:1 run — continuing through conditional branches (their fall-through is the next appended uop)
+// and stopping at an unconditional jal/jalr, code end, a rejoin with existing translation, or (for
+// DYNAMIC code) a 4 KB page boundary — invalidation works per page, so a translated run must never
+// straddle one (fall-through from the previous page would survive the invalidation).
+// Direct targets are baked against the live pc2uop; unresolved in-RAM targets get the
+// 0x80000000|word sentinel + a fixup entry. Appends to the device buffers (growable) and patches
+// the changed pc2uop range.
 static bool rvcud_translate_miss(uint32_t pc) {
     if (pc < g_base) return false;
     int w = (int)((pc - g_base) >> 2), N = g_pc2words;
     if (w < 0 || w >= N || g_pc2uop_h[w] != RC_BADUOP) return false;
-    RvcudBuild tb; tb.img = g_img.data(); tb.nwords = N; tb.base = g_base;
+    if (w >= g_imgwords && g_ncores != 1) return false;    // dynamic code: single-core only (flat RAM)
+    rvcud_grow(1100);                                      // longest possible run (page) + rejoin headroom
+    RvcudDynCache dc;
     int firstNew = g_nuops, j = w;
     for (; j < N && g_nuops < g_uopcap - 1; j++) {
-        if (j != w && g_pc2uop_h[j] != RC_BADUOP) {        // rejoin existing translation
+        bool rejoin = (j != w && g_pc2uop_h[j] != RC_BADUOP);
+        bool pageEnd = (j != w && j >= g_imgwords && ((g_base + (uint32_t)j * 4) & 0xFFFu) == 0);
+        if (rejoin || pageEnd) {                            // re-enter through the map
+            uint32_t w1v = (g_pc2uop_h[j] != RC_BADUOP) ? g_pc2uop_h[j] : (0x80000000u | (uint32_t)j);
             g_w0h.push_back(RCW0(RC_JAL,0,0,0,0,0,RP_UNC,0));
-            g_w1h.push_back(g_pc2uop_h[j]); g_uwh.push_back(0); g_u2pch.push_back(g_base+(uint32_t)j*4);
+            if (w1v & 0x80000000u) { g_fixups.push_back({ (uint32_t)g_nuops, (uint32_t)j }); g_unpatched++; }
+            g_w1h.push_back(w1v); g_uwh.push_back(0); g_u2pch.push_back(g_base+(uint32_t)j*4);
             g_nuops++; break;
         }
-        if (g_x_sptrust && !rvx_sp_writer_ok(g_img[j])) {   // newly-reached code breaks the sp proof
+        uint32_t instr = rvcud_code_word(j, dc);
+        if (g_x_sptrust && !rvx_sp_writer_ok(instr)) {      // newly-reached code breaks the sp proof
             g_xblk_ok = 0; g_x_sptrust = 0;
             fprintf(stderr,"[xblk] exec disabled: translate-on-miss found an unprovable sp writer at 0x%08X\n",
                     g_base + (uint32_t)j*4);
         }
-        uint32_t a0,a1,t; uint8_t wt; rvcud_classify(tb, j, a0,a1,wt,t);
+        uint32_t a0,a1,t; uint8_t wt;
+        rvcud_classify_word(instr, g_base + (uint32_t)j*4, g_base, a0,a1,wt,t);
         g_pc2uop_h[j] = (uint32_t)g_nuops;
         g_w0h.push_back(a0); g_w1h.push_back(a1); g_uwh.push_back(wt); g_u2pch.push_back(g_base+(uint32_t)j*4);
         uint32_t cls = a0 & 0x7F;
-        if (cls == RC_BR || cls == RC_JAL)                 // bake direct target against the live map
-            g_w1h[g_nuops] = ((int)t < N && g_pc2uop_h[t] != RC_BADUOP) ? g_pc2uop_h[t] : 0xFFFFFFFFu;
+        if (cls == RC_BR || cls == RC_JAL) {               // bake direct target against the live map
+            if ((int)t < N && g_pc2uop_h[t] != RC_BADUOP) g_w1h[g_nuops] = g_pc2uop_h[t];
+            else if (t < (uint32_t)N) { g_w1h[g_nuops] = 0x80000000u | t;
+                                        g_fixups.push_back({ (uint32_t)g_nuops, t }); g_unpatched++; }
+            else g_w1h[g_nuops] = 0xFFFFFFFFu;
+        }
         g_nuops++;
-        uint32_t op = g_img[j] & 0x7F;
+        uint32_t op = instr & 0x7F;
         if (op == 0x6F || op == 0x67) { j++; break; }      // jal/jalr: unconditional → block ends
     }
     int cnt = g_nuops - firstNew;
@@ -2125,6 +2343,23 @@ static bool rvcud_translate_miss(uint32_t pc) {
     cudaMemcpy(g_uw     + firstNew, g_uwh.data()+firstNew,(size_t)cnt,                 cudaMemcpyHostToDevice);
     cudaMemcpy(g_uop2pc + firstNew, g_u2pch.data()+firstNew,(size_t)cnt * 4,           cudaMemcpyHostToDevice);
     cudaMemcpy(g_pc2uop + w, g_pc2uop_h.data()+w, (size_t)(j - w) * 4, cudaMemcpyHostToDevice);
+    if (w >= g_imgwords && g_xblk_ok && !rvx_dyncode()) {  // exec built WITHOUT SMC checks: its stores
+        g_xblk_ok = 0;                                     // are unmonitored → sound only without exec
+        fprintf(stderr, "[xblk] exec disabled: runtime-generated code without RVX_DYNCODE=1\n");
+    }
+    if (w >= g_imgwords && g_dirty) {                      // dynamic code: register its pages + widen the
+        uint32_t alo = g_base + (uint32_t)w * 4;           // watch window all engines' store checks use
+        uint32_t ahi = g_base + (uint32_t)j * 4;
+        for (uint32_t p = alo >> 12; p <= ((ahi - 1) >> 12); p++)
+            if (p < (uint32_t)g_dynpage.size()) g_dynpage[p] = 1;
+        uint32_t nlo = (alo >> 12) << 12, nhi = (((ahi - 1) >> 12) + 1) << 12;
+        if (nlo < g_wlo || nhi > g_whi) {
+            if (nlo < g_wlo) g_wlo = nlo;
+            if (nhi > g_whi) g_whi = nhi;
+            rvcud_update_window();
+        }
+    }
+    rvcud_patch_fixups();                                  // resolve edges that pointed at this block
     cudaDeviceSynchronize();
     return true;
 }
@@ -2158,13 +2393,15 @@ API int cuda_rvcud_step_all(int budget) {
     for (int guard = 0; guard < 1 << 20; guard++) {
         int rem = budget - (int)total;
         if (rem <= 0) break;
+        if (g_unpatched) rvcud_patch_fixups();   // resolve edges whose targets got translated (no-op otherwise)
+        if (g_whi) rvcud_invalidate_dirty();     // SMC: window active → poll dirty pages, invalidate stale uops
         // exec_block fast path: if pc is a cross-compiled word, run the register-resident PTX kernel
         // (no per-uop interpreter tax). It returns at the first uncompiled pc / budget exhaustion;
         // the interpreter then owns whatever it handed back. On launch fault, disable & fall through.
         if (g_xblk_ok) {
             uint32_t xpc = g_state[0].pc;
             int xw = (xpc >= g_base) ? (int)((xpc - g_base) >> 2) : -1;
-            if (xw >= 0 && xw < g_pc2words && g_xtab[xw]) {
+            if (xw >= 0 && xw < g_imgwords && g_xtab[xw]) {   // exec covers the STATIC image only
                 double t0 = s_stats ? qpc() : 0;
                 long long did = rvxblk_step(rem);
                 if (s_stats) { s_tx += (qpc()-t0)/s_qpf; }
@@ -2271,6 +2508,21 @@ static bool rvx_sp_writer_ok(uint32_t in) {
 // unless alignment is statically PROVEN via cse.mod4, every load/store runtime-checks and falls back
 // to ld/st.global.u8 so a misaligned guest address can never raise the unrecoverable misaligned-access
 // fault that aligned ld.global.u32 would. Branch/jal to a SAME-REGION
+// RVX_DYNCODE=1 bakes the SMC store checks + fence.i exit into the exec PTX (dynamic-code guests —
+// CudaTinyCC sets it). Without it the exec PTX stays lean (the per-store checks fatten regions past
+// the ptxas knee), and a guest that nevertheless generates code at runtime DISABLES exec instead
+// (sound, interpreter-only — rvcud_translate_miss enforces it).
+static bool rvx_dyncode() {
+    if (g_dyncode) return true;
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("RVX_DYNCODE"); s = (e && *e == '1') ? 1 : 0; }
+    return s == 1;
+}
+// Host opt-in for dynamic-code guests (call BEFORE cuda_rvcud_set_code — the exec PTX is built
+// there). The env var also works for native callers; .NET SetEnvironmentVariable does not reach
+// the CRT's getenv, hence the API.
+API void cuda_rvcud_set_dyncode(int v) { g_dyncode = v ? 1 : 0; }
+
 // compiled FORWARD target → direct bra L<t>; BACKWARD (loop) → inline budget check + bra; jalr → the
 // region-local XDISP (same-region targets stay in-register). Cross-region or uncompiled target → set pc,
 // bra XSAVE (the region epilogue spills to XS and returns; the dispatcher re-enters the right region
@@ -2431,6 +2683,15 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                               fbaddr(i), 8*i, rd,rd);
               } break;
     case 0x23:{ addr((int)rv_simm(instr), f3==2?4:(f3==1)?2:1);
+                // SMC dirty mark (RVX_DYNCODE builds only): store into the watch window → set its
+                // page byte in a COLD block. Static guests get unchanged PTX (the checks fatten
+                // regions past the ptxas knee).
+                if (rvx_dyncode()) {
+                    rvx_app(s,"setp.ge.u32 %%p2, %s, %%dwl;\n@%%p2 setp.lt.u32 %%p2, %s, %%dwh;\n"
+                              "@%%p2 bra SMC%u;\nSMJ%u:\n", T, T, pc, pc);
+                    rvx_app(cold,"SMC%u:\nshr.u32 %%t2, %s, 12;\ncvt.u64.u32 %%a1, %%t2;\nadd.u64 %%a1, %%a1, %%DD;\n"
+                                 "mov.b32 %%t2, 1;\nst.global.u8 [%%a1], %%t2;\nbra SMJ%u;\n", pc, T, pc);
+                }
                 if(f3==0){ rvx_app(s,"st.global.u8 [%s], %%x%u;\n",A,rs2); break; }                    // sb
                 if(f3==1){ // sh: proven-aligned → bare st; else aligned fast path, byte fallback COLD
                     if(alok){ rvx_app(s,"st.global.u16 [%s], %%x%u;\n",A,rs2); break; }
@@ -2527,7 +2788,9 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                   case 6: rvx_app(s,"or.b32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); break;
                   default: rvx_app(s,"and.b32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); }
                 wr(rd,nm); } break;
-    case 0x0F: break;                                                                     // fence → nop
+    case 0x0F: if (f3 == 1 && rvx_dyncode())             // fence.i: the SMC sync point — exit to the host
+                   rvx_app(s,"setp.ne.u32 %%p0, %%dwh, 0;\n@%%p0 mov.u32 %%pc, %u;\n@%%p0 bra XSAVE;\n", pc+4);
+               break;                                    // (only when dynamic translations live); fence → nop
     default: rvx_app(s,"mov.u32 %%pc, %u;\nbra XSAVE;\n",pc|0x80000000u); break;           // system/illegal → halt
     }
 }
@@ -2960,12 +3223,14 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         std::string& ptx = units[1+r];
         ptx  = hdr;
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
+        ptx += ".extern .global .align 8 .b8 XDW[24];\n";   // SMC watch window {wlo,whi,dirtyPtr,rlo,rhi} (dispatcher-defined)
         if (ncpy) ptx += ".extern .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn);\n";
         if (nfill) ptx += ".extern .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn);\n";
         if (npal) ptx += ".extern .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
-        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt;\n"
+        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss,%DD;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt,%dwl,%dwh;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
+        ptx += "mov.u64 %DD, XDW;\nld.global.u32 %dwl, [%DD];\nld.global.u32 %dwh, [%DD+4];\nld.global.u64 %DD, [%DD+8];\n";
         ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
         // Shadow return stack base: after all XS slots — %ss = XS + 168*ntid + 128*tid (16 × 8 B / thread).
         ptx += "mov.u64 %ss, XS;\nmov.u32 %wi, %ntid.x;\nmul.wide.u32 %ad, %wi, 168;\nadd.u64 %ss, %ss, %ad;\n"
@@ -3041,6 +3306,13 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                              "setp.lt.u32 %%p1, %%t1, %%t0;\nor.pred %%p0, %%p0, %%p1;\n"
                              "@%%p0 bra CPORIG%u;\n",
                              C0.END, C0.D, C0.D, C0.S, pc);
+                if (rvx_dyncode()) {
+                    rvx_app(ptx, "add.u32 %%t1, %%x%u, %%t0;\n"                   // SMC: bulk dst range ∩ window
+                                 "setp.lt.u32 %%p1, %%x%u, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t1, %%dwl;\n"
+                                 "@%%p1 bra SMR%u;\nSMRJ%u:\n", C0.D, C0.D, pc, pc);
+                    rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%x%u;\n"
+                                 "red.global.max.u32 [%%a1+20], %%t1;\nbra SMRJ%u;\n", pc, C0.D, pc);
+                }
                 rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, 5;\nadd.s32 %%cnt, %%cnt, %%t1;\n");
                 rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n"
                              "cvt.u64.u32 %%a1, %%x%u;\nadd.u64 %%a1, %%a1, %%M;\n", C0.S, C0.D);
@@ -3075,6 +3347,13 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                                  "setp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
                                  F0.D, (1u<<F0.f3)-1u);
                 rvx_app(ptx, "@%%p0 bra FIORIG%u;\n", pc);
+                if (rvx_dyncode()) {
+                    rvx_app(ptx, "add.u32 %%t1, %%x%u, %%t0;\n"                   // SMC: bulk dst range ∩ window
+                                 "setp.lt.u32 %%p1, %%x%u, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t1, %%dwl;\n"
+                                 "@%%p1 bra SMR%u;\nSMRJ%u:\n", F0.D, F0.D, pc, pc);
+                    rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%x%u;\n"
+                                 "red.global.max.u32 [%%a1+20], %%t1;\nbra SMRJ%u;\n", pc, F0.D, pc);
+                }
                 if (F0.nw==4)        ptx += "shl.b32 %t1, %t0, 2;\nadd.s32 %cnt, %cnt, %t1;\n";
                 else if (F0.f3==0)   ptx += "mul.lo.u32 %t1, %t0, 3;\nadd.s32 %cnt, %cnt, %t1;\n";
                 else { rvx_app(ptx, "shr.u32 %%t1, %%t0, %u;\n", F0.f3);
@@ -3119,6 +3398,13 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                              "and.pred %%p1, %%p1, %%p2;\nor.pred %%p0, %%p0, %%p1;\n",
                              P0.PAL, P0.PAL);
                 rvx_app(ptx, "@%%p0 bra PXORIG%u;\n", pc);
+                if (rvx_dyncode()) {
+                    rvx_app(ptx, "add.u32 %%t3, %%t1, %%t2;\n"                    // SMC: bulk dst range ∩ window
+                                 "setp.lt.u32 %%p1, %%t1, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t3, %%dwl;\n"
+                                 "@%%p1 bra SMR%u;\nSMRJ%u:\n", pc, pc);
+                    rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%t1;\n"
+                                 "red.global.max.u32 [%%a1+20], %%t3;\nbra SMRJ%u;\n", pc, pc);
+                }
                 ptx += "mul.lo.u32 %t3, %t0, 14;\nadd.s32 %cnt, %cnt, %t3;\n";
                 rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n"   // src
                              "cvt.u64.u32 %%a1, %%t1;\nadd.u64 %%a1, %%a1, %%M;\n"    // dst word base
@@ -3170,6 +3456,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     std::string& ptx = units[0];
     ptx  = hdr;
     ptx += ".extern .shared .align 8 .b8 XS[];\n";       // same dynamic-shared segment the region units alias
+    ptx += ".visible .global .align 8 .b8 XDW[24];\n";   // SMC watch window {wlo,whi,dirtyPtr,rlo,rhi}; host-poked
     for (int r=0; r<K; r++) rvx_app(ptx, ".extern .func xr%d;\n", r);
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
     ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad,%xs;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg,%gid,%tx;\n.reg .pred %p0,%pz;\n";
@@ -3363,7 +3650,7 @@ static void rvxblk_build() {
     // generated PTX; lockstep guests run the regions in SIMT just like the interpreter.
     if (g_ncores < 1 || g_img.empty()) return;
     int maxw = RVX_MAXW; if (const char* e=getenv("RVX_MAXW")) { int v=atoi(e); if (v>0) maxw=v; }
-    int N = g_pc2words;
+    int N = g_imgwords;                       // exec compiles the STATIC image only (g_img-backed)
     std::vector<uint8_t> comp(N, 0), seen(N, 0);
     // Reachability walk over the RAW image, seeded from every statically-translated leader (confirmed
     // code, including jalr-only-reachable function entries). Walking the raw instructions FILLS the
@@ -3472,6 +3759,14 @@ static void rvxblk_build() {
     if (cudaMalloc(&d_p2i, (size_t)N*4) != cudaSuccess) { cuModuleUnload(mod); return; }
     cudaMemcpy(d_p2i, pc2idx.data(), (size_t)N*4, cudaMemcpyHostToDevice);
     g_xmod=mod; g_xfn=fn; g_x_pc2idx=d_p2i;
+    // Capture the module's XDW global (SMC watch window mirror) and initialize it: window + dirty
+    // pointer from the live host state, range cells to {0xFFFFFFFF, 0}.
+    g_xdw = 0; size_t xdwsz = 0;
+    if (cuModuleGetGlobal(&g_xdw, &xdwsz, mod, "XDW") == CUDA_SUCCESS && xdwsz >= 24) {
+        rvcud_update_window();
+        uint32_t init2[2] = { 0xFFFFFFFFu, 0 };
+        cuMemcpyHtoD(g_xdw + 16, init2, 8);
+    } else g_xdw = 0;
     g_xtab.assign(N, 0);
     for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch-entry words
     // Stamp uw bit7 on the uops at entry pcs (the interpreter's self-stop sites). Skip if-converted
@@ -4022,9 +4317,170 @@ API int cuda_rvcud_fuzz(int seed, int nprog) {
                 fprintf(stderr, "    x%d ref=%08X rvcud=%08X\n", r2, R[r2], cuda_rv32i_get_reg(0, r2));
         }
     }
+    // Phase 3: DYNAMIC CODE (the TinyCC shape). The static image is a 3-word stub
+    //   lui x30, DYN ; jalr x1, 0(x30) ; ebreak
+    // and the real program B is written into guest RAM at DYN (beyond the image) before stepping —
+    // exercising the full-RAM pc map, JALR miss into runtime code, unresolved direct edges INSIDE
+    // the dynamically-translated blocks (B has forward branches/jals), and the return.
+    int dynCompared = 0;
+    for (int p = 0; p < nprog && fails < 5; p++) {
+        const uint32_t DYN = 0x4000;
+        int PL = 8 + (int)(rnd() % 56);
+        std::vector<uint32_t> B(PL + 1);
+        for (int w = 0; w < PL; w++) {
+            uint32_t k = rnd()%100, rd = 2 + rnd()%29, rs1 = rnd()&31, rs2 = rnd()&31, instr;  // rd never x0/x1/x31
+            if (k < 18) instr = (((rnd()&0xFFFFF)<<12)) | (rd<<7) | ((rnd()&1) ? 0x37 : 0x17);
+            else if (k < 28 && w+1 < PL) {
+                uint32_t f3 = (uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                int hop = 1 + (int)(rnd() % ((PL-w) > 6 ? 6 : (PL-w))); uint32_t i = (uint32_t)(hop*4);
+                instr = (((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63;
+            }
+            else if (k < 34 && w+1 < PL) {
+                int hop = 1 + (int)(rnd() % ((PL-w) > 6 ? 6 : (PL-w))); uint32_t i = (uint32_t)(hop*4);
+                instr = (((i>>20)&1)<<31)|(((i>>1)&0x3FF)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xFF)<<12)|(rd<<7)|0x6F;
+            }
+            else if (k < 50) { uint32_t f3 = rnd()%5, ty = (uint32_t)"\x00\x01\x02\x04\x05"[f3];
+                uint32_t imm = DLO + (rnd() % (DHI-DLO)); instr = (imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+            else if (k < 66) { uint32_t f3 = rnd()%3; uint32_t imm = DLO + (rnd() % (DHI-DLO));
+                instr = (((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+            else if (k < 82) { uint32_t f3 = rnd()&7;
+                if (f3==1 || f3==5) { uint32_t f7 = (f3==5 && (rnd()&1)) ? 0x20 : 0;
+                    instr = (f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+                else instr = ((rnd()&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+            else { uint32_t f3 = rnd()&7, f7;
+                if (rnd()%10 < 4) f7 = 0x01;
+                else f7 = ((f3==0||f3==5) && (rnd()&1)) ? 0x20 : 0;
+                instr = (f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+            B[w] = instr;
+        }
+        B[PL] = (0u<<20)|(1<<15)|(0<<12)|(0<<7)|0x67;                 // jalr x0, 0(x1) — return to the stub
+        uint32_t stub[3] = { (DYN & 0xFFFFF000u) | (30<<7) | 0x37,    // lui  x30, DYN
+                             (0u<<20)|(30<<15)|(0<<12)|(1<<7)|0x67,   // jalr x1, 0(x30)
+                             0x00100073u };                            // ebreak
+        // reference: combined image [base .. DYN+B)
+        int dynW = (int)((DYN - base) >> 2), Nref = dynW + PL + 1;
+        std::vector<uint32_t> rimg(Nref, 0);
+        rimg[0]=stub[0]; rimg[1]=stub[1]; rimg[2]=stub[2];
+        for (int i = 0; i <= PL; i++) rimg[dynW + i] = B[i];
+        uint32_t R[32] = {0}; std::vector<uint8_t> M(8192, 0); uint32_t pc = base; bool term = false;
+        for (int g = 0; g < 200000; g++) {
+            int w = (int)((pc - base) >> 2); if (w < 0 || w >= Nref) { term = true; break; }
+            uint32_t ni = rvx_ref_step(R, M.data(), pc, rimg[w]); if (ni & 0x80000000u) { term = true; break; }
+            pc = ni; R[0] = 0;
+        }
+        if (!term) continue;
+        dynCompared++;
+        uint32_t ref_pc = pc;
+        if (cuda_rvcud_set_code(stub, sizeof stub, base, base) != 0) { fails++; continue; }
+        cuda_rv32i_write_mem(0, zero.data(), 0, 0x1000);
+        cuda_rv32i_write_mem(0, B.data(), DYN, (unsigned)(PL + 1) * 4);   // the "JIT output"
+        for (int i = 0; i < 32; i++) cuda_rv32i_set_reg(0, i, 0);
+        cuda_rv32i_set_entry(0, base);
+        for (int c = 0; c < 64 && !(cuda_rv32i_get_pc(0) & 0x80000000u); c++)
+            if (cuda_rvcud_step_all(40000) != 0) break;
+        uint32_t epc = cuda_rv32i_get_pc(0) & 0x7FFFFFFFu;
+        bool ok = (epc == ref_pc);
+        for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2]) { ok = false; break; }
+        if (ok) { std::vector<uint8_t> gm(DHI-DLO);
+            cuda_rv32i_read_mem(0, gm.data(), DLO, DHI-DLO);
+            if (memcmp(gm.data(), M.data()+DLO, DHI-DLO) != 0) ok = false; }
+        if (!ok) { fails++;
+            fprintf(stderr, "[fuzz4c] FAIL prog %d (PL=%d) ref_pc=0x%X rvcud_pc=0x%X\n", p, PL, ref_pc, epc);
+            for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2])
+                fprintf(stderr, "    x%d ref=%08X rvcud=%08X\n", r2, R[r2], cuda_rv32i_get_reg(0, r2));
+        }
+    }
+    // Phase 4: SELF-MODIFYING code (the TinyCC recompile shape). The static stub calls dynamic
+    // program B at DYN, then OVERWRITES it with program C via ordinary guest stores (lui/addi/sw
+    // per word), executes `fence.i` (the architectural sync point → dirty-page invalidation), and
+    // calls DYN again — which must now run C, re-translated from the new bytes. The reference runs
+    // a unified-memory model (fetch and data from one array), so the overwrite is modeled exactly.
+    int smcCompared = 0;
+    for (int p = 0; p < nprog && fails < 5; p++) {
+        const uint32_t DYN = 0x4000, MEMB = 0x8000;
+        auto genBody = [&](std::vector<uint32_t>& v) {
+            int PL = 6 + (int)(rnd() % 40);
+            v.assign(PL + 1, 0);
+            for (int w = 0; w < PL; w++) {
+                uint32_t k = rnd()%100, rd = 2 + rnd()%27, rs1 = rnd()&31, rs2 = rnd()&31, instr;  // rd 2..28
+                if (k < 18) instr = (((rnd()&0xFFFFF)<<12)) | (rd<<7) | ((rnd()&1) ? 0x37 : 0x17);
+                else if (k < 28 && w+1 < PL) {
+                    uint32_t f3 = (uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                    int hop = 1 + (int)(rnd() % ((PL-w) > 6 ? 6 : (PL-w))); uint32_t i = (uint32_t)(hop*4);
+                    instr = (((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63;
+                }
+                else if (k < 46) { uint32_t f3 = rnd()%5, ty = (uint32_t)"\x00\x01\x02\x04\x05"[f3];
+                    uint32_t imm = DLO + (rnd() % (DHI-DLO)); instr = (imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+                else if (k < 62) { uint32_t f3 = rnd()%3; uint32_t imm = DLO + (rnd() % (DHI-DLO));
+                    instr = (((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+                else if (k < 80) { uint32_t f3 = rnd()&7;
+                    if (f3==1 || f3==5) { uint32_t f7 = (f3==5 && (rnd()&1)) ? 0x20 : 0;
+                        instr = (f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+                    else instr = ((rnd()&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+                else { uint32_t f3 = rnd()&7, f7;
+                    if (rnd()%10 < 4) f7 = 0x01;
+                    else f7 = ((f3==0||f3==5) && (rnd()&1)) ? 0x20 : 0;
+                    instr = (f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+                v[w] = instr;
+            }
+            v[PL] = (0u<<20)|(1<<15)|(0<<12)|(0<<7)|0x67;             // jalr x0, 0(x1) — ret
+        };
+        std::vector<uint32_t> B, C;
+        genBody(B); genBody(C);
+        // stub: lui x30,DYN ; jalr x1,0(x30) ; { lui/addi x29,C[k] ; sw x29,k*4(x30) }* ; fence.i ;
+        //       jalr x1,0(x30) ; ebreak
+        std::vector<uint32_t> stub;
+        stub.push_back((DYN & 0xFFFFF000u) | (30<<7) | 0x37);
+        stub.push_back((0u<<20)|(30<<15)|(0<<12)|(1<<7)|0x67);
+        for (size_t k = 0; k < C.size(); k++) {
+            uint32_t v = C[k];
+            uint32_t hi = (v + 0x800u) & 0xFFFFF000u;
+            int32_t  lo = (int32_t)(v - hi);
+            stub.push_back(hi | (29<<7) | 0x37);                                          // lui  x29, hi
+            stub.push_back((((uint32_t)lo & 0xFFFu)<<20)|(29<<15)|(0<<12)|(29<<7)|0x13);  // addi x29, x29, lo
+            uint32_t off = (uint32_t)(k * 4);
+            stub.push_back((((off>>5)&0x7F)<<25)|(29<<20)|(30<<15)|(2<<12)|((off&0x1F)<<7)|0x23);  // sw
+        }
+        stub.push_back(0x0000100Fu);                                  // fence.i
+        stub.push_back((0u<<20)|(30<<15)|(0<<12)|(1<<7)|0x67);        // jalr x1, 0(x30) — call C
+        stub.push_back(0x00100073u);                                  // ebreak
+        // reference: unified memory model — fetch AND data from one array (overwrite is natural)
+        std::vector<uint8_t> M(MEMB, 0);
+        memcpy(&M[base], stub.data(), stub.size() * 4);
+        memcpy(&M[DYN],  B.data(),    B.size() * 4);
+        uint32_t R[32] = {0}; uint32_t pc = base; bool term = false;
+        for (int g = 0; g < 400000; g++) {
+            if (pc < base || pc + 4 > MEMB) { term = true; break; }
+            uint32_t instr; memcpy(&instr, &M[pc], 4);
+            uint32_t ni = rvx_ref_step(R, M.data(), pc, instr); if (ni & 0x80000000u) { term = true; break; }
+            pc = ni; R[0] = 0;
+        }
+        if (!term) continue;
+        smcCompared++;
+        uint32_t ref_pc = pc;
+        if (cuda_rvcud_set_code(stub.data(), (unsigned)stub.size() * 4, base, base) != 0) { fails++; continue; }
+        cuda_rv32i_write_mem(0, zero.data(), 0, 0x1000);
+        cuda_rv32i_write_mem(0, B.data(), DYN, (unsigned)B.size() * 4);
+        for (int i = 0; i < 32; i++) cuda_rv32i_set_reg(0, i, 0);
+        cuda_rv32i_set_entry(0, base);
+        for (int c = 0; c < 96 && !(cuda_rv32i_get_pc(0) & 0x80000000u); c++)
+            if (cuda_rvcud_step_all(40000) != 0) break;
+        uint32_t epc = cuda_rv32i_get_pc(0) & 0x7FFFFFFFu;
+        bool ok = (epc == ref_pc);
+        for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2]) { ok = false; break; }
+        if (ok) { std::vector<uint8_t> gm(DHI-DLO);
+            cuda_rv32i_read_mem(0, gm.data(), DLO, DHI-DLO);
+            if (memcmp(gm.data(), M.data()+DLO, DHI-DLO) != 0) ok = false; }
+        if (!ok) { fails++;
+            fprintf(stderr, "[fuzz4d] FAIL prog %d (B=%zu C=%zu) ref_pc=0x%X rvcud_pc=0x%X\n",
+                    p, B.size(), C.size(), ref_pc, epc);
+            for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2])
+                fprintf(stderr, "    x%d ref=%08X rvcud=%08X\n", r2, R[r2], cuda_rv32i_get_reg(0, r2));
+        }
+    }
     _putenv("RVX_OFF=");
-    fprintf(stderr, "[fuzz4] %d+%d programs (%d jalr-phase compared), %d failures (seed=%d)\n",
-            nprog, nprog, compared, fails, seed);
+    fprintf(stderr, "[fuzz4] 4 phases x %d programs (%d jalr, %d dynamic, %d smc compared), %d failures (seed=%d)\n",
+            nprog, compared, dynCompared, smcCompared, fails, seed);
     return fails;
 }
 

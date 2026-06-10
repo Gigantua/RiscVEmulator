@@ -10,6 +10,7 @@ using RiscVEmulator.Core.Cuda;
 // output is drained from a managed ring between kernel launches.
 
 const uint JitSrcAddress = 0x00D00000;
+[System.Runtime.InteropServices.DllImport("rv32i_cuda")] static extern void cuda_rvcud_set_dyncode(int v);
 const string JitSrc =
 @"extern int printf(const char *fmt, ...);
 extern int putchar(int c);
@@ -156,6 +157,13 @@ emu.OutputHandler = c => { Console.Write(c); output.Append(c); };
 
 uint entry = emu.LoadElf(elfData);
 emu.LoadBytes(JitSrcAddress, System.Text.Encoding.ASCII.GetBytes(JitSrc));
+bool useRvcud = args.Contains("--rvcud");      // rvcud uop core + exec_block; TCC's runtime-generated
+if (useRvcud)                                  // code runs via lazy translation + fence.i invalidation
+{
+    Console.WriteLine("rvcud: cross-compiling the guest to the CUDA uop core + exec_block JIT.\n");
+    cuda_rvcud_set_dyncode(1);                 // bake the SMC store checks into the exec PTX
+}
+emu.UseRvcud = useRvcud;
 emu.CommitImage();
 emu.SetReg(2, StackPointer);
 emu.SetEntry(entry);

@@ -79,6 +79,10 @@ static TCCState *compile_jit(void)
         printf("ERROR: tcc_relocate() failed\n");
         tcc_delete(s); return 0;
     }
+    /* Architectural icache sync: the buffer now holds executable code we just wrote as data.
+     * RISC-V requires fence.i before executing it (TCC's riscv port never emits one), and the
+     * emulator's DBT uses exactly this instruction as its invalidate-stale-translations point. */
+    __asm__ volatile ("fence.i");
     return s;
 }
 
