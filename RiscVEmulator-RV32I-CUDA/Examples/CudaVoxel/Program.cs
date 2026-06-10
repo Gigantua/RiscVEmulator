@@ -12,6 +12,7 @@ using RiscVEmulator.Frontend;
 
 const uint StackPointer = 0x00EFFF00;
 const int  RamMB = 16;
+[System.Runtime.InteropServices.DllImport("rv32i_cuda")] static extern uint cuda_rv32i_get_pc(int core);
 bool headless = args.Contains("--headless");
 bool useRvcud = !args.Contains("--no-jit");   // rvcud uop core + exec_block JIT (default ON; --no-jit = base kernel)
 int benchN = 0;                               // --bench N: headless, run to N guest VSYNC presents, report MIPS + fps
@@ -21,6 +22,11 @@ string? shotPath = null;                      // --shot <path>: with --bench, sa
     if (bi >= 0 && bi + 1 < args.Length && int.TryParse(args[bi + 1], out int bn)) benchN = bn;
     int si = Array.IndexOf(args, "--shot");
     if (si >= 0 && si + 1 < args.Length) shotPath = args[si + 1];
+}
+int benchBatch = 1_000_000;                   // --batch N: bench StepN granularity (debug)
+{
+    int ti = Array.IndexOf(args, "--batch");
+    if (ti >= 0 && ti + 1 < args.Length && int.TryParse(args[ti + 1], out int tb)) benchBatch = tb;
 }
 string clang = @"C:\Program Files\LLVM\bin\clang.exe";
 string exeDir = AppContext.BaseDirectory;
@@ -59,12 +65,12 @@ foreach (string src in sources)
 {
     if (!File.Exists(src)) { Console.Error.WriteLine($"missing {src}"); return 1; }
     string obj = Path.Combine(buildDir, Path.GetFileNameWithoutExtension(src) + ".o");
-    if (!Clang(new[] { "--target=riscv32-unknown-elf","-march=rv32i","-mabi=ilp32",
+    if (!Clang(new[] { "--target=riscv32-unknown-elf","-march=rv32im","-mabi=ilp32",
                        "-nostdlib","-nostartfiles","-O3","-fno-builtin","-fsigned-char","-c" }
                .Concat(inc).Concat(new[]{ src, "-o", obj }).ToArray())) return 1;
     objs.Add(obj);
 }
-if (!Clang(new[] { "--target=riscv32-unknown-elf","-march=rv32i","-mabi=ilp32",
+if (!Clang(new[] { "--target=riscv32-unknown-elf","-march=rv32im","-mabi=ilp32",
                    "-nostdlib","-nostartfiles","-O3","-fno-builtin","-fsigned-char",
                    "-fuse-ld=lld", $"-Wl,-T,{linkerLd}" }
            .Concat(objs).Concat(new[]{ "-o", elfPath }).ToArray())) return 1;
@@ -88,7 +94,7 @@ if (benchN > 0)
     double tFirst = 0; ulong sFirst = 0;
     for (int b = 0; b < 100000 && !emu.IsHalted; b++)
     {
-        emu.StepN(1_000_000);
+        emu.StepN(benchBatch);
         ulong vf = emu.Display.VsyncCount;
         if (vf >= 1 && tFirst == 0) { tFirst = sw.Elapsed.TotalSeconds; sFirst = emu.ActualSteps; }
         if (vf >= (ulong)benchN)
@@ -106,7 +112,8 @@ if (benchN > 0)
             return 0;
         }
     }
-    Console.Error.WriteLine($"only reached {emu.Display.VsyncCount}/{benchN} presents"); return 1;
+    Console.Error.WriteLine($"only reached {emu.Display.VsyncCount}/{benchN} presents " +
+                            $"(halted={emu.IsHalted}, pc=0x{cuda_rv32i_get_pc(0):X8})"); return 1;
 }
 
 if (headless)

@@ -110,9 +110,48 @@ u64 __muldi3(u64 a, u64 b)
  * Needed when C code uses uint64_t / uint64_t on a 32-bit target.
  * ═══════════════════════════════════════════════════════════════════ */
 
+#ifdef __riscv_mul
+/* ── M-extension fast path: 64/32 division via hardware 32-bit divides ─ *
+ * k-bit chunking: each step divides (r << k) | next_chunk by d, which     *
+ * fits 32 bits as long as d <= 2^(32-k) (r < d invariant). The softfloat  *
+ * library's f32 divide/sqrt put a <2^24 mantissa in the divisor, so the   *
+ * 8-bit-chunk path turns the old 64-iteration bit loop (~1000 instrs per  *
+ * pixel via 1.0f/iw) into ~6 hardware divides.                            */
+static u64 udiv64_32(u64 n, u32 d, u32* rem)              /* d != 0 */
+{
+    u32 hi = (u32)(n >> 32), lo = (u32)n;
+    u32 q1 = hi / d, r = hi % d, q0;
+    if (d < (1u << 16)) {
+        u32 t = (r << 16) | (lo >> 16);      u32 qa = t / d; r = t % d;
+        t     = (r << 16) | (lo & 0xFFFFu);  u32 qb = t / d; r = t % d;
+        q0 = (qa << 16) | qb;
+    } else if (d < (1u << 24)) {
+        u32 t = (r << 8) | (lo >> 24);           u32 qa = t / d; r = t % d;
+        t     = (r << 8) | ((lo >> 16) & 0xFFu); u32 qb = t / d; r = t % d;
+        t     = (r << 8) | ((lo >> 8) & 0xFFu);  u32 qc = t / d; r = t % d;
+        t     = (r << 8) | (lo & 0xFFu);         u32 qd = t / d; r = t % d;
+        q0 = (qa << 24) | (qb << 16) | (qc << 8) | qd;
+    } else {
+        /* d >= 2^24: bit-at-a-time over the low word, with a carry guard
+         * (r < d can still make r<<1 overflow 32 bits). */
+        q0 = 0;
+        for (int i = 31; i >= 0; i--) {
+            u32 carry = r >> 31;
+            r = (r << 1) | ((lo >> i) & 1u);
+            if (carry || r >= d) { r -= d; q0 |= (1u << i); }
+        }
+    }
+    if (rem) *rem = r;
+    return ((u64)q1 << 32) | q0;
+}
+#endif
+
 u64 __udivdi3(u64 a, u64 b)
 {
     if (!b) return 0;
+#ifdef __riscv_mul
+    if ((u32)(b >> 32) == 0) { return udiv64_32(a, (u32)b, 0); }
+#endif
     u64 q = 0, r = 0;
     for (int i = 63; i >= 0; i--) {
         r = (r << 1) | ((a >> i) & 1);
@@ -124,6 +163,9 @@ u64 __udivdi3(u64 a, u64 b)
 u64 __umoddi3(u64 a, u64 b)
 {
     if (!b) return 0;
+#ifdef __riscv_mul
+    if ((u32)(b >> 32) == 0) { u32 r32; udiv64_32(a, (u32)b, &r32); return r32; }
+#endif
     u64 r = 0;
     for (int i = 63; i >= 0; i--) {
         r = (r << 1) | ((a >> i) & 1);
