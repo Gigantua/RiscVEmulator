@@ -702,7 +702,7 @@ static uint32_t*  g_ext     = nullptr;  // side params for fat fusions (TEXSPAN)
 static int        g_nuops   = 0;
 static int        g_pc2words = 0;       // length of pc2uop[] = translated code words (NOT total memory words)
 static uint32_t   g_base    = 0;
-static unsigned long long* g_ret = nullptr;  // core-0 retired guest-instruction count (verify gate)
+static unsigned long long* g_ret = nullptr;  // core-0 retired guest-instruction count (verify gate); PINNED zero-copy
 #if RVCUD_HOTHIST
 static unsigned long long* g_hot_host = nullptr;   // managed mirror of the per-uop execution histogram
 #endif
@@ -729,7 +729,10 @@ static long long  rvxblk_step(long long budget);
 API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     g_ncores = nCores;
     cudaError_t e;
-    if ((e = cudaMallocManaged(&g_state, (size_t)nCores * sizeof(CoreState))) != cudaSuccess) return (int)e;
+    // PINNED zero-copy, not managed: kernels touch CoreState only at launch entry/exit (regs go to
+    // shared/PTX registers), but the host reads pc after EVERY launch — and on Windows/WDDM managed
+    // memory migrates wholesale at every launch/sync boundary (~0.5 ms per step_all call measured).
+    if ((e = cudaHostAlloc((void**)&g_state, (size_t)nCores * sizeof(CoreState), cudaHostAllocMapped)) != cudaSuccess) return (int)e;
     if ((e = cudaMalloc(&g_mem, (size_t)nCores * memBytes)) != cudaSuccess) return (int)e;
     memset(g_state, 0, (size_t)nCores * sizeof(CoreState));
     cudaMemset(g_mem, 0, (size_t)nCores * memBytes);
@@ -1993,7 +1996,7 @@ static bool rvcud_translate_miss(uint32_t pc) {
 // existing cores*budget*iters MIPS metric stays guest-MIPS and is apples-to-apples with rv32i.
 API int cuda_rvcud_step_all(int budget) {
     if (g_ncores <= 0 || g_nuops <= 0) return -1;
-    if (!g_ret) cudaMallocManaged(&g_ret, sizeof(unsigned long long));
+    if (!g_ret) { cudaHostAlloc((void**)&g_ret, 16, cudaHostAllocMapped); memset((void*)g_ret, 0, 16); }
 #if RVCUD_HOTHIST
     { static unsigned long long* hot = nullptr;
       if (!hot) { cudaMallocManaged(&hot, (size_t)g_uopcap * 8); cudaMemset(hot, 0, (size_t)g_uopcap * 8);
@@ -2961,8 +2964,8 @@ API void cuda_rv32i_shutdown() {
     }
 #endif
     rvcud_free();
-    if (g_ret) { cudaFree(g_ret); g_ret = nullptr; }
+    if (g_ret) { cudaFreeHost((void*)g_ret); g_ret = nullptr; }
     if (g_mem)  { cudaFree(g_mem);  g_mem  = nullptr; }
-    if (g_state) { cudaFree(g_state); g_state = nullptr; }
+    if (g_state) { cudaFreeHost(g_state); g_state = nullptr; }
     g_ncores = 0;
 }
