@@ -109,6 +109,8 @@ static void poll_keyboard(void)
     while (KBD_STATUS & 1u)
     {
         uint32_t raw = KBD_DATA;
+        KBD_STATUS = 0;  /* CUDA path: host-staged cell, one event per launch — consume exactly once
+                            (no-op write on the CPU path's guarded FIFO, where the read already popped). */
         uint8_t sc = (uint8_t)(raw & 0xFF);
         uint8_t pressed = (uint8_t)((raw >> 8) & 1);
         s_keys[sc] = pressed;

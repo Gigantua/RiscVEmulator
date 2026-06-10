@@ -112,8 +112,11 @@ public unsafe class SdlWindow
     {
         while (_running && !_emu.IsHalted)
         {
-            // Single P/Invoke call runs entire batch in native C++
-            int executed = _emu.StepN(2_000_000);
+            // Single P/Invoke call runs the batch in native code. Input staging happens once per
+            // batch (the CUDA path stages ONE keyboard event per launch), so the batch size bounds
+            // both input latency and keyboard throughput: 500k steps ≈ 20-30 ms per launch on the
+            // current engine — ~4x snappier input than 2M for sub-ms extra launch overhead.
+            int executed = _emu.StepN(500_000);
             Interlocked.Add(ref _totalSteps, executed);
         }
     }

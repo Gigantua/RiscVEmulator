@@ -167,6 +167,9 @@ static void poll_keyboard(void)
 {
     while (KB_STATUS & 1) {
         unsigned int raw = KB_DATA;
+        KB_STATUS = 0;   /* CUDA path: KB_* are host-staged memory cells (one event per launch), not a
+                            popping FIFO — without this the loop re-processes the same event for the
+                            whole batch. On the CPU path the guarded device ignores the write. */
         unsigned int scancode = raw & 0xFF;
         int pressed = (raw & 0x100) != 0;
         doom_key_t key = scancode_to_doom_key(scancode);
