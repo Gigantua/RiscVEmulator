@@ -407,7 +407,12 @@ static uint8_t world_get(int x, int y, int z)
 }
 /* ═══════════════════════════════ Framebuffer + depth ════════════════════════ */
 static float   s_zbuf[FB_PIXELS];       /* per-pixel 1/w depth (larger = closer) */
-static uint32_t s_shadow[FB_PIXELS];
+/* Double-buffered render target: draw into s_draw while the OTHER buffer is presented via
+ * DISP_FB_ADDR. The CUDA host reads the presented buffer asynchronously (batch-end drain),
+ * so single-buffering showed partially-drawn frames and raced the next frame's clear. */
+static uint32_t s_fb[2][FB_PIXELS];
+static uint32_t* s_draw = s_fb[0];
+static int s_fbi = 0;
 static uint32_t s_sky[FB_PIXELS];
 static void init_sky(void)
 {
@@ -425,7 +430,7 @@ static void init_sky(void)
 static void clear_screen(void)
 {
     memset(s_zbuf, 0, sizeof(s_zbuf));   /* 0.0f = infinitely far (1/w == 0) */
-    memcpy(s_shadow, s_sky, sizeof(s_sky));
+    memcpy(s_draw, s_sky, sizeof(s_sky));
 }
 /* ═══════════════════════════════ FLOAT PERSPECTIVE-CORRECT RASTERIZER ═══════ */
 typedef struct
@@ -502,8 +507,20 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
     if (maxy >= FB_HEIGHT) maxy = FB_HEIGHT - 1;
     if (minx > maxx || miny > maxy) return;
 
-    float area = edge_fn(v0->sx, v0->sy, v1->sx, v1->sy, v2->sx, v2->sy);
-    if (area >= 0.0f) return;
+    /* ── 28.4 integer edge functions for COVERAGE. Each soft-float compare is a libcall
+       (~8 libcalls per bounding-box pixel made the rasterizer ~670M instrs/frame); integer
+       coverage is a handful of ALU ops. Vertices snap to a 1/16-px grid so the edges are
+       exact integers (zero stepping drift); the accumulators are 64-bit because near-clip
+       vertices can project ~100k px off-screen and the cross products overflow 32 bits.
+       Attributes stay float but are evaluated ONLY for covered pixels (they were stepped
+       across the whole bounding box). */
+    int x0i = (int)(v0->sx * 16.0f), y0i = (int)(v0->sy * 16.0f);
+    int x1i = (int)(v1->sx * 16.0f), y1i = (int)(v1->sy * 16.0f);
+    int x2i = (int)(v2->sx * 16.0f), y2i = (int)(v2->sy * 16.0f);
+    long long areal = (long long)(x2i - x0i) * (y1i - y0i)
+                    - (long long)(y2i - y0i) * (x1i - x0i);   /* == edge_fn(v0, v1, v2) */
+    if (areal >= 0) return;                       /* back-facing / degenerate */
+    float area = (float)areal * (1.0f / 256.0f);  /* 24.8 → pixel², for the gradients */
     float inv_area = 1.0f / area;
 
     /* Edge-function screen-space derivatives (per 1-pixel step) */
@@ -538,6 +555,15 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
     float v_w_row  = v2->v_w   + (E0_row * dv0 + E1_row * dv1) * inv_area;
     float iw_row   = v2->inv_w + (E0_row * dw0 + E1_row * dw1) * inv_area;
 
+    /* Integer coverage steppers (28.4 pixel centers) */
+    int dE0xi = (y2i - y1i) << 4, dE0yi = -((x2i - x1i) << 4);
+    int dE1xi = (y0i - y2i) << 4, dE1yi = -((x0i - x2i) << 4);
+    int pxc = (minx << 4) + 8, pyc = (miny << 4) + 8;
+    long long E0l_row = (long long)(pxc - x1i) * (y2i - y1i)
+                      - (long long)(pyc - y1i) * (x2i - x1i);
+    long long E1l_row = (long long)(pxc - x2i) * (y0i - y2i)
+                      - (long long)(pyc - y2i) * (x0i - x2i);
+
     int nfog = 256 - fog_i;
     int fog_r = 230 * fog_i;
     int fog_g = 205 * fog_i;
@@ -545,22 +571,23 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
 
     for (int py = miny; py <= maxy; py++)
     {
-        float E0 = E0_row;
-        float E1 = E1_row;
-        float u_w = u_w_row;
-        float v_w = v_w_row;
-        float iw  = iw_row;
+        long long E0l = E0l_row;
+        long long E1l = E1l_row;
         int idx = py * FB_WIDTH + minx;
 
         for (int px = minx; px <= maxx; px++, idx++)
         {
-            if (E0 <= 0.0f && E1 <= 0.0f && E0 + E1 >= area)
+            if (E0l <= 0 && E1l <= 0 && E0l + E1l >= areal)
             {
+                float fdx = (float)(px - minx);
+                float iw  = iw_row + fdx * diw_dx;
                 if (iw > s_zbuf[idx])
                 {
                     s_zbuf[idx] = iw;
 
                     /* Perspective divide → recover true u, v at this pixel */
+                    float u_w = u_w_row + fdx * du_w_dx;
+                    float v_w = v_w_row + fdx * dv_w_dx;
                     float w = 1.0f / iw;
                     float u = u_w * w;
                     float v = v_w * w;
@@ -568,18 +595,15 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
                     int px_tex = (int)(u * 16.0f) & 15;
                     int py_tex = (int)(v * 16.0f) & 15;
 
-                    s_shadow[idx] = frag_shader_inline(tx, ty, px_tex, py_tex,
+                    s_draw[idx] = frag_shader_inline(tx, ty, px_tex, py_tex,
                         ao_i, nfog, fog_r, fog_g, fog_b);
                 }
             }
-            E0 += dE0_dx;
-            E1 += dE1_dx;
-            u_w += du_w_dx;
-            v_w += dv_w_dx;
-            iw  += diw_dx;
+            E0l += dE0xi;
+            E1l += dE1xi;
         }
-        E0_row += dE0_dy;
-        E1_row += dE1_dy;
+        E0l_row += dE0yi;
+        E1l_row += dE1yi;
         u_w_row += du_w_dy;
         v_w_row += dv_w_dy;
         iw_row  += diw_dy;
@@ -877,7 +901,7 @@ static void render_world(void)
 static void draw_pixel(int x, int y, uint32_t col)
 {
     if (x < 0 || x >= FB_WIDTH || y < 0 || y >= FB_HEIGHT) return;
-    s_shadow[y * FB_WIDTH + x] = col;
+    s_draw[y * FB_WIDTH + x] = col;
 }
 static void draw_crosshair(void)
 {
@@ -913,7 +937,6 @@ int main(void)
         s_proj_scale_y = proj[5];
     }
 
-    DISP_FB_ADDR_REG = (uint32_t)s_shadow;
     printf("Voxel: Entering game loop (camera-space verts + backface culling + fixed-point raster)\n");
     printf(" WASD = move, Space = jump, Mouse = look\n");
     printf(" LMB = break, RMB = place, 1-5 = select block, ESC = quit\n");
@@ -991,7 +1014,12 @@ int main(void)
         clear_screen();
         render_world();
         draw_crosshair();
+        /* Present the COMPLETED buffer, then draw the next frame into the other one — the
+         * host drains fbaddr+vsync at batch end, long after these writes. */
+        DISP_FB_ADDR_REG = (uint32_t)s_draw;
         DISP_VSYNC_REG = 1;
+        s_fbi ^= 1;
+        s_draw = s_fb[s_fbi];
     }
     printf("Voxel: Exiting\n");
     return 0;

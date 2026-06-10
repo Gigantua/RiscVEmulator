@@ -14,6 +14,14 @@ const uint StackPointer = 0x00EFFF00;
 const int  RamMB = 16;
 bool headless = args.Contains("--headless");
 bool useRvcud = !args.Contains("--no-jit");   // rvcud uop core + exec_block JIT (default ON; --no-jit = base kernel)
+int benchN = 0;                               // --bench N: headless, run to N guest VSYNC presents, report MIPS + fps
+string? shotPath = null;                      // --shot <path>: with --bench, save the final presented frame as PNG
+{
+    int bi = Array.IndexOf(args, "--bench");
+    if (bi >= 0 && bi + 1 < args.Length && int.TryParse(args[bi + 1], out int bn)) benchN = bn;
+    int si = Array.IndexOf(args, "--shot");
+    if (si >= 0 && si + 1 < args.Length) shotPath = args[si + 1];
+}
 string clang = @"C:\Program Files\LLVM\bin\clang.exe";
 string exeDir = AppContext.BaseDirectory;
 
@@ -71,6 +79,36 @@ emu.CommitImage();
 emu.SetReg(2, StackPointer);
 emu.SetEntry(entry);
 
+if (benchN > 0)
+{
+    // Headless throughput bench (h4-style): frames = the guest's own VSYNC presents, steps =
+    // actually-retired instructions. Reports MIPS over the span and the presented frame rate.
+    Console.WriteLine($"Bench: running to {benchN} guest presents...");
+    var sw = Stopwatch.StartNew();
+    double tFirst = 0; ulong sFirst = 0;
+    for (int b = 0; b < 100000 && !emu.IsHalted; b++)
+    {
+        emu.StepN(1_000_000);
+        ulong vf = emu.Display.VsyncCount;
+        if (vf >= 1 && tFirst == 0) { tFirst = sw.Elapsed.TotalSeconds; sFirst = emu.ActualSteps; }
+        if (vf >= (ulong)benchN)
+        {
+            double s = sw.Elapsed.TotalSeconds, steps = emu.ActualSteps;
+            double sSpan = s - tFirst;
+            Console.WriteLine($"first present: {sFirst / 1e6:F1}M steps, {tFirst:F2}s");
+            Console.WriteLine($"=> bench-{benchN}-presents: {steps / 1e6:F1}M steps in {s:F2}s = {steps / s / 1e6:F2} MIPS, " +
+                              $"{(benchN - 1) / Math.Max(sSpan, 1e-9):F1} fps after first present");
+            if (shotPath != null)
+            {
+                Png.WriteRgba(shotPath, emu.Framebuffer.PresentedPixels, 320, 200);
+                Console.WriteLine($"wrote {shotPath}");
+            }
+            return 0;
+        }
+    }
+    Console.Error.WriteLine($"only reached {emu.Display.VsyncCount}/{benchN} presents"); return 1;
+}
+
 if (headless)
 {
     Console.WriteLine("Headless: stepping until the framebuffer first renders...");
@@ -113,4 +151,40 @@ bool Clang(string[] a)
     var p = Process.Start(psi)!; string err = p.StandardError.ReadToEnd(); p.WaitForExit();
     if (p.ExitCode != 0) { Console.Error.WriteLine($"clang failed ({p.ExitCode})\n{err}"); return false; }
     return true;
+}
+
+// Minimal PNG writer (RGBA8888, no deps beyond built-in ZLibStream) — same as CudaDoom's.
+static class Png
+{
+    public static void WriteRgba(string path, byte[] rgba, int w, int h)
+    {
+        using var fs = File.Create(path);
+        fs.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
+        byte[] ihdr = new byte[13];
+        BE(ihdr, 0, (uint)w); BE(ihdr, 4, (uint)h);
+        ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0; // 8-bit RGBA
+        Chunk(fs, "IHDR", ihdr);
+        byte[] raw = new byte[h * (1 + w * 4)];
+        int o = 0;
+        for (int y = 0; y < h; y++) { raw[o++] = 0; Array.Copy(rgba, y * w * 4, raw, o, w * 4); o += w * 4; }
+        byte[] idat;
+        using (var ms = new MemoryStream())
+        {
+            using (var z = new System.IO.Compression.ZLibStream(ms, System.IO.Compression.CompressionLevel.Optimal, true))
+                z.Write(raw, 0, raw.Length);
+            idat = ms.ToArray();
+        }
+        Chunk(fs, "IDAT", idat);
+        Chunk(fs, "IEND", Array.Empty<byte>());
+    }
+    static void Chunk(Stream s, string type, byte[] data)
+    {
+        byte[] len = new byte[4]; BE(len, 0, (uint)data.Length); s.Write(len);
+        byte[] t = System.Text.Encoding.ASCII.GetBytes(type); s.Write(t); s.Write(data);
+        byte[] c = new byte[4]; BE(c, 0, Crc(t, data)); s.Write(c);
+    }
+    static void BE(byte[] b, int o, uint v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
+    static readonly uint[] T = Build();
+    static uint[] Build() { var t = new uint[256]; for (uint n = 0; n < 256; n++) { uint c = n; for (int k = 0; k < 8; k++) c = ((c & 1) != 0) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); t[n] = c; } return t; }
+    static uint Crc(byte[] a, byte[] b) { uint c = 0xFFFFFFFFu; foreach (var x in a) c = T[(c ^ x) & 0xFF] ^ (c >> 8); foreach (var x in b) c = T[(c ^ x) & 0xFF] ^ (c >> 8); return c ^ 0xFFFFFFFFu; }
 }
