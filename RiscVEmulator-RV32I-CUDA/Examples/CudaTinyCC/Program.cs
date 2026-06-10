@@ -11,6 +11,9 @@ using RiscVEmulator.Core.Cuda;
 
 const uint JitSrcAddress = 0x00D00000;
 [System.Runtime.InteropServices.DllImport("rv32i_cuda")] static extern void cuda_rvcud_set_dyncode(int v);
+[System.Runtime.InteropServices.DllImport("rv32i_cuda")] static extern void cuda_rvcud_set_prof(int k);
+[System.Runtime.InteropServices.DllImport("rv32i_cuda")] static extern int  cuda_rvcud_prof_top(uint[] pcs, ulong[] counts, int max);
+[System.Runtime.InteropServices.DllImport("rv32i_cuda")] static extern void cuda_rvcud_jit_stats(long[] out5);
 const string JitSrc =
 @"extern int printf(const char *fmt, ...);
 extern int putchar(int c);
@@ -157,12 +160,14 @@ emu.OutputHandler = c => { Console.Write(c); output.Append(c); };
 
 uint entry = emu.LoadElf(elfData);
 emu.LoadBytes(JitSrcAddress, System.Text.Encoding.ASCII.GetBytes(JitSrc));
-bool useRvcud = args.Contains("--rvcud");      // rvcud uop core + exec_block; TCC's runtime-generated
-if (useRvcud)                                  // code runs via lazy translation + fence.i invalidation
+bool profile  = args.Contains("--prof");       // guest-pc start-profile of the JIT run (implies --rvcud)
+bool useRvcud = profile || args.Contains("--rvcud");   // rvcud uop core + exec_block; TCC's runtime-
+if (useRvcud)                                  // generated code runs via lazy translation + fence.i
 {
     Console.WriteLine("rvcud: cross-compiling the guest to the CUDA uop core + exec_block JIT.\n");
     cuda_rvcud_set_dyncode(1);                 // bake the SMC store checks into the exec PTX
 }
+if (profile) cuda_rvcud_set_prof(48);          // 48 budget slices per launch → guest-pc samples
 emu.UseRvcud = useRvcud;
 emu.CommitImage();
 emu.SetReg(2, StackPointer);
@@ -186,7 +191,66 @@ if (!emu.IsHalted)
 double mips = steps / sw.Elapsed.TotalSeconds / 1_000_000.0;
 Console.WriteLine($"\nExit code: {emu.ExitCode}");
 Console.WriteLine($"GPU core: ~{steps:N0} step-budget in {sw.Elapsed.TotalSeconds:F1}s ({mips:F1} MIPS single-thread)");
+
+if (profile)
+{
+    // ── JIT start-profile: guest-pc sample buckets mapped to ELF symbols; pcs beyond the static
+    //    image are TCC's runtime-generated code. Aggregated per function. ──
+    var pcs = new uint[24]; var cnts = new ulong[24];
+    int n = cuda_rvcud_prof_top(pcs, cnts, 24);
+    ulong tot = 0; for (int i = 0; i < n; i++) tot += cnts[i];
+    var (_, imgHi) = ElfLoader.ReadOnlyCodeSpan(elfData);
+    var syms = ElfFunctionSymbols(elfData);
+    var agg = new Dictionary<string, ulong>();
+    for (int i = 0; i < n; i++)
+    {
+        string where = "JIT code (runtime-generated)";
+        if (pcs[i] < imgHi)
+        {
+            where = "?";
+            for (int s = syms.Count - 1; s >= 0; s--)
+                if (syms[s].addr <= pcs[i]) { where = syms[s].name; break; }
+        }
+        agg[where] = agg.TryGetValue(where, out var c) ? c + cnts[i] : cnts[i];
+    }
+    Console.WriteLine($"\n── JIT profile ({tot:N0} guest-pc samples) ──");
+    foreach (var kv in agg.OrderByDescending(k => k.Value))
+        Console.WriteLine($"  {100.0 * kv.Value / tot,5:F1}%  {kv.Key}");
+    var js = new long[5]; cuda_rvcud_jit_stats(js);
+    Console.WriteLine($"  jit: {js[0]} translation misses ({js[2]} in runtime code, {js[1]} uops emitted), " +
+                      $"{js[3]} branch-edge patches, {js[4]} page invalidations");
+}
 return emu.ExitCode;
+
+// ELF32 .symtab function symbols (addr-sorted) — for mapping profile buckets to names.
+static List<(uint addr, string name)> ElfFunctionSymbols(byte[] elf)
+{
+    var syms = new List<(uint, string)>();
+    uint shoff = BitConverter.ToUInt32(elf, 0x20);
+    ushort shentsize = BitConverter.ToUInt16(elf, 0x2E);
+    ushort shnum = BitConverter.ToUInt16(elf, 0x30);
+    for (int s = 0; s < shnum; s++)
+    {
+        int sh = (int)shoff + s * shentsize;
+        if (BitConverter.ToUInt32(elf, sh + 4) != 2) continue;        // SHT_SYMTAB
+        uint symoff = BitConverter.ToUInt32(elf, sh + 16);
+        uint symsz  = BitConverter.ToUInt32(elf, sh + 20);
+        uint link   = BitConverter.ToUInt32(elf, sh + 24);
+        int strSh   = (int)shoff + (int)link * shentsize;
+        uint stroff = BitConverter.ToUInt32(elf, strSh + 16);
+        for (uint o = 0; o + 16 <= symsz; o += 16)
+        {
+            int b = (int)(symoff + o);
+            uint value = BitConverter.ToUInt32(elf, b + 4);
+            if ((elf[b + 12] & 0xF) != 2 || value == 0) continue;     // STT_FUNC only
+            int ns = (int)(stroff + BitConverter.ToUInt32(elf, b)), ne = ns;
+            while (ne < elf.Length && elf[ne] != 0) ne++;
+            syms.Add((value, System.Text.Encoding.ASCII.GetString(elf, ns, ne - ns)));
+        }
+    }
+    syms.Sort((x, y) => x.Item1.CompareTo(y.Item1));
+    return syms;
+}
 
 // ── clang helpers (same flags as Examples/TinyCC) ──────────────────
 bool CompileO3(string src, string obj, string[] extraFlags)

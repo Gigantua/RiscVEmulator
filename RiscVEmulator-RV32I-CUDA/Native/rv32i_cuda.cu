@@ -3814,7 +3814,9 @@ static std::vector<unsigned long long> g_prof_hist; static uint32_t g_prof_base 
 // the interpreter driver slices its launch budgets the same way (cuda_rvcud_step_all) — without
 // that, JIT-class guests (interpreter/translation-dominated) profile as silence. The atexit dump
 // also reports the dynamic-translation activity counters.
+static int g_prof_force = 0;                 // cuda_rvcud_set_prof: harness opt-in (env can't cross the CRT)
 static int rvx_prof() {
+    if (g_prof_force) return g_prof_force;
     static int p = -1;
     if (p < 0) { const char* e = getenv("RVX_PROF"); p = e ? atoi(e) : 0;
         if (p > 1) atexit([]{
@@ -3839,6 +3841,21 @@ static void rvx_prof_sample() {
     uint32_t pc = g_state[0].pc & ~HALT_BIT;
     if (pc >= g_prof_base) { size_t b = (size_t)(pc - g_prof_base) >> 8;
                              if (b < g_prof_hist.size()) g_prof_hist[b]++; }
+}
+// Harness-facing profiler API: enable sampling (k slices per launch budget), pull the top buckets
+// (256 B granularity, sorted desc; returns entries written), and the JIT activity counters.
+API void cuda_rvcud_set_prof(int k) { g_prof_force = (k > 1) ? k : 0; }
+API int  cuda_rvcud_prof_top(unsigned* pcs, unsigned long long* counts, int max) {
+    std::vector<std::pair<unsigned long long,size_t>> top;
+    for (size_t b = 0; b < g_prof_hist.size(); b++)
+        if (g_prof_hist[b]) top.push_back({g_prof_hist[b], b});
+    std::sort(top.rbegin(), top.rend());
+    int n = (int)top.size() < max ? (int)top.size() : max;
+    for (int i = 0; i < n; i++) { pcs[i] = g_prof_base + (uint32_t)(top[i].second << 8); counts[i] = top[i].first; }
+    return n;
+}
+API void cuda_rvcud_jit_stats(long long* out5) {       // misses, uops appended, dynamic misses, patches, invalidations
+    out5[0]=g_n_miss; out5[1]=g_n_appuops; out5[2]=g_n_dynmiss; out5[3]=g_n_patch; out5[4]=g_n_inval;
 }
 static long long rvxblk_step_once(long long budget) {
     *g_ret = 0;
