@@ -2494,8 +2494,15 @@ static inline bool rvx_compilable(uint32_t op){
 // Region-entry words = `disp` leaders ∪ cross-region static-edge targets — the latter keep region-
 // boundary branches enterable. Within a region, labels / fall-through / direct bra / inline-budget
 // backward branches work exactly like the old monolith; jalr probes its own region via the local XDISP.
+// Region size: BIG regions win — every cross-region transition costs a 31-reg spill/reload through
+// shared + a dispatcher round trip, and the measured ttf30 climbs monotonically with region size
+// (6000→12000→20000→40000→60000: 121.5→126→129→133→139.6 MIPS, all interleaved pairs). The limit is
+// the ptxas brx knee, which scales with the per-region BRANCHTARGET COUNT, not words: one region
+// holding all ~15k Doom entries blew a ptxas child past 3 GB (watchdog-killed), while 2 regions of
+// ~7.5k targets build at 1.38 GB. So the default is large, and rvx_codegen separately floors the
+// region COUNT so no region ever exceeds ~8k brx targets.
 #ifndef RVX_REGW
-#define RVX_REGW 6000
+#define RVX_REGW 60000
 #endif
 static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& pc2idx,
                         const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
@@ -2506,7 +2513,12 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     int regw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) regw=v; }
     if (nc > 1 && regw > 4000) regw = 4000;   // interleaved memops emit ~2× the PTX — keep the per-unit ptxas peak flat
     if (regw >= (1<<20)) regw = (1<<20)-1;                  // local ordinal must fit pc2idx bits 19:0
-    int K = nb ? (nb + regw - 1) / regw : 1; if (K > 2048) K = 2048;   // region id fits 12 bits (no 0xFFFFFFFF alias)
+    int K = nb ? (nb + regw - 1) / regw : 1;
+    // ptxas-knee guard: the assembler's working set scales with the per-region brx TARGET count
+    // (≥ ~15k in one region blew a child past 3 GB). Floor the region count so each stays ≤ ~8k.
+    { int nde = 0; for (int w=0; w<N; w++) nde += disp[w] ? 1 : 0;
+      int Kt = (nde + 7999) / 8000; if (Kt > K) K = Kt; }
+    if (K > 2048) K = 2048;                                 // region id fits 12 bits (no 0xFFFFFFFF alias)
     // Region cuts: start from equal-compiled-word-count ideals, then slide each cut (±700 body slots)
     // to the word boundary crossed by the FEWEST static edges (branch/jal/fall-through between compiled
     // words; backward edges ×8 — a loop crossing a cut pays the spill/refill EVERY iteration).
