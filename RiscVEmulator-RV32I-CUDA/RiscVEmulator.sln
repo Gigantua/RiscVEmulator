@@ -29,6 +29,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Examples.CudaDoom", "Exampl
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Benchmark", "Examples\Benchmark\Benchmark.csproj", "{A1C0DA06-1111-2222-3333-000000000099}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Examples.CudaTests", "Examples\CudaTests\Examples.CudaTests.csproj", "{A1C0DA07-1111-2222-3333-000000000007}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -167,6 +169,18 @@ Global
 		{A1C0DA06-1111-2222-3333-000000000099}.Release|x64.Build.0 = Release|Any CPU
 		{A1C0DA06-1111-2222-3333-000000000099}.Release|x86.ActiveCfg = Release|Any CPU
 		{A1C0DA06-1111-2222-3333-000000000099}.Release|x86.Build.0 = Release|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Debug|x64.Build.0 = Debug|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Debug|x86.Build.0 = Debug|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Release|x64.ActiveCfg = Release|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Release|x64.Build.0 = Release|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Release|x86.ActiveCfg = Release|Any CPU
+		{A1C0DA07-1111-2222-3333-000000000007}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -180,6 +194,7 @@ Global
 		{A1C0DA05-1111-2222-3333-000000000005} = {07C68828-3C5F-46A8-0134-2638B4E7DAA6}
 		{A1C0DA06-1111-2222-3333-000000000006} = {07C68828-3C5F-46A8-0134-2638B4E7DAA6}
 		{A1C0DA06-1111-2222-3333-000000000099} = {07C68828-3C5F-46A8-0134-2638B4E7DAA6}
+		{A1C0DA07-1111-2222-3333-000000000007} = {07C68828-3C5F-46A8-0134-2638B4E7DAA6}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {5216B111-8B07-45DD-894E-625F35425DA3}

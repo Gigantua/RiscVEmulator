@@ -1,0 +1,19 @@
+{
+  "profiles": {
+    "echo": {
+      "commandName": "Project"
+    },
+    "echo (jit)": {
+      "commandName": "Project",
+      "commandLineArgs": "--jit"
+    },
+    "tests (jit)": {
+      "commandName": "Project",
+      "commandLineArgs": "--tests"
+    },
+    "tests (interp)": {
+      "commandName": "Project",
+      "commandLineArgs": "--tests --interp"
+    }
+  }
+}
