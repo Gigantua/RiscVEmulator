@@ -196,11 +196,17 @@ if (args.Contains("--ttf"))
     {
         emu.StepN(Batch); steps += Batch;
         var px = emu.Framebuffer.PresentedPixels;
+        // Frame-change detection, 8 bytes at a time: the original per-byte FNV cost ~0.4 ms per
+        // 200k batch (~20% of total wall at ~100 MIPS — pure measurement overhead). Any
+        // deterministic digest works (h is only compared against the previous frame's); alpha is
+        // masked out of the non-black count (the guest writes A=255 everywhere).
+        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(px);
         ulong h = 1469598103934665603UL; int nz = 0;
-        for (int i = 0; i + 3 < px.Length; i += 4)
+        for (int i = 0; i < words.Length; i++)
         {
-            if ((px[i] | px[i + 1] | px[i + 2]) != 0) nz++;
-            h = (h ^ px[i]) * 1099511628211UL; h = (h ^ px[i + 1]) * 1099511628211UL; h = (h ^ px[i + 2]) * 1099511628211UL;
+            ulong v = words[i];
+            h = (h ^ v) * 1099511628211UL;
+            if ((v & 0x00FFFFFF00FFFFFFUL) != 0) nz += 2;     // 2 pixels per word
         }
         if (nz > 5000 && h != last)
         {
