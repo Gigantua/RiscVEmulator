@@ -725,6 +725,8 @@ static std::vector<uint8_t> g_xtab;          // per guest-word: 1 if a compiled 
 static void*      g_x_pc2idx = nullptr;      // device u32[N]: word → branchtargets index, or 0xFFFFFFFF
 static void       rvxblk_build();
 static long long  rvxblk_step(long long budget);
+static int        g_x_sptrust = 0;           // exec PTX was built under the global sp-alignment proof
+static bool       rvx_sp_writer_ok(uint32_t in);
 
 API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     g_ncores = nCores;
@@ -740,7 +742,14 @@ API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
     return (int)cudaGetLastError();
 }
 
-API void cuda_rv32i_set_reg  (int core, int i, unsigned int v) { if (i) g_state[core].regs[i & 31] = v; }
+API void cuda_rv32i_set_reg  (int core, int i, unsigned int v) {
+    if (!i) return;
+    g_state[core].regs[i & 31] = v;
+    if ((i & 31) == 2 && (v & 3) && g_x_sptrust) {   // unaligned host-set sp voids the sp-alignment proof
+        g_xblk_ok = 0; g_x_sptrust = 0;
+        fprintf(stderr,"[xblk] exec disabled: host set sp=0x%08X (unaligned) under the sp-alignment proof\n", v);
+    }
+}
 API void cuda_rv32i_set_entry(int core, unsigned int pc)       { g_state[core].pc = pc; }
 API void cuda_rv32i_set_halted(int core, int v) { if (v) g_state[core].pc |= HALT_BIT; else g_state[core].pc &= ~HALT_BIT; }
 
@@ -1970,6 +1979,11 @@ static bool rvcud_translate_miss(uint32_t pc) {
             g_w1h.push_back(g_pc2uop_h[j]); g_uwh.push_back(0); g_u2pch.push_back(g_base+(uint32_t)j*4);
             g_nuops++; break;
         }
+        if (g_x_sptrust && !rvx_sp_writer_ok(g_img[j])) {   // newly-reached code breaks the sp proof
+            g_xblk_ok = 0; g_x_sptrust = 0;
+            fprintf(stderr,"[xblk] exec disabled: translate-on-miss found an unprovable sp writer at 0x%08X\n",
+                    g_base + (uint32_t)j*4);
+        }
         uint32_t a0,a1,t; uint8_t wt; rvcud_classify(tb, j, a0,a1,wt,t);
         g_pc2uop_h[j] = (uint32_t)g_nuops;
         g_w0h.push_back(a0); g_w1h.push_back(a1); g_uwh.push_back(wt); g_u2pch.push_back(g_base+(uint32_t)j*4);
@@ -2103,8 +2117,30 @@ static void rvx_app(std::string& s, const char* fmt, ...) {
 struct RvxCse {
     int abBase, a0Base; int32_t a0Imm; bool t0Valid;
     uint8_t mod4[32];
-    void reset() { abBase = a0Base = -1; t0Valid = false; memset(mod4, 0xFF, sizeof mod4); mod4[0] = 0; }
+    uint8_t spInit = 0xFF;     // 0 when the GLOBAL sp-alignment proof holds (see rvxblk_build) — sp
+                               // then re-seeds as ALIGNED at every reset, so stack spills/reloads
+                               // (the largest class of unproven memops) emit bare ld/st.
+    void reset() { abBase = a0Base = -1; t0Valid = false; memset(mod4, 0xFF, sizeof mod4); mod4[0] = 0; mod4[2] = spInit; }
 };
+// True if `in` either does not write x2 (sp) or provably leaves it 4-aligned given it was:
+// the induction step of the global sp-alignment proof. Invalid encodings (image data the
+// translator scanned) raise an illegal-instruction halt and write nothing — safe.
+static bool rvx_sp_writer_ok(uint32_t in) {
+    uint32_t op = in & 0x7F, rd = (in >> 7) & 0x1F, f3 = (in >> 12) & 7, rs1 = (in >> 15) & 0x1F;
+    switch (op) {
+    case 0x23: case 0x63: return true;                            // store/branch: no rd write (rd bits are imm)
+    case 0x37: case 0x17: return true;                            // lui (low 12 = 0) / auipc (pc 4-aligned)
+    case 0x6F: case 0x67: return true;                            // jal/jalr link value pc+4 is 4-aligned
+    case 0x13:
+        if (rd != 2) return true;
+        if (f3 == 0) return rs1 == 2 && (rv_iimm(in) & 3) == 0;   // addi sp, sp, 4k
+        if (f3 == 7) return (rv_iimm(in) & 3) == 0;               // andi …, mask clearing the low bits
+        return false;
+    case 0x03: case 0x33: return rd != 2;                         // load / reg-ALU into sp → unprovable
+    case 0x73: return true;                                       // ecall/ebreak/CSR ALL halt here (no Zicsr) — no rd write
+    default:   return true;                                       // not RV32I → illegal-instr halt, writes nothing
+    }
+}
 // Emit PTX for one guest instruction. Guest regs are %x0..%x31 (%x0 holds 0); %t0/%t1 b32, %a0/%ab b64
 // temps; %p0 pred; %M global-mem base. Memory is byte-wise assembled (ncores==1 ⇒ linear layout):
 // unless alignment is statically PROVEN via cse.mod4, every load/store runtime-checks and falls back
@@ -2297,7 +2333,7 @@ static inline bool rvx_compilable(uint32_t op){
 #endif
 static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& pc2idx,
                         const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
-                        const std::vector<uint8_t>& disp, int nc) {
+                        const std::vector<uint8_t>& disp, int nc, bool sptrust) {
     std::vector<uint32_t> body;
     for (int w=0; w<N; w++) if (comp[w]) body.push_back((uint32_t)w);
     const int nb = (int)body.size();
@@ -2391,7 +2427,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx += "BT: .branchtargets ";
         for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
         ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
-        RvxCse cse; cse.reset();
+        RvxCse cse; cse.spInit = sptrust ? 0 : 0xFF; cse.reset();
         int prev = -2;
         for (; bi<nb && regof[body[bi]]==r; bi++) {
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
@@ -2588,6 +2624,17 @@ static void rvxblk_build() {
     }
     if (cnt == 0) return;
 
+    // GLOBAL sp-alignment proof. The host sets an aligned initial sp, so if EVERY reachable writer
+    // of x2 provably preserves 4-alignment (addi sp,sp,4k / lui / auipc / aligned andi mask), then
+    // sp ≡ 0 (mod 4) at ALL times by induction and the codegen lattice may seed sp ALIGNED at every
+    // reset — stack spills/reloads then emit bare ld/st instead of the 14-instruction runtime-checked
+    // fallback. Safety valves elsewhere: set_reg(x2, unaligned) and a translate-on-miss discovering a
+    // bad writer both disable exec outright (g_xblk_ok=0) — sound, and never expected to trigger.
+    bool sptrust = true;
+    for (int w=0; w<N && sptrust; w++)
+        if (seen[w] && !(sptrust = rvx_sp_writer_ok(g_img[w])) && getenv("RVX_STATS"))
+            fprintf(stderr,"[xblk] sp-proof breaker: 0x%08X: %08X\n", g_base+(uint32_t)w*4, g_img[w]);
+
     // SPARSE dispatch entries: only pcs where execution can actually (re)enter the exec_block —
     // branch/jal targets, return sites (word after jal/jalr — also catches function entries, which
     // follow the previous function's terminator), and resume sites after uncompilable words (ecall
@@ -2610,7 +2657,7 @@ static void rvxblk_build() {
     for (int w=0; w<N; w++) ndisp += disp[w];
 
     std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp, g_ncores);
+    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp, g_ncores, sptrust);
     if (const char* dp = getenv("RVX_DUMP"))                 // offline ptxas experiments: <prefix><u>.ptx per unit
         for (size_t u=0; u<ptx.size(); u++) {
             char fn[512]; snprintf(fn, sizeof fn, "%s%zu.ptx", dp, u);
@@ -2647,8 +2694,9 @@ static void rvxblk_build() {
     int xnreg = -1, xlmem = -1;              // spill guardrail: ptxas register count + local (spill) bytes
     cuFuncGetAttribute(&xnreg, CU_FUNC_ATTRIBUTE_NUM_REGS, fn);
     cuFuncGetAttribute(&xlmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn);
-    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s), %d regs, %d B local\n",
-            cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF", xnreg, xlmem);
+    g_x_sptrust = sptrust ? 1 : 0;
+    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s), %d regs, %d B local, sp-proof %s\n",
+            cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF", xnreg, xlmem, sptrust?"OK":"none");
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;     // ptxas memory-knee watch: peak build commit
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
@@ -2728,7 +2776,7 @@ API int cuda_rvexec_blocktest() {
     std::vector<uint8_t> comp(N,0);
     for (int w=0; w<N; w++) if (rvx_compilable(img[w]&0x7F)) comp[w]=1;   // word 8 (ebreak) stays 0
     std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, img.data(), N, base, comp, comp, 1);   // tests: every compiled word is a dispatch entry
+    rvx_codegen(ptx, pc2idx, img.data(), N, base, comp, comp, 1, false);   // tests: every word a dispatch entry, no sp proof
 
     cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
@@ -2835,7 +2883,7 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // exec_block run
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1,false);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2902,7 +2950,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
         compared++;
         uint32_t ref_pc=pc;
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1,false);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz2] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2960,7 +3008,7 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // random compiled subset (≈70%); never compile the ebreak
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=(rnd()%100)<70;
-        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1,false);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz3] prog %d module fail\n",p); fails++; continue; }
         void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
