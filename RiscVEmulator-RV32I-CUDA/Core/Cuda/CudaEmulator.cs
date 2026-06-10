@@ -83,7 +83,9 @@ namespace RiscVEmulator.Core.Cuda
         private readonly int _fbBytes;
         private readonly int _pcmBytes;
         private IntPtr _audioMirror;
-        private uint   _lastAudioGen = unchecked((uint)-1);
+        private byte[] _pcmTmp = new byte[4096];     // PCM slice scratch (grown on demand)
+        private uint   _midiRd;                      // host read cursor into the guest MIDI ring
+        private readonly byte[] _midiBuf = new byte[128];
         private const ulong TimebaseHz = 60_000_000UL;
 
         // Scratch for cell-level reconcile copies.
@@ -239,14 +241,20 @@ namespace RiscVEmulator.Core.Cuda
         {
             StageTimers();
 
-            // Keyboard: stage one event (has/scancode/mod), pop from the queue.
-            uint has = Keyboard.Read(0x00, 4);
-            uint sc  = has != 0 ? Keyboard.Read(0x04, 4) : 0u;   // pops the C# FIFO
-            uint mod = Keyboard.Read(0x08, 4);
-            BitConverter.TryWriteBytes(_b32.AsSpan(0),  has);
-            BitConverter.TryWriteBytes(_b32.AsSpan(4),  sc);
-            BitConverter.TryWriteBytes(_b32.AsSpan(8),  mod);
-            cuda_rv32i_write_mem(CoreId, _b32, KBD_BASE, 12);
+            // Keyboard: a 1-deep mailbox with guest ack. The guest clears the has-cell after consuming
+            // an event (poll_keyboard writes KB_STATUS = 0), so stage the next one ONLY when the cell
+            // reads 0 — unconditionally re-staging every launch overwrote any event the guest hadn't
+            // polled within that one batch (the guest polls once per rendered frame), silently dropping
+            // most keys. Unconsumed events now persist across launches; bursts buffer in the host FIFO.
+            if (R32(KBD_BASE) == 0 && Keyboard.Read(0x00, 4) != 0)
+            {
+                uint sc = Keyboard.Read(0x04, 4);                // pops the host FIFO
+                BitConverter.TryWriteBytes(_b32.AsSpan(0), 1u);
+                BitConverter.TryWriteBytes(_b32.AsSpan(4), sc);
+                cuda_rv32i_write_mem(CoreId, _b32, KBD_BASE, 8);
+            }
+            BitConverter.TryWriteBytes(_b32.AsSpan(0), Keyboard.Read(0x08, 4));   // modifiers: always fresh
+            cuda_rv32i_write_mem(CoreId, _b32, KBD_BASE + 8, 4);
 
             // Mouse: stage accumulated deltas/buttons (the reads clear the C# side).
             int  dx  = (int)Mouse.Read(0x04, 4);
@@ -306,34 +314,65 @@ namespace RiscVEmulator.Core.Cuda
                 _uartTail += chunk;
             }
 
-            // MIDI: one message cell (host-drained best-effort).
+            // MIDI: lossless ring (guest writes entries at +0x20.. and its write index at +0x10; the
+            // host keeps its own read cursor). The old single-cell drain kept only the LAST message
+            // per launch — the guest's tick loop overwrote the cell per message, so chords and
+            // note-offs vanished. Guests that never touch the ring fall back to the legacy cell.
             if (Midi != null || OnMidi != null)
             {
-                uint m = R32(MIDI_BASE + 0x04);
-                if (m != 0)
+                uint wr = R32(MIDI_BASE + 0x10);
+                if (wr != 0)
                 {
-                    OnMidi?.Invoke(0x04, m & 0x00FFFFFFu);
-                    Midi?.Write(0x04, 4, m & 0x00FFFFFFu);
-                    W32(MIDI_BASE + 0x04, 0);   // consume
+                    if (wr - _midiRd > 32) _midiRd = wr - 32;            // ring overrun (32 entries)
+                    if (wr != _midiRd)
+                    {
+                        cuda_rv32i_read_mem(CoreId, _midiBuf, MIDI_BASE + 0x20, 128);
+                        for (; _midiRd != wr; _midiRd++)
+                        {
+                            uint m = BitConverter.ToUInt32(_midiBuf, (int)((_midiRd & 31) * 4)) & 0x00FFFFFFu;
+                            if (m == 0) continue;
+                            OnMidi?.Invoke(0x04, m);
+                            Midi?.Write(0x04, 4, m);
+                        }
+                    }
+                }
+                else
+                {
+                    uint m = R32(MIDI_BASE + 0x04);                      // legacy single-cell guests
+                    if (m != 0)
+                    {
+                        OnMidi?.Invoke(0x04, m & 0x00FFFFFFu);
+                        Midi?.Write(0x04, 4, m & 0x00FFFFFFu);
+                        W32(MIDI_BASE + 0x04, 0);   // consume
+                    }
                 }
             }
 
-            // Audio control snapshot + PCM on a new playback generation.
+            // Audio: snapshot the control page; on a guest-submitted buffer (ctrl bit 0) copy the PCM
+            // slice, bump the playback generation THROUGH the device Write path (SdlWindow keys on
+            // WriteGeneration — the old property assignment bypassed it, so nothing was ever queued),
+            // and ACK by clearing the guest's ctrl cell (copy_audio waits for 0 before submitting the
+            // next buffer — without the ack exactly one 46 ms buffer ever played).
             cuda_rv32i_read_mem(CoreId, _b32, AUDIO_BASE, 32);
-            AudioControl.Ctrl       = BitConverter.ToUInt32(_b32, 0);
+            uint actrl = BitConverter.ToUInt32(_b32, 0);
             AudioControl.SampleRate = BitConverter.ToUInt32(_b32, 8);
             AudioControl.Channels   = BitConverter.ToUInt32(_b32, 12);
             AudioControl.BitDepth   = BitConverter.ToUInt32(_b32, 16);
             AudioControl.BufStart   = BitConverter.ToUInt32(_b32, 20);
             AudioControl.BufLength  = BitConverter.ToUInt32(_b32, 24);
             AudioControl.Position   = BitConverter.ToUInt32(_b32, 28);
-            uint gen = AudioControl.Ctrl;   // generation proxy: any ctrl change re-copies
-            if (gen != _lastAudioGen && (AudioControl.Ctrl & 1) != 0)
+            if ((actrl & 1) != 0)
             {
-                _lastAudioGen = gen;
-                var tmp = new byte[_pcmBytes];
-                cuda_rv32i_read_mem(CoreId, tmp, PCM_BASE, (uint)_pcmBytes);
-                Marshal.Copy(tmp, 0, _audioMirror, _pcmBytes);
+                uint blen = Math.Min(AudioControl.BufLength, (uint)_pcmBytes);
+                uint boff = Math.Min(AudioControl.BufStart, (uint)_pcmBytes - blen);
+                if (blen > 0)
+                {
+                    if (_pcmTmp.Length < blen) _pcmTmp = new byte[blen];
+                    cuda_rv32i_read_mem(CoreId, _pcmTmp, PCM_BASE + boff, blen);
+                    Marshal.Copy(_pcmTmp, 0, _audioMirror + (int)boff, (int)blen);
+                }
+                AudioControl.Write(0x00, 4, actrl);   // sets Ctrl + bumps WriteGeneration
+                W32(AUDIO_BASE, 0);                   // ack → the guest may submit the next buffer
             }
 
             // Display: vsync / mode / fbaddr, then present.

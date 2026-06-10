@@ -295,7 +295,7 @@ if (selftest)
 if (cores <= 1)
 {
     // ── Single instance: play it ── (prefetch window left off — see selftest note)
-    using var emu = new CudaEmulator(RamMB * 1024 * 1024);
+    using var emu = new CudaEmulator(RamMB * 1024 * 1024, enableMidi: true);   // music needs the winmm MIDI device
     emu.OutputHandler = c => Console.Write(c);
     uint entry = emu.LoadElf(elfData);
     emu.LoadBytes(WadSizeAddr, BitConverter.GetBytes((uint)wadData.Length));

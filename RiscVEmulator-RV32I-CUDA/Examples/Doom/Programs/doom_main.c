@@ -60,10 +60,14 @@
 #define AUDIO_BLEN  (*(volatile unsigned int *)0x30100018)   /* +0x18 */
 #define AUDIO_POS   (*(volatile unsigned int *)0x3010001C)   /* +0x1C */
 
-/* MIDI output device */
+/* MIDI output device. DATA is the legacy single-message cell (CPU path: guarded device plays it
+ * immediately). WR + RING form the CUDA path's lossless 32-entry ring (host drains per launch). */
 #define MIDI_STATUS (*(volatile unsigned int *)0x10005000)
 #define MIDI_DATA   (*(volatile unsigned int *)0x10005004)
 #define MIDI_CTRL   (*(volatile unsigned int *)0x10005008)
+#define MIDI_WR     (*(volatile unsigned int *)0x10005010)
+#define MIDI_RING   ((volatile unsigned int *)0x10005020)
+static unsigned int midi_wr = 0;
 
 /* WAD location — host writes WAD data here and sets the size */
 #define WAD_BASE_ADDR  0x00A00000u  /* 10 MB offset into RAM */
@@ -375,6 +379,12 @@ void _start(void)
                 midi_accum_us -= MIDI_TICK_US;
                 unsigned long midi;
                 while ((midi = doom_tick_midi()) != 0) {
+                    /* CUDA path: lossless ring at +0x20 (entry first, then the write index — the host
+                     * drains [rd..wr) once per launch; the old single-cell write kept only the LAST
+                     * message per batch, dropping chords/note-offs). CPU path: the guarded device
+                     * plays MIDI_DATA immediately and ignores the ring-cell writes. */
+                    MIDI_RING[midi_wr & 31u] = (unsigned int)midi;
+                    MIDI_WR = ++midi_wr;
                     MIDI_DATA = (unsigned int)midi;
                 }
             }
