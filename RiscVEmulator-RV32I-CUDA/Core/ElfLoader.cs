@@ -80,8 +80,14 @@ namespace RiscVEmulator.Core
             if (roHi == 0) return (0, 0);
 
             uint lo = roLo & ~(pageSize - 1);
-            uint hi = (roHi + pageSize - 1) & ~(pageSize - 1);
-            if (rwLo != uint.MaxValue && hi > rwLo) hi = rwLo & ~(pageSize - 1);  // never cross into RW
+            // Exact RX end, clamped to the RW start WITHOUT page rounding: when the RW segment
+            // begins mid-page right after the code (lld packs them), rounding DOWN amputated up
+            // to a page of executable tail — the truncated functions then ran via fragile
+            // translate-on-miss, whose unresolved taken branches halt the core. Word alignment
+            // is all the translator needs.
+            uint hi = roHi;
+            if (rwLo != uint.MaxValue && hi > rwLo) hi = rwLo;                    // never cross into RW
+            hi = (hi + 3) & ~3u;
             return hi > lo ? (lo, hi) : (0u, 0u);
         }
 
