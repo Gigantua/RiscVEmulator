@@ -771,6 +771,60 @@ API int cuda_rv32i_read_mem(int core, void* dst, unsigned int off, unsigned int 
     return (int)cudaMemcpy2D(dst, 4, src, (size_t)g_ncores * 4, 4, len >> 2, cudaMemcpyDeviceToHost);
 }
 
+// ── Staged-MMIO mailbox ─────────────────────────────────────────────────────
+// One pinned zero-copy page replaces the ~12 tiny synchronous cudaMemcpys the host used to issue
+// per StepN for input staging and output draining — each of those costs a WDDM submit+flush
+// (~10-20 µs), together more than the 256 KB framebuffer copy. The host writes the INBOX and reads
+// the OUTBOX as plain memory; two trivial kernels scatter/gather the guest cells on-stream around
+// the main launch (FIFO order on the default stream makes stage→main→drain sequencing free).
+// Single-core (flat memory) only; multi-core keeps the legacy memcpy path. Word layout:
+//   [0..15]  cell addresses, set once by the host:
+//            0 kbd, 1 mouse, 2 rtc, 3 mtime, 4 uart_head, 5 midi_wr, 6 audio, 7 vsync,
+//            8 fbaddr, 9 exit, 10 midi_legacy
+//   INBOX    16 kbd_has, 17 kbd_sc, 18 kbd_mods, 19 mouse_has, 20 mdx, 21 mdy, 22 mbtn,
+//            23..30 rtc page, 31..32 mtime lo/hi,
+//            33 audio_ack_req, 34 vsync_clear_req, 35 midi_legacy_clear_req
+//   OUTBOX   48 uart_head, 49 midi_wr, 50..57 audio ctrl page, 58 vsync, 59 fbaddr, 60 exit,
+//            61 kbd_status, 62 mouse_status, 63 midi_legacy
+static uint32_t* g_iobox = nullptr;   // pinned mapped (UVA: same pointer host & device)
+__global__ void rv_iostage_k(uint32_t* mem, uint32_t* box) {
+    uint32_t kbd = box[0] >> 2, mouse = box[1] >> 2, rtc = box[2] >> 2, mt = box[3] >> 2;
+    for (int i = 0; i < 8; i++) mem[rtc + i] = box[23 + i];
+    mem[mt] = box[31]; mem[mt + 1] = box[32];
+    mem[kbd + 2] = box[18];                                    // modifiers: always fresh
+    if (box[16]) { mem[kbd] = 1; mem[kbd + 1] = box[17]; box[16] = 0; }   // host staged only if free
+    if (box[19]) { mem[mouse] = 1; mem[mouse + 1] = box[20];
+                   mem[mouse + 2] = box[21]; mem[mouse + 3] = box[22]; box[19] = 0; }
+    if (box[33]) { mem[box[6] >> 2]  = 0; box[33] = 0; }       // audio buffer ack (guest awaits 0)
+    if (box[34]) { mem[box[7] >> 2]  = 0; box[34] = 0; }       // vsync consume
+    if (box[35]) { mem[box[10] >> 2] = 0; box[35] = 0; }       // legacy MIDI cell consume
+}
+__global__ void rv_iodrain_k(const uint32_t* mem, uint32_t* box) {
+    box[48] = mem[box[4] >> 2];
+    box[49] = mem[box[5] >> 2];
+    uint32_t au = box[6] >> 2;
+    for (int i = 0; i < 8; i++) box[50 + i] = mem[au + i];
+    box[58] = mem[box[7] >> 2];
+    box[59] = mem[box[8] >> 2];
+    box[60] = mem[box[9] >> 2];
+    box[61] = mem[box[0] >> 2];
+    box[62] = mem[box[1] >> 2];
+    box[63] = mem[box[10] >> 2];
+}
+// Returns the pinned mailbox (host pointer) — null when the fast path is unavailable (multi-core).
+API void* cuda_rv32i_iobox() {
+    if (g_ncores != 1) return nullptr;
+    if (!g_iobox) { if (cudaHostAlloc((void**)&g_iobox, 4096, cudaHostAllocMapped) != cudaSuccess) return nullptr;
+                    memset((void*)g_iobox, 0, 4096); }
+    return (void*)g_iobox;
+}
+API void cuda_rv32i_iostage() { if (g_iobox) rv_iostage_k<<<1,1>>>(g_mem, g_iobox); }              // async, FIFO before main
+API int  cuda_rv32i_iodrain() {
+    if (!g_iobox) return -1;
+    rv_iodrain_k<<<1,1>>>(g_mem, g_iobox);
+    return (int)cudaDeviceSynchronize();
+}
+
 API int cuda_rv32i_step_all(int budget) {
     if (g_ncores <= 0) return 0;
     // Small (2-warp) blocks: at modest core counts this spreads work across many
@@ -3097,6 +3151,7 @@ API void cuda_rv32i_shutdown() {
 #endif
     rvcud_free();
     if (g_ret) { cudaFreeHost((void*)g_ret); g_ret = nullptr; }
+    if (g_iobox) { cudaFreeHost((void*)g_iobox); g_iobox = nullptr; }
     if (g_mem)  { cudaFree(g_mem);  g_mem  = nullptr; }
     if (g_state) { cudaFreeHost(g_state); g_state = nullptr; }
     g_ncores = 0;

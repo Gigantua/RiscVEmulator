@@ -38,6 +38,12 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern int  cuda_rvcud_set_code(byte[] src, uint len, uint baseAddr, uint entry);
         [DllImport(Lib)] private static extern int  cuda_rvcud_step_all(int budget);
         [DllImport(Lib)] private static extern ulong cuda_rvcud_iters();
+        // Staged-MMIO mailbox: one pinned page + two on-stream micro-kernels replace the ~12 tiny
+        // synchronous memcpys per StepN (each a ~10-20 µs WDDM submit — together they dominated the
+        // host gap between launches). Host writes the INBOX / reads the OUTBOX as plain memory.
+        [DllImport(Lib)] private static extern IntPtr cuda_rv32i_iobox();
+        [DllImport(Lib)] private static extern void   cuda_rv32i_iostage();
+        [DllImport(Lib)] private static extern int    cuda_rv32i_iodrain();
         public ulong RvcudIters => cuda_rvcud_iters();
 
         // ── Guest memory map (host-side device layout inside the flat buffer) ──
@@ -107,6 +113,8 @@ namespace RiscVEmulator.Core.Cuda
 
         private bool _committed, _halted, _disposed;
         private int  _exitCode;
+        private bool  _boxInit;
+        private uint* _box;          // pinned staged-MMIO mailbox (null → legacy memcpy path / multi-core)
 
         public bool DeterministicTime { get; set; }
         private ulong _totalSteps;
@@ -218,14 +226,28 @@ namespace RiscVEmulator.Core.Cuda
             if (_halted) return 0;
             if (!_committed) throw new InvalidOperationException("CommitImage() must be called before StepN().");
 
+            if (!_boxInit)
+            {
+                _boxInit = true;
+                _box = (uint*)cuda_rv32i_iobox();
+                if (_box != null)
+                {   // cell-address table, set once (single source of truth stays in this file)
+                    _box[0] = KBD_BASE;  _box[1] = MOUSE_BASE;       _box[2] = RTC_BASE;
+                    _box[3] = CLINT_MTIME; _box[4] = UART_HEAD;      _box[5] = MIDI_BASE + 0x10;
+                    _box[6] = AUDIO_BASE;  _box[7] = DISP_BASE + 0x0C; _box[8] = DISP_BASE + 0x1C;
+                    _box[9] = EXIT_BASE;   _box[10] = MIDI_BASE + 0x04;
+                }
+            }
+
             _totalSteps += (ulong)n;
-            StageInputs();
+            if (_box != null) StageInputsBox(); else StageInputs();
             int rc = UseRvcud ? cuda_rvcud_step_all(n) : cuda_rv32i_step_all(n);
             if (rc != 0)
                 throw new InvalidOperationException($"cuda_{(UseRvcud ? "rvcud" : "rv32i")}_step_all failed (CUDA error {rc})");
-            DrainOutputs();
 
-            uint exit = R32(EXIT_BASE);
+            uint exit;
+            if (_box != null) { cuda_rv32i_iodrain(); DrainOutputsBox(); exit = _box[60]; }
+            else              { DrainOutputs(); exit = R32(EXIT_BASE); }
             if (exit != EXIT_SENTINEL) { _halted = true; _exitCode = (int)(exit & 0x7FFFFFFF); cuda_rv32i_set_halted(CoreId, 1); }
             return n;
         }
@@ -283,9 +305,8 @@ namespace RiscVEmulator.Core.Cuda
             }
         }
 
-        private void StageTimers()
+        private void ComputeTimers(out ulong us, out ulong ms, out ulong ep, out uint sec, out uint subus)
         {
-            ulong us, ms, ep; uint sec, subus;
             if (DeterministicTime)
             {
                 us = _totalSteps / 3UL; ms = us / 1000UL; sec = (uint)(us / 1_000_000UL);
@@ -298,6 +319,132 @@ namespace RiscVEmulator.Core.Cuda
                 ulong ticks = (ulong)_clock.ElapsedTicks, freq = (ulong)Stopwatch.Frequency;
                 _mtime = (ticks / freq) * TimebaseHz + (ticks % freq) * TimebaseHz / freq; subus = (uint)(us % 1_000_000UL);
             }
+        }
+
+        // ── Mailbox fast path: inbox/outbox in one pinned page, scatter/gather on-device ──
+        private void StageInputsBox()
+        {
+            ComputeTimers(out ulong us, out ulong ms, out ulong ep, out uint sec, out uint subus);
+            _box[23] = (uint)us;  _box[24] = (uint)(us >> 32);
+            _box[25] = (uint)ms;  _box[26] = (uint)(ms >> 32);
+            _box[27] = (uint)ep;  _box[28] = (uint)(ep >> 32);
+            _box[29] = sec;       _box[30] = subus;
+            _box[31] = (uint)_mtime; _box[32] = (uint)(_mtime >> 32);
+            _box[18] = Keyboard.Read(0x08, 4);                            // modifiers: always fresh
+            // 1-deep mailboxes with guest ack: outbox[61]/[62] hold the cells' state AFTER the last
+            // launch — and the guest cannot run between drain and stage, so they are exact.
+            if (_box[61] == 0 && Keyboard.Read(0x00, 4) != 0)
+            {
+                _box[17] = Keyboard.Read(0x04, 4);                        // pops the host FIFO
+                _box[16] = 1;
+                _box[61] = 1;                                             // mirror: cell will be occupied
+            }
+            if (_box[62] == 0 && Mouse.Read(0x00, 4) != 0)
+            {
+                _box[20] = Mouse.Read(0x04, 4);                           // reads clear the accumulator
+                _box[21] = Mouse.Read(0x08, 4);
+                _box[22] = Mouse.Read(0x0C, 4);
+                _box[19] = 1;
+                _box[62] = 1;
+            }
+            cuda_rv32i_iostage();                                         // async; FIFO-ordered before the main launch
+        }
+
+        private void DrainOutputsBox()
+        {
+            // UART ring → console (bulk ring reads only when nonempty).
+            uint head = _box[48];
+            var sink = OutputHandler;
+            while (_uartTail != head)
+            {
+                uint avail = head - _uartTail;
+                if (avail > UART_MASK + 1) { _uartTail = head - (UART_MASK + 1); avail = UART_MASK + 1; }
+                uint start = _uartTail & UART_MASK;
+                uint chunk = Math.Min(avail, (UART_MASK + 1) - start);
+                cuda_rv32i_read_mem(CoreId, _uartBuf, UART_RING + start, chunk);
+                if (sink != null) for (uint i = 0; i < chunk; i++) sink((char)_uartBuf[i]);
+                _uartTail += chunk;
+            }
+
+            if (Midi != null || OnMidi != null)
+            {
+                uint wr = _box[49];
+                if (wr != 0) DrainMidiRing(wr);
+                else
+                {
+                    uint m = _box[63];                                    // legacy single-cell guests
+                    if (m != 0)
+                    {
+                        OnMidi?.Invoke(0x04, m & 0x00FFFFFFu);
+                        Midi?.Write(0x04, 4, m & 0x00FFFFFFu);
+                        _box[35] = 1;                                     // consume at next stage
+                        _box[63] = 0;
+                    }
+                }
+            }
+
+            uint actrl = _box[50];
+            AudioControl.SampleRate = _box[52];
+            AudioControl.Channels   = _box[53];
+            AudioControl.BitDepth   = _box[54];
+            AudioControl.BufStart   = _box[55];
+            AudioControl.BufLength  = _box[56];
+            AudioControl.Position   = _box[57];
+            if ((actrl & 1) != 0)
+            {
+                uint blen = Math.Min(AudioControl.BufLength, (uint)_pcmBytes);
+                uint boff = Math.Min(AudioControl.BufStart, (uint)_pcmBytes - blen);
+                if (blen > 0)
+                {
+                    if (_pcmTmp.Length < blen) _pcmTmp = new byte[blen];
+                    cuda_rv32i_read_mem(CoreId, _pcmTmp, PCM_BASE + boff, blen);
+                    Marshal.Copy(_pcmTmp, 0, _audioMirror + (int)boff, (int)blen);
+                }
+                AudioControl.Write(0x00, 4, actrl);
+                _box[33] = 1;                                             // ack at next stage (guest awaits 0)
+                _box[50] = 0;
+            }
+
+            uint vsync = _box[58], fbAddr = _box[59];
+            if (vsync != 0) { Display.Write(0x0C, 4, vsync); _box[34] = 1; _box[58] = 0; }
+            int fbLen = Math.Min(_fbBytes, Framebuffer.PresentedPixels.Length);
+            if (fbAddr != 0 && fbAddr < (uint)RamBytes)
+                cuda_rv32i_read_mem(CoreId, Framebuffer.PresentedPixels, fbAddr, (uint)fbLen);
+            else
+                cuda_rv32i_read_mem(CoreId, Framebuffer.PresentedPixels, FB_BASE, (uint)fbLen);
+        }
+
+        private void DrainMidiRing(uint wr)
+        {
+            if (wr - _midiRd > 256) _midiRd = wr - 256;
+            if (wr == _midiRd) return;
+            cuda_rv32i_read_mem(CoreId, _midiBuf, MIDI_BASE + 0x20, 1024);
+            long swFreq = Stopwatch.Frequency;
+            for (; _midiRd != wr; _midiRd++)
+            {
+                uint e = BitConverter.ToUInt32(_midiBuf, (int)((_midiRd & 255) * 4));
+                if (e == 0) continue;
+                uint m = e & 0x00FFFFFFu;
+                byte tick = (byte)(e >> 24);
+                long now = Stopwatch.GetTimestamp();
+                if (!_midiClkInit || now - _midiLastEvtWall > swFreq)
+                {
+                    _midiClkInit = true; _midiTickExt = 0;
+                    _midiWallBase = now + MidiLeadMs * swFreq / 1000;
+                }
+                else _midiTickExt += (byte)(tick - _midiLastTick);
+                _midiLastTick = tick; _midiLastEvtWall = now;
+                long due = _midiWallBase + (long)(_midiTickExt * 7143UL) * swFreq / 1_000_000;
+                if (due < now) { _midiWallBase += now - due; due = now; }
+                Midi?.PaceUntil(due);
+                OnMidi?.Invoke(0x04, m);
+                Midi?.Write(0x04, 4, m);
+            }
+        }
+
+        private void StageTimers()
+        {
+            ComputeTimers(out ulong us, out ulong ms, out ulong ep, out uint sec, out uint subus);
             // RTC page (8 words) and CLINT mtime.
             BitConverter.TryWriteBytes(_b32.AsSpan(0),  (uint)us);  BitConverter.TryWriteBytes(_b32.AsSpan(4),  (uint)(us >> 32));
             BitConverter.TryWriteBytes(_b32.AsSpan(8),  (uint)ms);  BitConverter.TryWriteBytes(_b32.AsSpan(12), (uint)(ms >> 32));
@@ -340,37 +487,7 @@ namespace RiscVEmulator.Core.Cuda
             if (Midi != null || OnMidi != null)
             {
                 uint wr = R32(MIDI_BASE + 0x10);
-                if (wr != 0)
-                {
-                    if (wr - _midiRd > 256) _midiRd = wr - 256;          // ring overrun (256 entries)
-                    if (wr != _midiRd)
-                    {
-                        cuda_rv32i_read_mem(CoreId, _midiBuf, MIDI_BASE + 0x20, 1024);
-                        long swFreq = Stopwatch.Frequency;
-                        for (; _midiRd != wr; _midiRd++)
-                        {
-                            uint e = BitConverter.ToUInt32(_midiBuf, (int)((_midiRd & 255) * 4));
-                            if (e == 0) continue;
-                            uint m = e & 0x00FFFFFFu;
-                            byte tick = (byte)(e >> 24);
-                            long now = Stopwatch.GetTimestamp();
-                            if (!_midiClkInit || now - _midiLastEvtWall > swFreq)
-                            {
-                                // First event, or >1 s of silence (tick byte would be ambiguous):
-                                // (re)base the musical clock with the full lead buffer.
-                                _midiClkInit = true; _midiTickExt = 0;
-                                _midiWallBase = now + MidiLeadMs * swFreq / 1000;
-                            }
-                            else _midiTickExt += (byte)(tick - _midiLastTick);
-                            _midiLastTick = tick; _midiLastEvtWall = now;
-                            long due = _midiWallBase + (long)(_midiTickExt * 7143UL) * swFreq / 1_000_000;
-                            if (due < now) { _midiWallBase += now - due; due = now; }   // late (frame hitch) → slide, keep spacing
-                            Midi?.PaceUntil(due);
-                            OnMidi?.Invoke(0x04, m);
-                            Midi?.Write(0x04, 4, m);
-                        }
-                    }
-                }
+                if (wr != 0) DrainMidiRing(wr);
                 else
                 {
                     uint m = R32(MIDI_BASE + 0x04);                      // legacy single-cell guests
