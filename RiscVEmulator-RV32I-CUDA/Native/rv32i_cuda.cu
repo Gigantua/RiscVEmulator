@@ -2152,7 +2152,8 @@ static bool rvx_sp_writer_ok(uint32_t in) {
 // on-device, or exits to the host/interpreter when pc2idx has no entry for pc).
 static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                      const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base,
-                     const std::vector<int>& regof, int myreg, RvxCse& cse, int nc) {
+                     const std::vector<int>& regof, int myreg, RvxCse& cse, int nc,
+                     const std::vector<uint32_t>& p2i) {
     const uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
     auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2;
         return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w] && regof[w]==myreg; };
@@ -2217,13 +2218,46 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                   "@!%%p0 add.u64 %%a1, %%a1, %%ad;\n@!%%p0 add.u64 %%a1, %%a1, %%M;\n", T, i, nc);
         strcpy(FB,"%a1"); return FB;
     };
+    // Shadow return stack push: a call (jal/jalr with rd=ra) records (return pc, the return site's
+    // baked pc2idx token) in the per-thread shared stack; the matching ret pops and re-dispatches
+    // through the region brx with no global-memory touch. 16 entries with wraparound — overflow
+    // just loses the oldest prediction (that ret misses to XDISP; the validating compare keeps it sound).
+    auto spush=[&](){
+        uint32_t wn = (pc + 4 - base) >> 2;
+        uint32_t tok = (wn < (uint32_t)N) ? p2i[wn] : 0xFFFFFFFFu;
+        rvx_app(s,"mad.wide.u32 %%a1, %%rsp, 8, %%ss;\n"
+                  "mov.b32 %%t1, %u;\nst.shared.u32 [%%a1], %%t1;\n"
+                  "mov.b32 %%t1, %u;\nst.shared.u32 [%%a1+4], %%t1;\n"
+                  "add.u32 %%rsp, %%rsp, 1;\nand.b32 %%rsp, %%rsp, 15;\n", pc+4, tok);
+    };
     switch(op) {
     case 0x37: if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,instr&0xFFFFF000u); wr(rd,0); } break;     // low 12 bits zero
     case 0x17: if(rd){ uint32_t v=pc+(instr&0xFFFFF000u); rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,v); wr(rd,(int)(v&3)); } break;
-    case 0x6F:{ uint32_t t=pc+rv_jimm(instr); if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); } xfer(false,t); } break;
-    case 0x67:{ rvx_app(s,"add.s32 %%t0, %%x%u, %d;\nand.b32 %%t0, %%t0, 4294967294;\n",rs1,(int)rv_iimm(instr));
-                cse.t0Valid=false;
-                if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); } s += "mov.b32 %pc, %t0;\nbra XDISP;\n"; } break;
+    case 0x6F:{ uint32_t t=pc+rv_jimm(instr);
+                if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); }
+                if(rd==1) spush(); xfer(false,t); } break;
+    case 0x67:{ cse.t0Valid=false;
+                if (rd==0 && rs1==1 && (int)rv_iimm(instr)==0) {
+                    // ret (jalr x0, ra, 0): SHADOW-STACK fast path. Pop the predicted (return pc,
+                    // dispatch token) pushed by the matching call; on a hit, re-enter through the
+                    // region-local brx directly — skipping XDISP's bounds checks and, crucially, its
+                    // ~200-cycle GLOBAL pc2idx load. A miss (setjmp/longjmp, stack skew after an
+                    // interpreter interlude, post-launch cold stack) falls back to XDISP — the
+                    // compare makes the prediction sound, never trusted.
+                    s += "and.b32 %t0, %x1, 4294967294;\nmov.b32 %pc, %t0;\n"
+                         "sub.u32 %rsp, %rsp, 1;\nand.b32 %rsp, %rsp, 15;\n"
+                         "mad.wide.u32 %a1, %rsp, 8, %ss;\n"
+                         "ld.shared.u32 %t1, [%a1];\nld.shared.u32 %bidx, [%a1+4];\n"
+                         "setp.ne.u32 %p0, %t0, %t1;\n@%p0 bra XDISP;\n"
+                         "setp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";   // call/ret loops must still yield
+                    rvx_app(s,"shr.u32 %%rg, %%bidx, 20;\nsetp.ne.u32 %%p0, %%rg, %d;\n@%%p0 bra XSAVE;\n", myreg);
+                    s += "and.b32 %bidx, %bidx, 1048575;\nbra JBRX;\n";
+                    break;
+                }
+                rvx_app(s,"add.s32 %%t0, %%x%u, %d;\nand.b32 %%t0, %%t0, 4294967294;\n",rs1,(int)rv_iimm(instr));
+                if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); }
+                if(rd==1) spush();                                  // indirect CALL: arm the callee's ret
+                s += "mov.b32 %pc, %t0;\nbra XDISP;\n"; } break;
     case 0x63:{ uint32_t t=pc+rv_bimm(instr); const char* cc; bool sg=false;
                 switch(f3){case 0:cc="eq";break;case 1:cc="ne";break;case 4:cc="lt";sg=true;break;case 5:cc="ge";sg=true;break;case 6:cc="lt";break;default:cc="ge";}
                 rvx_app(s,"setp.%s.%s %%p0, %%x%u, %%x%u;\n",cc,sg?"s32":"u32",rs1,rs2);
@@ -2417,13 +2451,17 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx  = hdr;
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
-        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs;\n.reg .b32 %x<32>,%t0,%t1,%t2,%pc,%budget,%cnt;\n"
-               ".reg .u32 %wi,%bidx,%rg,%tx;\n.reg .pred %p0,%p1,%p2;\n";
+        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss;\n.reg .b32 %x<32>,%t0,%t1,%t2,%pc,%budget,%cnt;\n"
+               ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
         ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
+        // Shadow return stack base: after all XS slots — %ss = XS + 168*ntid + 128*tid (16 × 8 B / thread).
+        ptx += "mov.u64 %ss, XS;\nmov.u32 %wi, %ntid.x;\nmul.wide.u32 %ad, %wi, 168;\nadd.u64 %ss, %ss, %ad;\n"
+               "mul.wide.u32 %ad, %tx, 128;\nadd.u64 %ss, %ss, %ad;\n";
         ptx += "mov.b32 %x0, 0;\n";
         for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%x%u, [%%xs+%d];\n", g, g*4);
         ptx += "ld.shared.u32 %cnt, [%xs+132];\nld.shared.u32 %budget, [%xs+136];\n"
-               "ld.shared.u64 %M, [%xs+144];\nld.shared.u64 %P2I, [%xs+152];\nld.shared.u32 %bidx, [%xs+160];\n";
+               "ld.shared.u64 %M, [%xs+144];\nld.shared.u64 %P2I, [%xs+152];\nld.shared.u32 %bidx, [%xs+160];\n"
+               "ld.shared.u32 %rsp, [%xs+164];\n";
         ptx += "BT: .branchtargets ";
         for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
         ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
@@ -2433,7 +2471,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
             if ((int)w != prev+1 || targ[w]) cse.reset();   // run start or sideways-enterable
             rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
-            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc);
+            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc, pc2idx);
             bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
             if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
                 int nw = (int)w + 1;
@@ -2451,7 +2489,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx += "and.b32 %bidx, %bidx, 1048575;\nbra JBRX;\n";
         ptx += "XSAVE:\n";
         for (int g=1; g<32; g++) rvx_app(ptx, "st.shared.u32 [%%xs+%d], %%x%u;\n", g*4, g);
-        ptx += "st.shared.u32 [%xs+128], %pc;\nst.shared.u32 [%xs+132], %cnt;\nret;\n}\n";
+        ptx += "st.shared.u32 [%xs+128], %pc;\nst.shared.u32 [%xs+132], %cnt;\nst.shared.u32 [%xs+164], %rsp;\nret;\n}\n";
     }
     // ── dispatcher unit: state→XS, then loop { budget/bounds/pc2idx gate → call region } → state←XS.
     std::string& ptx = units[0];
@@ -2474,7 +2512,8 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.shared.u32 [%%xs+%d], %%t0;\n", g*4, g*4);
     rvx_app(ptx, "ld.global.u32 %%pc, [%%S+%d];\nmov.b32 %%cnt, 0;\n", 32*4);
     ptx += "st.shared.u32 [%xs+132], %cnt;\nst.shared.u32 [%xs+136], %budget;\n"
-           "st.shared.u64 [%xs+144], %M;\nst.shared.u64 [%xs+152], %P2I;\n";
+           "st.shared.u64 [%xs+144], %M;\nst.shared.u64 [%xs+152], %P2I;\n"
+           "st.shared.u32 [%xs+164], %cnt;\n";   // shadow-stack pointer = 0 (cold stack: rets miss to XDISP)
     ptx += "DLOOP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
     rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
     rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
@@ -2714,7 +2753,7 @@ static long long rvxblk_step(long long budget) {
     void* args[] = { &g_mem, &g_state, &bud, &g_x_pc2idx, &g_ret };
     int block = g_ncores < 64 ? g_ncores : 64;                                // one thread per guest core (2-warp blocks)
     int grid  = (g_ncores + block - 1) / block;
-    CUresult r = cuLaunchKernel(g_xfn, grid,1,1, block,1,1, 168*block,0, args, nullptr);   // 168 B dynamic shared per thread = XS spill slots
+    CUresult r = cuLaunchKernel(g_xfn, grid,1,1, block,1,1, 296*block,0, args, nullptr);   // per thread: 168 B XS spill slot + 128 B shadow return stack
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] launch %d\n",(int)r); return -1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr,"[xblk] sync fault\n"); return -1; }
     return (long long)*g_ret;
@@ -2742,7 +2781,7 @@ API int cuda_rvexec_selftest() {
     if (cuModuleGetFunction(&fn, mod, "k") != CUDA_SUCCESS) { cuModuleUnload(mod); return 0; }
     unsigned* d=nullptr; cudaMalloc(&d,4); cudaMemset(d,0,4);
     void* args[]={&d};
-    CUresult lr = cuLaunchKernel(fn, 1,1,1, 1,1,1, 168,0, args, nullptr);
+    CUresult lr = cuLaunchKernel(fn, 1,1,1, 1,1,1, 296,0, args, nullptr);
     cudaDeviceSynchronize();
     unsigned h=0; cudaMemcpy(&h,d,4,cudaMemcpyDeviceToHost);
     cudaFree(d); cuModuleUnload(mod);
@@ -2791,7 +2830,7 @@ API int cuda_rvexec_blocktest() {
     unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
     unsigned bud=1000;
     void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-    CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr);
+    CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,296,0,args,nullptr);
     cudaError_t se=cudaDeviceSynchronize();
     cudaMemcpy(&st,d_st,sizeof st,cudaMemcpyDeviceToHost);
     unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
@@ -2891,7 +2930,7 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
         unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
         unsigned bud=300000; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,296,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
         cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
         cudaFree(d_st); cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_ret); cuModuleUnload(mod);
         bool ok = (lr==CUDA_SUCCESS && se==cudaSuccess && cs.pc==ref_pc && (long long)ret==rs);
@@ -2958,7 +2997,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
         unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
         unsigned bud=(unsigned)rs+64; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,296,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
         cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
         cudaFree(d_st); cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_ret); cuModuleUnload(mod);
         bool ok = (lr==CUDA_SUCCESS && se==cudaSuccess && cs.pc==ref_pc && (long long)ret==rs);
@@ -3023,7 +3062,7 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
                 cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
                 cudaMemcpy(d_mem,Mh.data(),MEMB,cudaMemcpyHostToDevice);
                 cudaMemset(d_ret,0,4); unsigned bud=100000; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-                CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+                CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,296,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
                 if(lr!=CUDA_SUCCESS||se!=cudaSuccess){ blew=true; break; }
                 cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); cudaMemcpy(Mh.data(),d_mem,MEMB,cudaMemcpyDeviceToHost);
                 for(int r=0;r<32;r++) Rh[r]=cs.regs[r]; Rh[0]=0; pc=cs.pc;
