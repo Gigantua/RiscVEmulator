@@ -782,6 +782,10 @@ static CUdeviceptr g_xdw = 0;
 static int        g_dyncode = 0;             // RVX_DYNCODE / cuda_rvcud_set_dyncode: bake exec SMC checks
 static void rvcud_update_window();
 static bool rvx_dyncode();
+static int  rvx_prof();                      // RVX_PROF=K guest-pc profiler (shared by both engines)
+static void rvx_prof_sample();
+// Dynamic-translation activity counters (reported by the RVX_PROF atexit dump).
+static long long g_n_miss = 0, g_n_appuops = 0, g_n_dynmiss = 0, g_n_patch = 0, g_n_inval = 0;
 
 // TIERED exec_block (defined far below): cross-compile a BOUNDED set of statically-reached rv32i words
 // to ONE PTX kernel (guest regs → PTX registers, no per-uop interpreter tax), dispatched by pc via
@@ -2233,7 +2237,7 @@ static void rvcud_invalidate_dirty() {
     if (!any) return;
     auto invalidate_page = [&](int p) {
         if (p < 0 || p >= (int)g_dynpage.size() || !g_dynpage[p]) return;
-        g_dynpage[p] = 0;
+        g_dynpage[p] = 0; g_n_inval++;
         uint32_t a0 = (uint32_t)p << 12, a1 = a0 + 0x1000;
         if (a1 <= g_base) return;
         uint32_t w0 = (a0 > g_base) ? (a0 - g_base) >> 2 : 0;
@@ -2266,7 +2270,7 @@ static void rvcud_patch_fixups() {
         if (f.tw < (uint32_t)g_pc2words && g_pc2uop_h[f.tw] != RC_BADUOP) {
             g_w1h[f.ui] = g_pc2uop_h[f.tw];
             cudaMemcpy((char*)g_uops + (size_t)f.ui * sizeof(uint2) + 4, &g_w1h[f.ui], 4, cudaMemcpyHostToDevice);
-            g_unpatched--;
+            g_unpatched--; g_n_patch++;
         }
     }
 }
@@ -2337,6 +2341,7 @@ static bool rvcud_translate_miss(uint32_t pc) {
     }
     int cnt = g_nuops - firstNew;
     if (cnt <= 0) return false;
+    g_n_miss++; g_n_appuops += cnt; if (w >= g_imgwords) g_n_dynmiss++;
     std::vector<uint2> nu(cnt);
     for (int i = 0; i < cnt; i++) nu[i] = make_uint2(g_w0h[firstNew+i], g_w1h[firstNew+i]);
     cudaMemcpy(g_uops   + firstNew, nu.data(),            (size_t)cnt * sizeof(uint2), cudaMemcpyHostToDevice);
@@ -2426,17 +2431,21 @@ API int cuda_rvcud_step_all(int budget) {
             }
         }
         int xstop = g_xblk_ok ? 0x80 : 0;             // self-stop only while exec is live (else: no relaunch storm)
+        int irem = rem;                               // RVX_PROF: slice interpreter launches too, so
+        { int pr = rvx_prof();                        // interpreter/JIT-dominated guests get samples
+          if (pr > 1) { int sl = budget / pr; if (sl < 1000) sl = 1000; if (irem > sl) irem = sl; } }
         if (g_ncores == 1)
             rvcud_kernel<true ><<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
-                                                        g_ncores, g_pc2words, g_base, rem, xstop, g_ret);
+                                                        g_ncores, g_pc2words, g_base, irem, xstop, g_ret);
         else
             rvcud_kernel<false><<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
-                                                        g_ncores, g_pc2words, g_base, rem, xstop, g_ret);
+                                                        g_ncores, g_pc2words, g_base, irem, xstop, g_ret);
         cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
         if (le != cudaSuccess) return (int)le;
         if (se != cudaSuccess) return (int)se;
         if (s_stats) { s_il++; s_iret += (long long)*g_ret; }
         total += (long long)*g_ret;                  // core 0 retired this launch
+        if (rvx_prof() > 1) rvx_prof_sample();
         uint32_t pc = g_state[0].pc;                 // managed memory → host-readable
         { static int s_trc = -1; if (s_trc < 0) s_trc = getenv("RVCUD_TRACE") ? 1 : 0;
           if (s_trc) fprintf(stderr, "[trc] pc=%08X ret=%llu total=%lld\n", pc, *g_ret, total); }
@@ -3801,6 +3810,36 @@ static void rvxblk_build() {
 // Run the exec_block from g_state[0].pc for up to `budget` guest instructions. Updates g_state[0]
 // (regs+pc, managed mem) and returns instructions retired, or -1 on launch error.
 static std::vector<unsigned long long> g_prof_hist; static uint32_t g_prof_base = 0;
+// RVX_PROF=K guest-pc profiler, shared by BOTH engines: exec slices its budget in rvxblk_step;
+// the interpreter driver slices its launch budgets the same way (cuda_rvcud_step_all) — without
+// that, JIT-class guests (interpreter/translation-dominated) profile as silence. The atexit dump
+// also reports the dynamic-translation activity counters.
+static int rvx_prof() {
+    static int p = -1;
+    if (p < 0) { const char* e = getenv("RVX_PROF"); p = e ? atoi(e) : 0;
+        if (p > 1) atexit([]{
+            std::vector<std::pair<unsigned long long,size_t>> top;
+            for (size_t b = 0; b < g_prof_hist.size(); b++)
+                if (g_prof_hist[b]) top.push_back({g_prof_hist[b], b});
+            std::sort(top.rbegin(), top.rend());
+            unsigned long long tot = 0; for (auto& t : top) tot += t.first;
+            fprintf(stderr, "[prof] %llu samples, top buckets (256 B):\n", tot);
+            for (size_t i = 0; i < top.size() && i < 24; i++)
+                fprintf(stderr, "[prof]   0x%08X  %5.1f%%  (%llu)\n",
+                        g_prof_base + (uint32_t)(top[i].second << 8),
+                        100.0 * top[i].first / (double)tot, top[i].first);
+            fprintf(stderr, "[prof] jit: %lld misses (%lld uops appended, %lld dynamic-code), "
+                            "%lld edge patches, %lld invalidations\n",
+                    g_n_miss, g_n_appuops, g_n_dynmiss, g_n_patch, g_n_inval);
+        }); }
+    return p;
+}
+static void rvx_prof_sample() {
+    if (g_prof_hist.empty()) { g_prof_hist.assign(((size_t)g_pc2words * 4 + 255) >> 8, 0); g_prof_base = g_base; }
+    uint32_t pc = g_state[0].pc & ~HALT_BIT;
+    if (pc >= g_prof_base) { size_t b = (size_t)(pc - g_prof_base) >> 8;
+                             if (b < g_prof_hist.size()) g_prof_hist[b]++; }
+}
 static long long rvxblk_step_once(long long budget) {
     *g_ret = 0;
     unsigned bud = (budget > 0x7fffffff) ? 0x7fffffffu : (unsigned)budget;
@@ -3817,30 +3856,14 @@ static long long rvxblk_step(long long budget) {
     // RVX_PROF=K: statistical guest-pc PROFILER — split the budget into K slices and histogram the
     // pc after each slice (pinned state, free to read). Relative bucket weights identify where guest
     // time goes; the extra launches distort absolute MIPS, so profile runs are never benchmarks.
-    static int prof = -1;
-    if (prof < 0) { const char* e = getenv("RVX_PROF"); prof = e ? atoi(e) : 0;
-        if (prof > 1) atexit([]{
-            std::vector<std::pair<unsigned long long,size_t>> top;
-            for (size_t b = 0; b < g_prof_hist.size(); b++)
-                if (g_prof_hist[b]) top.push_back({g_prof_hist[b], b});
-            std::sort(top.rbegin(), top.rend());
-            unsigned long long tot = 0; for (auto& t : top) tot += t.first;
-            fprintf(stderr, "[prof] %llu samples, top buckets (256 B):\n", tot);
-            for (size_t i = 0; i < top.size() && i < 24; i++)
-                fprintf(stderr, "[prof]   0x%08X  %5.1f%%  (%llu)\n",
-                        g_prof_base + (uint32_t)(top[i].second << 8),
-                        100.0 * top[i].first / (double)tot, top[i].first);
-        }); }
+    int prof = rvx_prof();
     if (prof > 1) {
-        if (g_prof_hist.empty()) { g_prof_hist.assign(((size_t)g_pc2words * 4 + 255) >> 8, 0); g_prof_base = g_base; }
         long long total = 0, slice = budget / prof; if (slice < 1000) slice = 1000;
         while (total < budget) {
             long long did = rvxblk_step_once(slice < budget - total ? slice : budget - total);
             if (did < 0) return -1;
             total += did;
-            uint32_t pc = g_state[0].pc & ~HALT_BIT;
-            if (pc >= g_prof_base) { size_t b = (size_t)(pc - g_prof_base) >> 8;
-                                     if (b < g_prof_hist.size()) g_prof_hist[b]++; }
+            rvx_prof_sample();
             if (g_state[0].pc & HALT_BIT) break;
             if (did == 0) break;                       // not enterable — let the interpreter run
         }
