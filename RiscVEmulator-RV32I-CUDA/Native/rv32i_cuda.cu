@@ -743,11 +743,18 @@ API void cuda_rv32i_set_halted(int core, int v) { if (v) g_state[core].pc |= HAL
 
 // Host I/O scatters/gathers words into the interleaved layout (one word per 2D
 // "row", stride g_ncores words). off/len are word-aligned for all call sites.
+// ncores==1 ⇒ the layout is LINEAR: use a plain cudaMemcpy — the 2D path with 4-byte
+// rows is a 64,000-descriptor strided transfer for a 256 KB framebuffer read and
+// dominated the per-StepN host cost (~3.8 ms/batch measured end-to-end).
 API int cuda_rv32i_write_mem(int core, const void* src, unsigned int off, unsigned int len) {
+    if (g_ncores == 1)
+        return (int)cudaMemcpy((uint8_t*)g_mem + off, src, len, cudaMemcpyHostToDevice);
     uint8_t* dst = (uint8_t*)(g_mem + (size_t)(off >> 2) * g_ncores + core);
     return (int)cudaMemcpy2D(dst, (size_t)g_ncores * 4, src, 4, 4, len >> 2, cudaMemcpyHostToDevice);
 }
 API int cuda_rv32i_read_mem(int core, void* dst, unsigned int off, unsigned int len) {
+    if (g_ncores == 1)
+        return (int)cudaMemcpy(dst, (const uint8_t*)g_mem + off, len, cudaMemcpyDeviceToHost);
     const uint8_t* src = (const uint8_t*)(g_mem + (size_t)(off >> 2) * g_ncores + core);
     return (int)cudaMemcpy2D(dst, 4, src, (size_t)g_ncores * 4, 4, len >> 2, cudaMemcpyDeviceToHost);
 }
@@ -1999,6 +2006,15 @@ API int cuda_rvcud_step_all(int budget) {
     // that block and resume — until the budget is spent or the guest halts. Static fully-translated
     // guests (the benchmarks) never miss, so this runs exactly once for them.
     long long total = 0;
+    // RVX_STATS=1: hybrid launch profile — exec/interp launch counts, retired split, and the wall-time
+    // split between GPU work (launch+sync inside this call) and everything else, dumped at exit.
+    static long long s_xl=0, s_il=0, s_xret=0, s_iret=0; static double s_tx=0, s_tall=0; static int s_stats=-1;
+    if (s_stats < 0) { s_stats = getenv("RVX_STATS") ? 1 : 0;
+        if (s_stats) atexit([]{ fprintf(stderr,"[hyb] exec launches %lld (retired %lld), interp launches %lld (retired %lld), gpu %.0f ms, step_all %.0f ms\n",
+                                        s_xl, s_xret, s_il, s_iret, s_tx*1e3, s_tall*1e3); }); }
+    auto qpc=[]{ LARGE_INTEGER c; QueryPerformanceCounter(&c); return (double)c.QuadPart; };
+    static double s_qpf = []{ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
+    double t_all = s_stats ? qpc() : 0;
     for (int guard = 0; guard < 1 << 20; guard++) {
         int rem = budget - (int)total;
         if (rem <= 0) break;
@@ -2009,9 +2025,12 @@ API int cuda_rvcud_step_all(int budget) {
             uint32_t xpc = g_state[0].pc;
             int xw = (xpc >= g_base) ? (int)((xpc - g_base) >> 2) : -1;
             if (xw >= 0 && xw < g_pc2words && g_xtab[xw]) {
+                double t0 = s_stats ? qpc() : 0;
                 long long did = rvxblk_step(rem);
+                if (s_stats) { s_tx += (qpc()-t0)/s_qpf; }
                 if (did < 0) { g_xblk_ok = 0; }            // exec error → permanently fall back to interpreter
                 else {
+                    if (s_stats) { s_xl++; s_xret += did; }
                     total += did;
                     uint32_t epc = g_state[0].pc;
                     if (epc & 0x80000000u) break;            // halted
@@ -2035,6 +2054,7 @@ API int cuda_rvcud_step_all(int budget) {
         cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
         if (le != cudaSuccess) return (int)le;
         if (se != cudaSuccess) return (int)se;
+        if (s_stats) { s_il++; s_iret += (long long)*g_ret; }
         total += (long long)*g_ret;                  // core 0 retired this launch
         uint32_t pc = g_state[0].pc;                 // managed memory → host-readable
         if (pc & 0x80000000u) break;                 // halted (illegal instr / guest done)
@@ -2045,6 +2065,7 @@ API int cuda_rvcud_step_all(int budget) {
         }
         continue;                                     // interp self-stopped at an exec entry (or budget end) → re-evaluate
     }
+    if (s_stats) s_tall += (qpc()-t_all)/s_qpf;
     *g_ret = (unsigned long long)total;               // report TOTAL retired (verify gate reads this)
     return 0;
 }
