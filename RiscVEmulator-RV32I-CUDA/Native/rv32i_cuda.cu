@@ -1,25 +1,5 @@
-// ── EXPERIMENTAL FEATURE FLAGS (all default OFF → the committed-best path is byte-for-byte unchanged) ──
-// Flip one on at the nvcc command line: -DRVCUD_CPASYNC=1  (each is independent; combine freely).
-// Every flag preserves the rvcud↔rv32i bit-identical verify gate — they change cache policy, memory
-// staging, or uop COUNT, never the architectural result. Validate each with the gate, then read the
-// Doom "RV32I MIPS = uop-throughput × fusion-ratio" bench line (+FPS cross-check). See IDEA_BeyondTenMips.md.
-//   RVCUD_CPASYNC   §1  cp.async/LDGSTS-stream a detected unit-stride memcpy loop's source through a
-//                       shared double-buffer (overlaps the global read behind the store). Single-core
-//                       only (ncores==1, where guest RAM is linear). GENERIC — keys on the copy-loop
-//                       instruction pattern, not on any guest address.
-//   RVCUD_BITFIELD  §8  fuse `srli rt,rs,k ; andi rd,rt,mask` → one BFE uop (rd = (rs>>k)&mask); the
-//                       shift temp never reaches the shared regfile. GENERIC bit-field extract pattern.
-#ifndef RVCUD_CPASYNC
-#define RVCUD_CPASYNC 0
-#endif
-#ifndef RVCUD_BITFIELD
-#define RVCUD_BITFIELD 0
-#endif
 #ifndef RVCUD_HOTHIST       // profiling only: count per-uop executions on core 0, dump CSV (ui,pc,class,count) on shutdown
 #define RVCUD_HOTHIST 0
-#endif
-#ifndef RVCUD_LOADFWD       // #5  static redundant-load elimination: a load matching an earlier same-block
-#define RVCUD_LOADFWD 0     //     load (base unchanged, no store between) → register copy, no memory op
 #endif
 
 #include <cstdint>
@@ -37,9 +17,6 @@
 #define PSAPI_VERSION 2
 #include <windows.h>
 #include <psapi.h>
-#endif
-#if RVCUD_CPASYNC
-#include <cuda_pipeline.h>          // __pipeline_memcpy_async / commit / wait_prior (LDGSTS, sm_80+)
 #endif
 
 static constexpr uint32_t HALT_BIT = 0x80000000u;
@@ -144,7 +121,7 @@ static __device__ __forceinline__ uint32_t alu(uint32_t f3, uint32_t u1, uint32_
 
 // Assemble the sign-extended, opcode-appropriate immediate for one instruction. Done inline in the
 // fetch path so the interpreter reads live guest RAM (correct for self-modifying / JIT guests like
-// TinyCC) rather than a stale predecoded copy.
+// guests) rather than a stale predecoded copy.
 static __device__ __forceinline__ uint32_t decode_imm(uint32_t instr) {
     const uint32_t op = instr & 0x7F;
     if (op == 0x63)                        // B-type
@@ -264,20 +241,20 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        RC_CONST=0x37, RC_LEA=0x1B, RC_ADDC=0x2B, RC_JAL=0x6F, RC_JALR=0x67, RC_NOP=0x0F,
        RC_SUB=0x3B, RC_MULR=0x53, RC_MULADD=0x43, RC_XSH=0x4B, RC_INCBR=0x5B,
        RC_LOADPI=0x71, RC_STOREPI=0x79, RC_COPYPI=0x75, RC_LDX=0x6D, RC_STX=0x65, RC_LDXS=0x1D, RC_STXS=0x15,
-       RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_BFE=0x09, RC_DIVLOOP=0x49,
+       RC_COPYLOOP=0x6B, RC_MEXT=0x5D, RC_MULLOOP=0x5F, RC_DIVLOOP=0x49,
        RC_MEMSET=0x39, RC_PALEXP=0x4F, RC_TEXSPAN=0x59, RC_COPYLOOPS=0x21, RC_TEXCOL=0x61,
-       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_MELTCOL=0x55, RC_ILL=0x00 };
-       // RC_MELTCOL: strided copy whose src-advance goes through a temp (lX V,0(S); addi S2,S,Ks;
+       RC_WORDFILL=0x35, RC_WORDSCAN=0x45, RC_COPYLOOPT=0x55, RC_ILL=0x00 };
+       // RC_COPYLOOPT: strided copy whose src-advance goes through a temp (lX V,0(S); addi S2,S,Ks;
        //   sX V,0(D); addi D,D,Kd; mv S,S2; bne S2,LIM) → 1 native loop uop (params in g_ext).
        //   The COPYLOOPS matcher requires in-place addi src bumps and misses this 6-word form
-       //   (the ttf30 profile's screen-melt column, 5 dispatched uops/iter today). Generic.
+       //   (profiled hot: 5 dispatched uops/iter as 1:1 code). Generic.
        // RC_WORDFILL: direct-form fill loop (sX VAL,0(D); addi D,D,K; bne D,END) → 1 native loop uop.
        //   The byte-MEMSET arm matches clang's addi-temp form; this matches the temp-less direct form
-       //   (the profile's sw-based screen fill, 2 dispatched uops/iter today). Generic, any width/stride.
+       //   (profiled hot: 2 dispatched uops/iter as 1:1 code). Generic, any width/stride.
        // RC_WORDSCAN: counted search loop (addi C,C,Kc; addi P,P,Kp; b<cc> C,Z,→EXIT; lw V,off(P);
-       //   bne V,KEY,→top) → 1 native loop uop (params in g_ext; the ttf30 profile's lump-name scan,
+       //   bne V,KEY,→top) → 1 native loop uop (params in g_ext; a record-table scan, profiled at
        //   ~15% of all uop-execs at 4 dispatched uops/iter). Two exits, EXACT per-path weights (3 vs 5).
-       // RC_TEXCOL: textured-column loop (R_DrawColumn): pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=stride;
+       // RC_TEXCOL: textured-column loop: pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=stride;
        //   frac+=step → 1 native loop. 1D vertical TEXSPAN; params (regs/offsets/shifts/stride) in g_ext, generic.
        // RC_COPYLOOPS: strided copy loop (load rt,0(src); store rt,0(dst); src+=Ks; dst+=Kd; bne cnt,lim) → 1
        //   native loop. Generic (any element size + arbitrary strides); captures column/span blits. Params in g_ext.
@@ -287,7 +264,6 @@ enum { RC_ALUI=0x13, RC_ALUR=0x33, RC_MULC=0x0B, RC_LOAD=0x03, RC_BR=0x63, RC_ST
        // instructions, never hardcoded → generic across guests):
        // RC_TEXSPAN: texture-span loop  pix=cmap[tex[((y>>shY)&mask)+((x<<shX1)>>shX2)]]; *dst++=pix; x+=xs; y+=ys.
        // RC_PALEXP:  LUT-expand loop     idx=src++; p=tbl+3*idx; dst[0..2]=p[0..2]; dst[3]=const; dst+=4.
-       // RC_BFE (RVCUD_BITFIELD): rd = (rs >> k) & mask  — fused srli+andi; 0x09 is a free sparse code.
        // RC_DIVLOOP: clang's rv32i bit-serial restoring-division loop (the body shared by __udivsi3/__divsi3,
        //   ~416 guest instrs) → ONE hardware divide. Q=N/D, R=N%D, counter→-1. CPU-validated 8M cases.
        // COPYLOOP: byte-memcpy loop; MEXT: mulh*/div*/rem*; MULLOOP: whole shift-add software-multiply loop → 1 hw multiply
@@ -358,12 +334,12 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         // Frequency-ordered dispatch ladder (hottest classes first → fewest predicted compares on
         // the common path). SUB/MULR are rare (never fire on these guests) → pushed to the tail.
         uint32_t r = 0, nui = ui + 1;
-        // Frequency-ordered for DOOM (the optimization target): hottest classes first so the common
+        // Frequency-ordered by the dynamic profile of the target guest workload: hottest classes first so the common
         // path hits the fewest predicted compares. At ~48 cyc/uop each ladder compare is ~3%, so order
-        // matters a lot. Universally-hot (ALUI/ALUR/LOAD/ST/BR) lead; Doom's fusions next; compute-only
+        // matters a lot. Universally-hot (ALUI/ALUR/LOAD/ST/BR) lead; profiled-hot fusions next; compute-only
         // (XSH/ADDC/MULC) and dormant-on-rv32i (MULR/MEXT) at the tail. Reorder is semantically identical.
         if      (cls == RC_ALUI)  r = alu(f3, u1, w1, w1 & 0x1F, false, sra);
-        else if (cls == RC_BR) {                         // 2nd: 17.6% of ttf30 execs (was 5th)
+        else if (cls == RC_BR) {                         // 2nd: 17.6% of profiled execs (was 5th)
             int t; switch (f3) { case 0:t=u1==u2;break; case 1:t=u1!=u2;break; case 4:t=s1<s2;break;
                                  case 5:t=s1>=s2;break; case 6:t=u1<u2;break; default:t=u1>=u2; }
             ui = t ? w1 : ui + 1; gi += wt; continue;                            // w1 = baked target uop-index
@@ -375,7 +351,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                           case 2: r=                   ld_i<uint32_t,NC1>(mem,ncores,id,a); break;
                           case 4: r=                   ld_i<uint8_t,NC1> (mem,ncores,id,a); break;
                           default:r=                   ld_i<uint16_t,NC1>(mem,ncores,id,a); } }   // f3==5 (translator validated {0,1,2,4,5})
-        else if (cls == RC_SUB)   r = u1 - u2;           // 5th: 5.7% of ttf30 execs (was tail)
+        else if (cls == RC_SUB)   r = u1 - u2;           // 5th: 5.7% of profiled execs (was tail)
         else if (cls == RC_ST) { uint32_t a = (uint32_t)(s1 + (int32_t)w1);
             if (live) switch (f3) { case 0: st_i<uint8_t,NC1> (mem,ncores,id,a,(uint8_t)u2);  break;
                                     case 1: st_i<uint16_t,NC1>(mem,ncores,id,a,(uint16_t)u2); break;
@@ -515,7 +491,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
                 if (w1 == 0xFFFFFFFFu) { resume_pc = __ldg(&uop2pc[ui]) + 5*4; break; }
                 ui = w1; continue; }
             continue; }                                                        // budget-cut → ui stays, resume re-enters
-        else if (cls == RC_MELTCOL) {                    // temp-advance strided copy: whole loop, native (params in ext[])
+        else if (cls == RC_COPYLOOPT) {                    // temp-advance strided copy: whole loop, native (params in ext[])
             uint32_t e = w0 >> 7; uint32_t p0=__ldg(&ext[e]), p1=__ldg(&ext[e+1]);
             uint32_t Sr=p0&31, Dr=(p0>>5)&31, Vr=(p0>>10)&31, S2r=(p0>>15)&31, Lr=(p0>>20)&31, lf3=(p0>>25)&7;
             int32_t Ks=(int32_t)(int16_t)(p1&0xFFFF), Kd=(int32_t)(int16_t)(p1>>16);
@@ -544,34 +520,7 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             const bool cdst = (w0>>25)&1;                      // which pointer the bne compares to L
             { uint32_t ftp = w1 & 0x00FFFFFFu;                 // warm the exit dispatch's descriptor loads (hint only)
               if (ftp != 0x00FFFFFFu) { pf_h(&uops[ftp]); pf_h(&uw[ftp]); } }
-#if RVCUD_CPASYNC
-            // cp.async/LDGSTS fast path (single-Doom only: ncores==1 ⇒ guest byte a lives at ((char*)mem)[a],
-            // so the source region is contiguous and stage-able). Stream 16-B chunks through a shared
-            // double-buffer — the global read of chunk N+1 overlaps the store of chunk N. Byte-for-byte
-            // identical to the scalar copy below (same bytes, gi=5/byte), so the verify gate is unchanged.
-            if (ncores == 1) {
-                __shared__ uint32_t s_cp[2][4];            // two 16-B stages, one thread (block==1) → +32 B shared
-                char* const gm = (char*)mem;
-                while ((s & 15u) && (cdst ? d : s) != L && gi < budget) {   // align src to 16 B (cp.async.cg wants 16-B align)
-                    st_i<uint8_t,NC1>(mem,ncores,id,d,(uint8_t)ld_i<uint8_t,NC1>(mem,ncores,id,s)); s++; d++; gi += 5; }
-                int cur = 0; bool inflight = false;
-                while ((L - (cdst ? d : s)) >= 16u && (((d>s)?(d-s):(s-d)) >= 16u) && gi < budget) {
-                    if (!inflight) { __pipeline_memcpy_async(&s_cp[cur][0], gm + s, 16); __pipeline_commit(); }
-                    int nxt = cur ^ 1;
-                    bool haveNext = ((L - (cdst ? d : s) - 16u) >= 16u) && (gi + 80 < budget);
-                    if (haveNext) { __pipeline_memcpy_async(&s_cp[nxt][0], gm + s + 16u, 16); __pipeline_commit(); }
-                    __pipeline_wait_prior(haveNext ? 1 : 0);   // current stage filled
-                    st_i<uint32_t,NC1>(mem,ncores,id,d,    s_cp[cur][0]);
-                    st_i<uint32_t,NC1>(mem,ncores,id,d+4,  s_cp[cur][1]);
-                    st_i<uint32_t,NC1>(mem,ncores,id,d+8,  s_cp[cur][2]);
-                    st_i<uint32_t,NC1>(mem,ncores,id,d+12, s_cp[cur][3]);
-                    s += 16u; d += 16u; gi += 80;              // 16 bytes × 5 guest instrs
-                    cur = nxt; inflight = haveNext;
-                }
-                if (inflight) __pipeline_wait_prior(0);        // drain the unconsumed prefetch (tail re-reads from global)
-            }
-#endif
-            while ((cdst ? d : s) != L && gi < budget) {       // scalar copy: base path AND the cp.async tail/overlap
+            while ((cdst ? d : s) != L && gi < budget) {       // word-widened scalar copy
                 uint32_t cnt = cdst ? d : s, rem = L - cnt, adiff = (d > s) ? (d - s) : (s - d);
                 pf_i(mem, ncores, id, s + 96);                 // prefetch source ~96B ahead of the copy cursor
                 if (rem >= 4u && adiff >= 4u) {                // word copy: ≥4 to go AND non-overlapping within the word
@@ -592,9 +541,6 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
             }                                                                      // else budget-cut → ui stays, resume here
             continue; }
         else if (cls == RC_XSH)   r = u1 ^ (sra ? (u1 >> (w1 & 31)) : (u1 << (w1 & 31)));  // xorshift step: rs ^ (rs<<|>>k)
-#if RVCUD_BITFIELD
-        else if (cls == RC_BFE)   r = (u1 >> (w1 & 0x1F)) & (w1 >> 5);            // (rs>>k)&mask: fused srli+andi
-#endif
         else if (cls == RC_ADDC)  r = u1 + w1;
         else if (cls == RC_MULC)  r = u1 * w1;                                   // strength-reduced ×const → 1 IMAD
         else if (cls == RC_LEA)   r = (u1 << (w1 & 31)) + u2;                    // slli+add fused
@@ -1140,22 +1086,6 @@ static int rvcud_try_fuse(const RvcudBuild& B, int w,
         }
     }
 
-#if RVCUD_BITFIELD
-    // ── BFE — srli rt,rs,k ; andi rd,rt,mask  (rt dead after) → rd = (rs>>k)&mask (one uop) ──
-    if (OPC(w)==0x13 && ((img[w]>>12)&7)==5 && ((img[w]>>25)&0x7F)==0          // srli (logical, f7==0)
-        && w+1<N && !B.leader[w+1] && OPC(w+1)==0x13 && ((img[w+1]>>12)&7)==7) {  // andi
-        uint32_t i1=img[w], i2=img[w+1];
-        uint32_t rt=(i1>>7)&0x1F, rs=(i1>>15)&0x1F, k=(i1>>20)&0x1F;
-        uint32_t rd=(i2>>7)&0x1F, ra=(i2>>15)&0x1F, mask=rv_iimm(i2);           // andi imm sign-extends to 32 b
-        bool rtdead = (rd==rt) || !(B.liveout[w+1] & (1u<<rt));                 // the shift temp must not escape
-        if (rt!=0 && ra==rt && rs!=rt && rtdead && mask <= 0xFFFFu) {           // real positive mask (excludes andi -1 = mv)
-            w0 = RCW0(RC_BFE, rd, rs, 0, 0, 0, RP_UNC, 0);
-            w1 = (k & 0x1F) | (mask << 5); weight = 2; tgt = RC_NOTGT;          // pack k[4:0] | mask<<5
-            return 2;
-        }
-    }
-#endif
-
     return rvcud_classify(B, w, w0, w1, weight, tgt);   // 1:1 fallback
 }
 
@@ -1200,7 +1130,7 @@ static int rvcud_try_ifconv(RvcudBuild& B, int w, uint32_t& ui) {
 // STRIDED COPY LOOP → COPYLOOPS. A byte/half/word copy step (lX rt,0(src); sX rt,0(dst); addi src,Ks;
 // addi dst,Kd — any order) immediately followed by `bne cnt,lim,→w` (back-edge) runs the WHOLE strided
 // copy in one native loop uop. Generalizes the per-step COPYPI to its loop form for arbitrary element size
-// and strides (e.g. column blit: src+=1, dst+=screenwidth). Captures V_DrawPatch/blit loops. Params in
+// and strides (e.g. column blit: src+=1, dst+=row pitch). Captures patch/column blit loops. Params in
 // g_ext (strides exceed a uint2 with the regs). Consumes 5 words; weight 5/iter.
 static int rvcud_try_copyloops(RvcudBuild& B, int w, uint32_t& ui) {
     const int N = B.nwords; const uint32_t* img = B.img;
@@ -1250,8 +1180,8 @@ static int rvcud_try_copyloops(RvcudBuild& B, int w, uint32_t& ui) {
 // MEMORY-COPY FUSION. A byte/half/word copy step `lb rt,0(src); sb rt,0(dst); addi src,Ks; addi dst,Kd`
 // (the four in ANY order — clang interleaves the pointer bumps differently for horizontal memcpy vs the
 // vertical column blit) collapses to ONE uop: mem[dst]=mem[src]; src+=Ks; dst+=Kd. Requires offset 0 on
-// both, rt dead after the store, and src/dst/rt distinct. Replaces 4 rv32i instrs/iter with 1 — Doom's
-// hottest code is exactly these copy loops (span blits + column blits). Strides fit signed 16 bits.
+// both, rt dead after the store, and src/dst/rt distinct. Replaces 4 rv32i instrs/iter with 1 — blit-style
+// hot paths are exactly these copy loops (span blits + column blits). Strides fit signed 16 bits.
 static int rvcud_try_copy(RvcudBuild& B, int w, uint32_t& ui) {
     const int N = B.nwords; const uint32_t* img = B.img;
     uint32_t i0 = img[w], lf3 = (i0>>12)&7;
@@ -1317,9 +1247,9 @@ static int rvcud_try_memset(RvcudBuild& B, int w, uint32_t& ui) {
     return 4;
 }
 
-// DIRECT-FORM FILL LOOP → WORDFILL. The temp-less fill clang emits for word/half screen clears:
+// DIRECT-FORM FILL LOOP → WORDFILL. The temp-less fill clang emits for word/half block clears:
 //   sX VAL,0(D) ; addi D,D,K ; bne D,END,→top   →  fill stride-K with VAL (3 instrs/iter).
-// rvcud_try_memset matches the addi-temp byte form; this matches the direct form (the ttf30 profile's
+// rvcud_try_memset matches the addi-temp byte form; this matches the direct form (profiled hot: a
 // sw-based fill at 2 dispatched uops/iter). VAL/END loop-invariant (VAL may be x0 = zero fill); D is
 // the only written register, so the closed form is exact. Consumes 3 words; weight 3/iteration.
 static int rvcud_try_wordfill(RvcudBuild& B, int w, uint32_t& ui) {
@@ -1344,8 +1274,8 @@ static int rvcud_try_wordfill(RvcudBuild& B, int w, uint32_t& ui) {
     return 3;
 }
 
-// COUNTED SEARCH LOOP → WORDSCAN. The lump-name-scan shape (W_CheckNumForName-style, ~15% of the
-// ttf30 profile's uop-execs at 4 dispatched uops/iter):
+// COUNTED SEARCH LOOP → WORDSCAN. The record-table scan shape (compare a key against fixed-stride
+// records; profiled at ~15% of uop-execs at 4 dispatched uops/iter):
 //   addi C,C,Kc ; addi P,P,Kp ; b<cc> C,Z,→EXIT(fwd) ; lw V,off(P) ; bne V,KEY,→top
 // → ONE native loop uop (params in g_ext: regs + strides + offset; exit-target baked into ext[e+2]
 // in Pass 3, fall-through in w1). Two exits with EXACT per-path weights: exit-branch iter retires 3,
@@ -1394,12 +1324,12 @@ static int rvcud_try_wordscan(RvcudBuild& B, int w, uint32_t& ui) {
     return 5;
 }
 
-// TEMP-ADVANCE STRIDED COPY → MELTCOL. The screen-melt column shape (5 dispatched uops/iter in the
-// ttf30 profile) — a strided copy whose src-advance goes through a TEMP, defeating COPYLOOPS:
+// TEMP-ADVANCE STRIDED COPY → COPYLOOPT. A strided column copy whose src-advance goes through a
+// TEMP, defeating COPYLOOPS (profiled hot at 5 dispatched uops/iter as 1:1 code):
 //   lX V,0(S) ; addi S2,S,Ks ; sX V,0(D) ; addi D,D,Kd ; mv S,S2 ; bne S2,LIM,→top
 // → ONE native loop uop (params in g_ext; strides signed 16-bit). All four written regs (V,S2,D,S)
 // reproduced exactly each iteration; LIM read-only. Matched by structure → generic. Consumes 6 words.
-static int rvcud_try_meltcol(RvcudBuild& B, int w, uint32_t& ui) {
+static int rvcud_try_copyloopt(RvcudBuild& B, int w, uint32_t& ui) {
     const int N = B.nwords; const uint32_t* img = B.img;
     if (w+6 >= N) return 0;                                          // 6 body words + a fall-through instr
     uint32_t i0=img[w],i1=img[w+1],i2=img[w+2],i3=img[w+3],i4=img[w+4],i5=img[w+5];
@@ -1430,7 +1360,7 @@ static int rvcud_try_meltcol(RvcudBuild& B, int w, uint32_t& ui) {
     B.ext.push_back((S&31)|((D&31)<<5)|((V&31)<<10)|((S2&31)<<15)|((LIM&31)<<20)|((lf3&7)<<25));
     B.ext.push_back(((uint32_t)Ks&0xFFFF) | (((uint32_t)Kd&0xFFFF)<<16));
     B.pc2uop[w]=ui;
-    B.w0.push_back(RC_MELTCOL | (e<<7));                              // ext base index in bits[31:7]
+    B.w0.push_back(RC_COPYLOOPT | (e<<7));                              // ext base index in bits[31:7]
     B.w1.push_back(0);                                               // fall-through baked in Pass 3 (full w1)
     B.uw.push_back(6); B.u2pc.push_back(B.base+(uint32_t)w*4); B.tgt.push_back((uint32_t)(w+6)); ui++;
     return 6;
@@ -1529,7 +1459,7 @@ static int rvcud_try_ldxs(RvcudBuild& B, int w, uint32_t& ui) {
 // INDEXED LOAD/STORE (virtual-register address). `add rt,ra,rb; lX rd,imm(rt)` (or a store) → ONE uop:
 // rd = mem[ra+rb+imm] / mem[ra+rb+imm] = rc. The address temp rt never reaches the shared regfile — it
 // lives only in a CUDA register inside the uop, cutting one shared write + one shared read (the regfile
-// is the per-uop bottleneck). Pervasive in Doom (every pointer+index access). Correct-by-construction:
+// is the per-uop bottleneck). Pervasive in compiled code (every pointer+index access). Correct-by-construction:
 // the load/store reads ra,rb (and rc) at their live-in values exactly as the original add+memop did.
 static int rvcud_try_ldx(RvcudBuild& B, int w, uint32_t& ui) {
     const int N = B.nwords; const uint32_t* img = B.img;
@@ -1560,8 +1490,8 @@ static int rvcud_try_ldx(RvcudBuild& B, int w, uint32_t& ui) {
 
 // POST-INCREMENT LOAD/STORE. `lb/lh/lw rd, 0(base); addi base,base,K` (or a store) → ONE uop that
 // does the memory op at 0(base) and writes base+K — the trailing pointer bump folded in, ARM ldr/str
-// post-increment style. Saves a uop per iteration in copy/scan/blit loops, which dominate Doom's hot
-// path (column blits, memcpy). Requires offset 0 (so w1 carries the increment), the addi to target the
+// post-increment style. Saves a uop per iteration in copy/scan/blit loops, which dominate blit-style hot
+// paths (column blits, memcpy). Requires offset 0 (so w1 carries the increment), the addi to target the
 // base reg, and for loads rd != base so the two writebacks are independent. Indirect jumps landing on
 // the absorbed addi are covered by translate-on-miss (its pc stays unmapped → re-translated 1:1).
 static int rvcud_try_postinc(RvcudBuild& B, int w, uint32_t& ui) {
@@ -1589,7 +1519,7 @@ static int rvcud_try_postinc(RvcudBuild& B, int w, uint32_t& ui) {
     return 2;
 }
 
-// SOFTWARE-MULTIPLY LOOP → MULLOOP. clang's rv32i shift-add multiply (the renderer's FixedMul) is a
+// SOFTWARE-MULTIPLY LOOP → MULLOOP. clang's rv32i shift-add software multiply (fixed-point multiply helpers) is a
 // 7-instruction loop, structurally (regs generalized M=multiplier, B=multiplicand, A=temp, ACC=accum):
 //   slli A,M,31; srli M,M,1; srai A,A,31; and A,A,B; add ACC,A,ACC; slli B,B,1; bne M,x0, →top
 // computing ACC += B*M over the bits of M. Replaced by ONE uop that does a hardware multiply and sets
@@ -1762,7 +1692,7 @@ static int rvcud_try_palexp(RvcudBuild& B, int w, uint32_t& ui) {
     return 14;
 }
 
-// TEXTURE-MAPPED SPAN LOOP → TEXSPAN. clang's R_DrawSpan inner loop (19 instructions):
+// TEXTURE-MAPPED SPAN LOOP → TEXSPAN. The texture-mapped span idiom (19 instructions):
 //   srli Yt,YPOS,shY; slli Xt,XPOS,shX1; lw CMAP,oC(BASE); lw TEX,oT(BASE); and Yt,Yt,MASK;
 //   srli Xt,Xt,shX2; add OFF,Yt,Xt; add TA,TEX,OFF; lbu PIDX,0(TA); add CA,CMAP,PIDX; lbu PIX,0(CA);
 //   sb PIX,0(DST); lw XS,oX(BASE); lw YS,oY(BASE); addi nD,DST,1; add XPOS,XS,XPOS; add YPOS,YS,YPOS;
@@ -1836,7 +1766,7 @@ static int rvcud_try_texspan(RvcudBuild& B, int w, uint32_t& ui) {
     return 19;
 }
 
-// TEXTURED-COLUMN LOOP → TEXCOL. clang's R_DrawColumn inner loop (12 instrs):
+// TEXTURED-COLUMN LOOP → TEXCOL. The textured-column idiom (12 instrs):
 //   lw TEX,oT(BASE); lw CMAP,oC(BASE); slli C,FRAC,sa; srli C,C,sb; add TA,TEX,C; lbu PIDX,0(TA);
 //   add CA,CMAP,PIDX; lbu PIX,0(CA); sb PIX,0(DST); addi DST,DST,STR; add FRAC,FRAC,STEP; bne DST,END,top
 // = vertical 1D textured column: pix=cmap[tex[(frac<<sa)>>sb]]; *dst=pix; dst+=STR; frac+=STEP. Params
@@ -1880,41 +1810,6 @@ static int rvcud_try_texcol(RvcudBuild& B, int w, uint32_t& ui) {
     return 12;
 }
 
-#if RVCUD_LOADFWD
-// STATIC REDUNDANT-LOAD ELIMINATION (#5). A load whose (base,offset,width,sign=f3) matches an EARLIER
-// load in the SAME basic block — with the base register unchanged and NO store between (conservative
-// alias kill) and the earlier dest still holding its value — is replaced by a register copy (ADDC rd,rA,0),
-// dropping the memory op. Sound: mem[base+off] is provably unchanged across the window, so the second
-// load reads identical bits → gate-identical (weight 1, same as the load it replaces). clang -O2 already
-// elides most of these, so EV is low; the flag exists to MEASURE the Doom hit-rate. Default OFF.
-static int rvcud_try_loadfwd(RvcudBuild& B, int w, uint32_t& ui) {
-    const uint32_t* img = B.img;
-    uint32_t i0 = img[w]; if ((i0 & 0x7F) != 0x03) return 0;
-    uint32_t f3 = (i0>>12)&7; if (!(f3==0||f3==1||f3==2||f3==4||f3==5)) return 0;
-    uint32_t rd = (i0>>7)&0x1F, rb = (i0>>15)&0x1F, off = rv_iimm(i0);
-    if (rd == 0 || B.leader[w]) return 0;                 // don't forward into a block entry (no dominance)
-    uint32_t redef = 0;                                   // registers written strictly between j and w
-    for (int j = w-1; j >= 0; j--) {
-        uint32_t in = img[j], op = in & 0x7F, jrd = (in>>7)&0x1F;
-        if (op == 0x23) return 0;                         // a store between → may alias the address → bail
-        if (op == 0x03 && ((in>>12)&7)==f3 && ((in>>15)&0x1F)==rb && rv_iimm(in)==off) {   // matching producer load
-            uint32_t rA = jrd;
-            if (rA != 0 && rA != rb && !((redef>>rA)&1u) && !((redef>>rb)&1u)) {            // rA still holds it; base stable
-                B.pc2uop[w] = ui;
-                B.w0.push_back(RCW0(RC_ADDC, rd, rA, 0, 0, 0, RP_UNC, 0));
-                B.w1.push_back(0); B.uw.push_back(1);
-                B.u2pc.push_back(B.base + (uint32_t)w*4); B.tgt.push_back(RC_NOTGT); ui++;
-                return 1;
-            }
-        }
-        if (op==0x6F || op==0x67 || op==0x73) return 0;   // call/jump/system between → not straight-line
-        if (jrd) { if (jrd == rb) return 0; redef |= (1u << jrd); }   // base reg changed before w → no stable producer
-        if (B.leader[j]) break;                           // reached this block's start
-    }
-    return 0;
-}
-#endif
-
 static void rvcud_build(RvcudBuild& B) {
     int N = B.nwords;
     // Pass 1 — leaders (any uop start) and xtargets (explicit foreign entries only).
@@ -1937,24 +1832,21 @@ static void rvcud_build(RvcudBuild& B) {
         int consumed = rvcud_try_mulloop(B, w, ui);                // shift-add software-multiply loop → 1 hw multiply
         if (consumed == 0) consumed = rvcud_try_divloop(B, w, ui);  // bit-serial software-divide loop → 1 hw divide
         if (consumed == 0) consumed = rvcud_try_palexp(B, w, ui);   // 8bpp→32bpp palette-expand loop → 1 native loop uop
-        if (consumed == 0) consumed = rvcud_try_texspan(B, w, ui);  // texture-mapped span loop (R_DrawSpan) → 1 native loop uop
-        if (consumed == 0) consumed = rvcud_try_texcol(B, w, ui);   // textured-column loop (R_DrawColumn) → 1 native loop uop
+        if (consumed == 0) consumed = rvcud_try_texspan(B, w, ui);  // texture-mapped span loop → 1 native loop uop
+        if (consumed == 0) consumed = rvcud_try_texcol(B, w, ui);   // textured-column loop → 1 native loop uop
         if (consumed == 0) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
         if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
         if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
         if (consumed == 0) consumed = rvcud_try_memset(B, w, ui);    // whole byte-fill (memset) loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_wordfill(B, w, ui);  // direct-form sX-fill loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_wordscan(B, w, ui);  // counted search loop → 1 native uop
-        if (consumed == 0) consumed = rvcud_try_meltcol(B, w, ui);   // temp-advance strided copy loop → 1 native uop
+        if (consumed == 0) consumed = rvcud_try_copyloopt(B, w, ui);   // temp-advance strided copy loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
         if (consumed == 0) consumed = rvcud_try_copyloops(B, w, ui); // whole strided copy loop → 1 native uop
         if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
         if (consumed == 0) consumed = rvcud_try_ldxs(B, w, ui);     // slli + add + load → scaled-indexed load (1 uop)
         if (consumed == 0) consumed = rvcud_try_ldx(B, w, ui);      // add + load/store → indexed mem op (1 uop)
         if (consumed == 0) consumed = rvcud_try_postinc(B, w, ui);  // load/store + base post-increment → 1 uop
-#if RVCUD_LOADFWD
-        if (consumed == 0) consumed = rvcud_try_loadfwd(B, w, ui);  // redundant load → register copy (no memory op)
-#endif
         if (consumed == 0) {
             B.pc2uop[w] = ui;
             uint32_t a0, a1, t; uint8_t wt;
@@ -1987,7 +1879,7 @@ static void rvcud_build(RvcudBuild& B) {
             uint32_t idx = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? (B.pc2uop[tw] & 0x003FFFFFu) : 0x003FFFFFu;
             B.w1[i] = (B.w1[i] & 0xFFC00000u) | idx;
         }
-        else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS || cls == RC_TEXCOL || cls == RC_MELTCOL) {  // w1 = full fall-through uop index (params in ext[])
+        else if (cls == RC_TEXSPAN || cls == RC_COPYLOOPS || cls == RC_TEXCOL || cls == RC_COPYLOOPT) {  // w1 = full fall-through uop index (params in ext[])
             uint32_t tw = B.tgt[i];
             B.w1[i] = ((int)tw < N && B.pc2uop[tw] != RC_BADUOP) ? B.pc2uop[tw] : 0xFFFFFFFFu;
         }
@@ -2272,7 +2164,7 @@ static inline bool rvx_compilable(uint32_t op){
 
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
-// linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, the 24000-word Doom set):
+// linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
 //   - ONE .entry, one 21611-target brx.idx (the old monolith): 1.38 GB — but on a knife edge: ANY
 //     perturbation (+3 instructions, or splitting the brx into 4 in the same entry) → 12-25 GB.
 //   - K .funcs in ONE unit: ~12 GB regardless of K (whole-module .func analysis, ~0.5 MB per target).
@@ -2463,8 +2355,31 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
     (void)ptx; (void)cubin; return -1;
 #endif
 }
+// 64-bit FNV-1a over all unit PTX — the key for the linked-cubin disk cache below.
+static unsigned long long rvx_units_hash(const std::vector<std::string>& units) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (const auto& u : units) for (unsigned char c : u) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
 static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod, CUfunction* fn) {
     const int verbose = getenv("RVX_STATS") ? 1 : 0;
+    // Linked-cubin disk cache: the out-of-process ptxas path bypasses the driver's JIT cache, so without
+    // this EVERY process start re-assembles all regions (~20-30 s for a full ~109k-word guest image). On a content
+    // hash hit the linked cubin loads directly — zero ptxas spawns, zero linking.
+    char cpath[300] = {0};
+#ifdef _WIN32
+    { char dir[MAX_PATH]; if (GetTempPathA(sizeof dir, dir))
+        snprintf(cpath, sizeof cpath, "%srvcud_xblk_%016llx.cubin", dir, rvx_units_hash(units)); }
+    if (cpath[0]) if (FILE* cf = fopen(cpath, "rb")) {
+        fseek(cf, 0, SEEK_END); long sz = ftell(cf); fseek(cf, 0, SEEK_SET);
+        std::vector<char> blob((size_t)(sz > 0 ? sz : 0));
+        bool ok = sz > 0 && fread(blob.data(), 1, (size_t)sz, cf) == (size_t)sz; fclose(cf);
+        if (ok && cuModuleLoadData(mod, blob.data()) == CUDA_SUCCESS) {
+            if (cuModuleGetFunction(fn, *mod, "xk") == CUDA_SUCCESS) return 0;
+            cuModuleUnload(*mod);
+        }                                                    // unreadable/stale → fall through and rebuild
+    }
+#endif
     char log[8192]; log[0]=0;
     std::vector<char> ilog(1<<16); ilog[0]=0;
     CUjit_option opt[] = { CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
@@ -2488,6 +2403,7 @@ static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod,
     if (r != CUDA_SUCCESS) {
         fprintf(stderr,"[xblk] link: %d %s\n", (int)r, log); cuLinkDestroy(ls); return -3; }
     if (verbose && ilog[0]) fprintf(stderr,"[xblk] link info log:\n%s\n", ilog.data());
+    if (cpath[0]) if (FILE* cf = fopen(cpath, "wb")) { fwrite(cubin, 1, csz, cf); fclose(cf); }  // populate the disk cache
     r = cuModuleLoadData(mod, cubin);                        // cubin owned by ls — load before destroy
     cuLinkDestroy(ls);
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] module load: %d\n",(int)r); return (int)r; }
@@ -2498,8 +2414,8 @@ static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod,
 // Build the exec_block from the live (statically-translated) image. Compiles up to RVX_MAXW
 // reachable+compilable words (env RVX_MAXW overrides). Single-core only (linear memory ⇒ byte addr ==
 // %M + a). The old 24000-word cap existed only for the single-function ptxas memory knee; with per-unit
-// out-of-process assembly the limit is gone — default to full coverage (Doom: 108650 words, 19 regions,
-// ~1.3 GB per ptxas child, ~1.4 GB in-process; ttf30 15.5 → 27 MIPS, coverage WAS the bottleneck).
+// out-of-process assembly the limit is gone — default to full coverage (measured guest image: 108650 words, 19 regions,
+// ~1.3 GB per ptxas child, ~1.4 GB in-process; guest bench 15.5 → 27 MIPS, coverage WAS the bottleneck).
 #ifndef RVX_MAXW
 #define RVX_MAXW (1<<20)
 #endif
@@ -2615,7 +2531,7 @@ API int cuda_rvexec_selftest() {
 
 // Offline end-to-end validation of the exec_block machine on a self-contained synthetic guest —
 // exercises reg load/save, addi/add, a BACKWARD loop branch (budget-gated XDISP path), byte-wise
-// sw+lw, and the system hand-off — WITHOUT touching Doom's context. Returns 1 on PASS.
+// sw+lw, and the system hand-off — WITHOUT touching the live guest context. Returns 1 on PASS.
 //   x3=10; x1=0; x2=0; loop: x1+=x2; x2++; if(x2<x3) loop; mem[0x40]=x1; x4=mem[0x40]; ebreak
 //   expect x1==45, x2==10, x4==45, pc==ebreak.
 API int cuda_rvexec_blocktest() {
@@ -2840,7 +2756,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
 // Differential fuzz #3: models the REAL hybrid (exec_block runs compiled words; an interpreter — here
 // rvx_ref_step — owns everything uncompiled), with a RANDOM ~70% compiled subset so interior gaps,
 // fall-through hand-offs, and re-entry via brx.idx are all exercised. Compares the hybrid's final state
-// against a pure reference run. This is the exact failure shape Doom hits. Returns # of FAILING programs.
+// against a pure reference run. This is the exact failure shape large guest images hit. Returns # of FAILING programs.
 API int cuda_rvexec_fuzz3(int seed, int nprog) {
     cudaFree(0); cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
