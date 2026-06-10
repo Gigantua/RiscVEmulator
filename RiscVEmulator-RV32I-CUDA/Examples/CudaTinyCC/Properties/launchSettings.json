@@ -1,6 +1,14 @@
 {
   "profiles": {
-    "Examples.CudaTinyCC": {
+    "JIT (rvcud)": {
+      "commandName": "Project",
+      "commandLineArgs": "--rvcud"
+    },
+    "JIT + profile": {
+      "commandName": "Project",
+      "commandLineArgs": "--prof"
+    },
+    "Base kernel": {
       "commandName": "Project",
       "commandLineArgs": ""
     }
