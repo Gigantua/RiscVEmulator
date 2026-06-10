@@ -2522,6 +2522,41 @@ static bool rvx_match_divloop(const uint32_t* img, int Nw, uint32_t base, int w,
     return true;
 }
 
+// Shift-add software-multiply loop shape (mirror of rvcud_try_mulloop):
+//   slli A,M,31; srli M,M,1; srai A,A,31; and A,A,B; add ACC,A,ACC; slli B,B,1; bne M,x0,→top
+// computing ACC += B*M. Replaced straight-line by ONE mul.lo (knee-light at the current region
+// size). The closed form is valid from ANY entry state, so no precondition test is needed; the
+// data-dependent retire (7/iter, it = M ? 32-clz(M) : 1) is computed with clz. Final state mirrors
+// the interpreter's RC_MULLOOP arm: ACC += B0*M0; M=0; B=B0<<it (PTX shl clamps ≥32 to 0, matching);
+// A = M0 ? B0<<(it-1) : 0.
+struct RvxMul { uint32_t A,M,B,ACC; };
+static bool rvx_match_mulloop(const uint32_t* img, int Nw, uint32_t base, int w, RvxMul& o) {
+    if (w+7 >= Nw) return false;
+    const uint32_t* i = img + w;
+    if ((i[0]&0x7F)!=0x13 || ((i[0]>>12)&7)!=1 || ((i[0]>>20)&0x1F)!=31) return false;
+    uint32_t A=(i[0]>>7)&0x1F, M=(i[0]>>15)&0x1F;
+    if ((i[1]&0x7F)!=0x13 || ((i[1]>>12)&7)!=5 || ((i[1]>>30)&1)!=0 || ((i[1]>>20)&0x1F)!=1
+        || ((i[1]>>7)&0x1F)!=M || ((i[1]>>15)&0x1F)!=M) return false;
+    if ((i[2]&0x7F)!=0x13 || ((i[2]>>12)&7)!=5 || ((i[2]>>30)&1)!=1 || ((i[2]>>20)&0x1F)!=31
+        || ((i[2]>>7)&0x1F)!=A || ((i[2]>>15)&0x1F)!=A) return false;
+    if ((i[3]&0x7F)!=0x33 || ((i[3]>>25)&0x7F)!=0 || ((i[3]>>12)&7)!=7 || ((i[3]>>7)&0x1F)!=A) return false;
+    uint32_t s1=(i[3]>>15)&0x1F, s2=(i[3]>>20)&0x1F, Bb;
+    if (s1==A) Bb=s2; else if (s2==A) Bb=s1; else return false;
+    if ((i[4]&0x7F)!=0x33 || ((i[4]>>25)&0x7F)!=0 || ((i[4]>>12)&7)!=0) return false;
+    uint32_t ACC=(i[4]>>7)&0x1F, a1=(i[4]>>15)&0x1F, a2=(i[4]>>20)&0x1F;
+    if (!((a1==A && a2==ACC) || (a2==A && a1==ACC))) return false;
+    if ((i[5]&0x7F)!=0x13 || ((i[5]>>12)&7)!=1 || ((i[5]>>20)&0x1F)!=1
+        || ((i[5]>>7)&0x1F)!=Bb || ((i[5]>>15)&0x1F)!=Bb) return false;
+    if ((i[6]&0x7F)!=0x63 || ((i[6]>>12)&7)!=1) return false;
+    uint32_t b1=(i[6]>>15)&0x1F, b2=(i[6]>>20)&0x1F;
+    if (!((b1==M && b2==0) || (b2==M && b1==0))) return false;
+    uint32_t bpc=base+(uint32_t)(w+6)*4;
+    if ((int)((bpc + rv_bimm(i[6]) - base) >> 2) != w) return false;
+    if (A==0||M==0||Bb==0||ACC==0 || A==M||A==Bb||A==ACC||M==Bb||M==ACC||Bb==ACC) return false;
+    o.A=A; o.M=M; o.B=Bb; o.ACC=ACC;
+    return true;
+}
+
 // Byte-copy loop shape: lb/lbu RT,0(S); sb RT,0(D); addi D,D,1; addi S,S,1; bne D,END,→top
 // (the two addis in either order). This is the present-path screen copy in the boot/menu workload
 // (~24% of guest-pc samples, 64000 iterations per frame). Replaced by a CALL into the tiny dedicated
@@ -2661,11 +2696,13 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
     // state than the per-instruction path, so the exits must be reset points.
-    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0);
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0);
     int ncpy = 0;
-    { RvxDiv dr; RvxCpy cr;
+    { RvxDiv dr; RvxCpy cr; RvxMul mr;
       for (int w=0; w+13 < N; w++)
           if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
+      for (int w=0; w+7 < N; w++)
+          if (comp[w] && rvx_match_mulloop(img, N, base, w, mr)) { mulhit[w] = 1; targ[w+7] = 1; }
       if (nc == 1)
           for (int w=0; w+5 < N; w++)
               if (comp[w] && rvx_match_copyloop(img, N, base, w, cr)) { cpyhit[w] = 1; targ[w+5] = 1; ncpy++; } }
@@ -2750,6 +2787,25 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 rvx_app(ptx, "bra L%u;\n", base+(w+13)*4);
                 rvx_app(ptx, "DORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();                                  // the test clobbered scratch state
+            }
+            // Software-multiply loop → ONE mul.lo, straight-line, valid from ANY entry state (the
+            // loop's effect from the header is ACC += B·M over current values). Exact final state
+            // and exact data-dependent retire: 7/iter, it = M ? 32-clz(M) : 1 (do-while ≥1).
+            else if (mulhit[w] && (int)w+7 < N && regof[w+7]==r && comp[w+7]) {
+                RvxMul M0; rvx_match_mulloop(img, N, base, (int)w, M0);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "clz.b32 %%t0, %%x%u;\nsub.u32 %%t0, 32, %%t0;\n"
+                             "setp.eq.u32 %%p0, %%x%u, 0;\n@%%p0 mov.b32 %%t0, 1;\n", M0.M, M0.M);
+                ptx += "mul.lo.u32 %t1, %t0, 7;\nadd.s32 %cnt, %cnt, %t1;\n";
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%x%u, %%x%u;\nadd.u32 %%x%u, %%x%u, %%t1;\n",
+                             M0.B, M0.M, M0.ACC, M0.ACC);
+                rvx_app(ptx, "sub.u32 %%t1, %%t0, 1;\nshl.b32 %%t1, %%x%u, %%t1;\n@%%p0 mov.b32 %%t1, 0;\n", M0.B);
+                rvx_app(ptx, "shl.b32 %%t2, %%x%u, %%t0;\n", M0.B);
+                rvx_app(ptx, "mov.b32 %%x%u, %%t1;\nmov.b32 %%x%u, %%t2;\nmov.b32 %%x%u, 0;\n",
+                             M0.A, M0.B, M0.M);
+                rvx_app(ptx, "bra L%u;\n", base+(w+7)*4);
+                rvx_app(ptx, "MORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
             }
             // Byte-copy loop → xcopy call (word-widened). Guards route to the kept original loop:
             // len==0 (the do-while would wrap 2^32 — pathological, keep original semantics), forward
