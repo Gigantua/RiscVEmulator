@@ -828,6 +828,44 @@ API int  cuda_rv32i_iodrain() {
     return (int)cudaDeviceSynchronize();
 }
 
+// ── Pipelined framebuffer fetch ─────────────────────────────────────────────
+// snap(): D2D-snapshot the guest framebuffer into a staging buffer ON THE MAIN STREAM (FIFO order
+// makes it race-free: it runs after this batch's drain and before the next batch's kernel), then an
+// event-gated async D2H on a second stream copies it into a pinned double buffer WHILE the next
+// kernel runs. wait(): block on the OTHER slot (normally long done) and memcpy it out — the host
+// thus reads each frame one batch late, with the PCIe copy fully hidden under guest execution.
+static void*        g_fbstage = nullptr;  static size_t g_fbstage_sz = 0;
+static void*        g_fbpin[2] = {};      static size_t g_fbpin_sz = 0;
+static cudaStream_t g_fbs = nullptr;
+static cudaEvent_t  g_fbev = nullptr, g_fbdone[2] = {};
+API int cuda_rv32i_fb_snap(unsigned int addr, unsigned int len, int slot) {
+    if (g_ncores != 1) return -1;
+    slot &= 1;
+    if (len > g_fbstage_sz) { if (g_fbstage) cudaFree(g_fbstage);
+        if (cudaMalloc(&g_fbstage, len) != cudaSuccess) { g_fbstage = nullptr; g_fbstage_sz = 0; return -2; }
+        g_fbstage_sz = len; }
+    if (len > g_fbpin_sz) { for (int i = 0; i < 2; i++) { if (g_fbpin[i]) cudaFreeHost(g_fbpin[i]);
+        if (cudaHostAlloc(&g_fbpin[i], len, 0) != cudaSuccess) { g_fbpin[i] = nullptr; g_fbpin_sz = 0; return -3; }
+        memset(g_fbpin[i], 0, len); } g_fbpin_sz = len; }
+    if (!g_fbs) { cudaStreamCreateWithFlags(&g_fbs, cudaStreamNonBlocking);
+                  cudaEventCreateWithFlags(&g_fbev, cudaEventDisableTiming);
+                  for (int i = 0; i < 2; i++) cudaEventCreateWithFlags(&g_fbdone[i], cudaEventDisableTiming); }
+    cudaStreamWaitEvent(0, g_fbdone[slot ^ 1], 0);     // don't overwrite the stage while its D2H is in flight
+    cudaMemcpyAsync(g_fbstage, (uint8_t*)g_mem + addr, len, cudaMemcpyDeviceToDevice, 0);
+    cudaEventRecord(g_fbev, 0);
+    cudaStreamWaitEvent(g_fbs, g_fbev, 0);
+    cudaMemcpyAsync(g_fbpin[slot], g_fbstage, len, cudaMemcpyDeviceToHost, g_fbs);
+    cudaEventRecord(g_fbdone[slot], g_fbs);
+    return 0;
+}
+API int cuda_rv32i_fb_wait(int slot, void* dst, unsigned int len) {
+    slot &= 1;
+    if (!g_fbpin[slot] || len > g_fbpin_sz) return -1;
+    cudaEventSynchronize(g_fbdone[slot]);              // never-recorded events report complete (cold start: zeros)
+    memcpy(dst, g_fbpin[slot], len);
+    return 0;
+}
+
 API int cuda_rv32i_step_all(int budget) {
     if (g_ncores <= 0) return 0;
     // Small (2-warp) blocks: at modest core counts this spreads work across many

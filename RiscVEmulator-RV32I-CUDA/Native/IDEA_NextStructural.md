@@ -98,3 +98,5 @@ bit-identical throughout; f1 = 60,589 px pixel-exact; f40 clean.
 | h3 | Staged-MMIO mailbox: pinned page + on-stream stage/drain micro-kernels replace ~12 sync memcpys/StepN | 105.2 → **110.7–115.5** | KEPT — host gap 132 → ~68 ms; subagent's top recommendation. CUDA-graphics interop evaluated and DROPPED (zero benchmark gain, SDL2 has no public D3D texture access). |
 | r2 | Budget-count batching, retried at 122 MIPS kernel | 112.0 vs 111.8 | REVERTED (tie again) — %cnt adds stay hidden even now |
 | r3 | Branch-free funnel lw (2 overlapping aligned loads + shf.r, +8 B buffer guard) for alignment-unproven flat-layout loads | **120.5 vs 112.2 (+7.4%)** | KEPT — wins all pairs; replaces the ~14-instr predicated checked path with 9 branch-free instrs, loads issue independently |
+| r4 | Funnel load extended to lh/lhu | 112.5 vs 109.3 | KEPT (+~3%, all pairs) |
+| r5 | Pipelined FB fetch: D2D snapshot (FIFO-safe on stream 0) + event-gated async D2H to pinned double buffer overlapping the next kernel; host consumes one batch late | **~119-125** | KEPT — the reshaped, race-free version of the user's stream/double-buffer idea; also removes the SDL live-buffer tear |

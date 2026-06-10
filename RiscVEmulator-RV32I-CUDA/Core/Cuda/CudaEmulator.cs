@@ -44,6 +44,10 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern IntPtr cuda_rv32i_iobox();
         [DllImport(Lib)] private static extern void   cuda_rv32i_iostage();
         [DllImport(Lib)] private static extern int    cuda_rv32i_iodrain();
+        // Pipelined framebuffer fetch: snap = race-free D2D snapshot + async D2H into a pinned double
+        // buffer (overlaps the NEXT kernel); wait = consume the previous batch's frame.
+        [DllImport(Lib)] private static extern int cuda_rv32i_fb_snap(uint addr, uint len, int slot);
+        [DllImport(Lib)] private static extern int cuda_rv32i_fb_wait(int slot, byte[] dst, uint len);
         public ulong RvcudIters => cuda_rvcud_iters();
 
         // ── Guest memory map (host-side device layout inside the flat buffer) ──
@@ -115,6 +119,8 @@ namespace RiscVEmulator.Core.Cuda
         private int  _exitCode;
         private bool  _boxInit;
         private uint* _box;          // pinned staged-MMIO mailbox (null → legacy memcpy path / multi-core)
+        private int   _fbSlot;       // pipelined-FB double-buffer toggle
+        private bool  _fbPipeOk = true;
 
         public bool DeterministicTime { get; set; }
         private ulong _totalSteps;
@@ -408,10 +414,15 @@ namespace RiscVEmulator.Core.Cuda
             uint vsync = _box[58], fbAddr = _box[59];
             if (vsync != 0) { Display.Write(0x0C, 4, vsync); _box[34] = 1; _box[58] = 0; }
             int fbLen = Math.Min(_fbBytes, Framebuffer.PresentedPixels.Length);
-            if (fbAddr != 0 && fbAddr < (uint)RamBytes)
-                cuda_rv32i_read_mem(CoreId, Framebuffer.PresentedPixels, fbAddr, (uint)fbLen);
-            else
-                cuda_rv32i_read_mem(CoreId, Framebuffer.PresentedPixels, FB_BASE, (uint)fbLen);
+            uint src = (fbAddr != 0 && fbAddr < (uint)RamBytes) ? fbAddr : FB_BASE;
+            // Pipelined fetch: this batch's frame copies under the NEXT kernel; consume the previous
+            // batch's (one-batch display lag ≈ 2 ms). Falls back to the sync read on any failure.
+            if (_fbPipeOk && cuda_rv32i_fb_snap(src, (uint)fbLen, _fbSlot) == 0)
+            {
+                cuda_rv32i_fb_wait(_fbSlot ^ 1, Framebuffer.PresentedPixels, (uint)fbLen);
+                _fbSlot ^= 1;
+            }
+            else { _fbPipeOk = false; cuda_rv32i_read_mem(CoreId, Framebuffer.PresentedPixels, src, (uint)fbLen); }
         }
 
         private void DrainMidiRing(uint wr)
