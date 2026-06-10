@@ -2585,6 +2585,49 @@ static bool rvx_match_copyloop(const uint32_t* img, int Nw, uint32_t base, int w
     return true;
 }
 
+// Fill loop shapes (mirrors of rvcud_try_memset / rvcud_try_wordfill), both replaced by a CALL into
+// the tiny dedicated `xfill` unit (pattern-replicated word fill; knee-ISOLATED like xcopy) plus the
+// exact closed form D(/nD)=END:
+//   form A (4 instrs/iter): addi nD,D,1 ; sb VAL,0(D) ; mv D,nD ; bne nD,END,→top
+//   form B (3 instrs/iter): sb/sh/sw VAL,0(D) ; addi D,D,K ; bne D,END,→top — CONTIGUOUS only
+//     (K == 1<<f3); strided fills keep the original loop.
+struct RvxFill { uint32_t D,VAL,END,ND,f3; int nw; };   // ND=0 for form B; nw = words consumed
+static bool rvx_match_fillloop(const uint32_t* img, int Nw, uint32_t base, int w, RvxFill& o) {
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    const uint32_t* i = img + w;
+    if (w+4 < Nw && (i[0]&0x7F)==0x13 && F3(i[0])==0 && (int32_t)rv_iimm(i[0])==1) {   // form A
+        uint32_t nD=RD(i[0]), D=S1(i[0]);
+        if (nD && D && nD!=D
+            && (i[1]&0x7F)==0x23 && F3(i[1])==0 && S1(i[1])==D && rv_simm(i[1])==0
+            && (i[2]&0x7F)==0x13 && F3(i[2])==0 && RD(i[2])==D && S1(i[2])==nD && rv_iimm(i[2])==0
+            && (i[3]&0x7F)==0x63 && F3(i[3])==1) {
+            uint32_t VAL=S2(i[1]), b1=S1(i[3]), b2=S2(i[3]);
+            uint32_t END = (b1==nD) ? b2 : (b2==nD) ? b1 : 0xFFu;
+            uint32_t bpc = base+(uint32_t)(w+3)*4;
+            if (END!=0xFFu && END!=0 && (int)((bpc+rv_bimm(i[3])-base)>>2)==w
+                && VAL!=D && VAL!=nD && END!=D && END!=nD && VAL!=END) {
+                o.D=D; o.VAL=VAL; o.END=END; o.ND=nD; o.f3=0; o.nw=4; return true;
+            }
+        }
+    }
+    if (w+3 < Nw && (i[0]&0x7F)==0x23 && F3(i[0])<=2 && rv_simm(i[0])==0) {            // form B
+        uint32_t f3=F3(i[0]), D=S1(i[0]), VAL=S2(i[0]);
+        if (D!=0 && VAL!=D
+            && (i[1]&0x7F)==0x13 && F3(i[1])==0 && RD(i[1])==D && S1(i[1])==D
+            && (int32_t)rv_iimm(i[1])==(int32_t)(1u<<f3)
+            && (i[2]&0x7F)==0x63 && F3(i[2])==1) {
+            uint32_t b1=S1(i[2]), b2=S2(i[2]);
+            uint32_t END = (b1==D) ? b2 : (b2==D) ? b1 : 0xFFu;
+            uint32_t bpc = base+(uint32_t)(w+2)*4;
+            if (END!=0xFFu && END!=0 && END!=D && (int)((bpc+rv_bimm(i[2])-base)>>2)==w) {
+                o.D=D; o.VAL=VAL; o.END=END; o.ND=0; o.f3=f3; o.nw=3; return true;
+            }
+        }
+    }
+    return false;
+}
+
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
 // linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
@@ -2696,20 +2739,24 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
     // state than the per-instruction path, so the exits must be reset points.
-    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0);
-    int ncpy = 0;
-    { RvxDiv dr; RvxCpy cr; RvxMul mr;
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0);
+    int ncpy = 0, nfill = 0;
+    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr;
       for (int w=0; w+13 < N; w++)
           if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
       for (int w=0; w+7 < N; w++)
           if (comp[w] && rvx_match_mulloop(img, N, base, w, mr)) { mulhit[w] = 1; targ[w+7] = 1; }
-      if (nc == 1)
+      if (nc == 1) {
           for (int w=0; w+5 < N; w++)
-              if (comp[w] && rvx_match_copyloop(img, N, base, w, cr)) { cpyhit[w] = 1; targ[w+5] = 1; ncpy++; } }
+              if (comp[w] && rvx_match_copyloop(img, N, base, w, cr)) { cpyhit[w] = 1; targ[w+5] = 1; ncpy++; }
+          for (int w=0; w+3 < N; w++)
+              if (comp[w] && rvx_match_fillloop(img, N, base, w, fr)) { fillhit[w] = (uint8_t)fr.nw; targ[w+fr.nw] = 1; nfill++; }
+      } }
     if (getenv("RVX_STATS") && ncpy) fprintf(stderr, "[xblk] copyloop sites: %d\n", ncpy);
+    if (getenv("RVX_STATS") && nfill) fprintf(stderr, "[xblk] fillloop sites: %d\n", nfill);
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    units.assign(1+K + (ncpy ? 1 : 0), std::string());
+    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0), std::string());
     // ── xcopy unit (knee-ISOLATED: assembles alone in microseconds). Word-widened forward byte copy:
     //    byte head until DST is 4-aligned, then a funnel-shift body (the +8 B buffer guard covers the
     //    high word of an unaligned source), then a byte tail. Callers guarantee n ≥ 1 and NO forward
@@ -2736,6 +2783,29 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               "add.u64 %s, %s, 1;\nadd.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra CT;\n"
               "CE:\nret;\n}\n";
     }
+    // ── xfill unit (knee-ISOLATED, same playbook). Fills n bytes at d with the 32-bit pattern v,
+    //    which the call site pre-replicates to word width (so byte (a&3) of v is the right byte for
+    //    ANY address a — callers guarantee d ≡ 0 mod the element width, and width divides 4): byte
+    //    head until d is 4-aligned, word body, byte tail.
+    if (nfill) {
+        std::string& xf = units[1+K + (ncpy ? 1 : 0)];
+        xf  = hdr;
+        xf += ".visible .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn)\n{\n"
+              ".reg .b64 %d;\n.reg .b32 %n,%v,%t,%sh;\n.reg .pred %q;\n"
+              "ld.param.u64 %d,[pd];\nld.param.u32 %v,[pv];\nld.param.u32 %n,[pn];\n"
+              "FH:\nsetp.eq.u32 %q, %n, 0;\n@%q bra FE;\n"
+              "cvt.u32.u64 %t, %d;\nand.b32 %t, %t, 3;\nsetp.eq.u32 %q, %t, 0;\n@%q bra FB;\n"
+              "shl.b32 %sh, %t, 3;\nshr.u32 %t, %v, %sh;\nst.global.u8 [%d], %t;\n"
+              "add.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra FH;\n"
+              "FB:\nsetp.lt.u32 %q, %n, 4;\n@%q bra FT;\n"
+              "FL:\nst.global.u32 [%d], %v;\nadd.u64 %d, %d, 4;\nsub.u32 %n, %n, 4;\n"
+              "setp.ge.u32 %q, %n, 4;\n@%q bra FL;\n"
+              "FT:\nsetp.eq.u32 %q, %n, 0;\n@%q bra FE;\n"
+              "cvt.u32.u64 %t, %d;\nand.b32 %t, %t, 3;\nshl.b32 %sh, %t, 3;\n"
+              "shr.u32 %t, %v, %sh;\nst.global.u8 [%d], %t;\n"
+              "add.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra FT;\n"
+              "FE:\nret;\n}\n";
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -2745,6 +2815,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx  = hdr;
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
         if (ncpy) ptx += ".extern .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn);\n";
+        if (nfill) ptx += ".extern .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
         ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss;\n.reg .b32 %x<32>,%t0,%t1,%t2,%pc,%budget,%cnt;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
@@ -2836,6 +2907,42 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                              C0.S, C0.S, C0.D, C0.END);
                 rvx_app(ptx, "bra L%u;\n", base+(w+5)*4);
                 rvx_app(ptx, "CPORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
+            }
+            // Fill loop → xfill call (pattern pre-replicated to a 32-bit word). Guards route to the
+            // kept original loop: len==0 (the do-while would wrap 2^32), wild lengths (>16 M, bound
+            // the atomic retire), and for form B widths >1: len not a multiple of the element width
+            // (the guest loop would never terminate) or D misaligned vs the width (the byte-phase
+            // replication trick needs D ≡ 0 mod width). Exact closed form after the call: retire
+            // 4·len (form A) or 3·(len>>f3) (form B), D = END (form A also nD = END); VAL/END are
+            // loop-invariant.
+            else if (fillhit[w] && (int)w+fillhit[w] < N && regof[w+fillhit[w]]==r && comp[w+fillhit[w]]) {
+                RvxFill F0; rvx_match_fillloop(img, N, base, (int)w, F0);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"                      // len = END - D
+                             "setp.eq.u32 %%p0, %%t0, 0;\n"
+                             "setp.gt.u32 %%p1, %%t0, 16777216;\nor.pred %%p0, %%p0, %%p1;\n",
+                             F0.END, F0.D);
+                if (F0.f3)
+                    rvx_app(ptx, "or.b32 %%t1, %%x%u, %%t0;\nand.b32 %%t1, %%t1, %u;\n"
+                                 "setp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                                 F0.D, (1u<<F0.f3)-1u);
+                rvx_app(ptx, "@%%p0 bra FIORIG%u;\n", pc);
+                if (F0.nw==4)        ptx += "shl.b32 %t1, %t0, 2;\nadd.s32 %cnt, %cnt, %t1;\n";
+                else if (F0.f3==0)   ptx += "mul.lo.u32 %t1, %t0, 3;\nadd.s32 %cnt, %cnt, %t1;\n";
+                else { rvx_app(ptx, "shr.u32 %%t1, %%t0, %u;\n", F0.f3);
+                       ptx += "mul.lo.u32 %t1, %t1, 3;\nadd.s32 %cnt, %cnt, %t1;\n"; }
+                if (F0.f3==0)        rvx_app(ptx, "and.b32 %%t2, %%x%u, 255;\nmul.lo.u32 %%t2, %%t2, 16843009;\n", F0.VAL);
+                else if (F0.f3==1)   rvx_app(ptx, "and.b32 %%t2, %%x%u, 65535;\nmul.lo.u32 %%t2, %%t2, 65537;\n", F0.VAL);
+                else                 rvx_app(ptx, "mov.b32 %%t2, %%x%u;\n", F0.VAL);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n", F0.D);
+                ptx += "{ .param .b64 pd; .param .b32 pv; .param .b32 pn;\n"
+                       "st.param.b64 [pd], %a0;\nst.param.b32 [pv], %t2;\nst.param.b32 [pn], %t0;\n"
+                       "call.uni xfill, (pd, pv, pn);\n}\n";
+                rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", F0.D, F0.END);
+                if (F0.ND) rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", F0.ND, F0.END);
+                rvx_app(ptx, "bra L%u;\n", base+(w+(uint32_t)F0.nw)*4);
+                rvx_app(ptx, "FIORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();
             }
             else rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
