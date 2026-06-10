@@ -2628,6 +2628,69 @@ static bool rvx_match_fillloop(const uint32_t* img, int Nw, uint32_t base, int w
     return false;
 }
 
+// Palette-expand loop shape (mirror of rvcud_try_palexp — see that matcher for the per-instruction
+// commentary; 14 instrs/iter, the present-path RGBA expansion at 64000 iterations/frame):
+//   lbu IDX,0(SRC); addi SRC,SRC,1; slli T,IDX,1; add P,PAL,IDX; add P,P,T; lbu C0,0(P);
+//   sb C0,-3(DST); lbu C1,1(P); sb C1,-2(DST); lbu C2,2(P); sb C2,-1(DST); sb ALPHA,0(DST);
+//   addi DST,DST,4; bne SRC,END,→top
+// Replaced by a CALL into the tiny dedicated `xpal` unit (one word store per pixel; knee-ISOLATED —
+// the r11/r13 INLINE emissions of this loop tripped the ptxas knee, the xcopy-style unit does not)
+// plus the exact closed form: SRC=END, DST+=4n, temps re-derived from the last pixel in guest write
+// order. STRICTER than the interpreter matcher: all 11 registers pairwise distinct and nonzero, so
+// the closed form is exact with no aliasing analysis.
+struct RvxPal { uint32_t SRC,DST,PAL,END,ALPHA,IDX,T,P,C0,C1,C2; };
+static bool rvx_match_palexp(const uint32_t* img, int Nw, uint32_t base, int w, RvxPal& o) {
+    if (w+14 >= Nw) return false;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;};
+    const uint32_t* i = img + w;
+    if ((i[0]&0x7F)!=0x03 || F3(i[0])!=4 || rv_iimm(i[0])!=0) return false;          // lbu IDX,0(SRC)
+    uint32_t IDX=RD(i[0]), SRC=S1(i[0]);
+    if ((i[1]&0x7F)!=0x13 || F3(i[1])!=0 || RD(i[1])!=SRC || S1(i[1])!=SRC || rv_iimm(i[1])!=1) return false;
+    if ((i[2]&0x7F)!=0x13 || F3(i[2])!=1 || S1(i[2])!=IDX || S2(i[2])!=1) return false;   // slli T,IDX,1
+    uint32_t T=RD(i[2]);
+    if ((i[3]&0x7F)!=0x33 || F3(i[3])!=0 || F7(i[3])!=0) return false;               // add P,PAL,IDX
+    uint32_t P=RD(i[3]), PAL;
+    if (S1(i[3])==IDX) PAL=S2(i[3]); else if (S2(i[3])==IDX) PAL=S1(i[3]); else return false;
+    if ((i[4]&0x7F)!=0x33 || F3(i[4])!=0 || F7(i[4])!=0 || RD(i[4])!=P) return false;     // add P,P,T
+    if (!((S1(i[4])==P&&S2(i[4])==T)||(S1(i[4])==T&&S2(i[4])==P))) return false;
+    if ((i[5]&0x7F)!=0x03 || F3(i[5])!=4 || S1(i[5])!=P || rv_iimm(i[5])!=0) return false;
+    uint32_t C0=RD(i[5]);
+    if ((i[6]&0x7F)!=0x23 || F3(i[6])!=0 || S2(i[6])!=C0 || (int32_t)rv_simm(i[6])!=-3) return false;
+    uint32_t DST=S1(i[6]);
+    if ((i[7]&0x7F)!=0x03 || F3(i[7])!=4 || S1(i[7])!=P || rv_iimm(i[7])!=1) return false;
+    uint32_t C1=RD(i[7]);
+    if ((i[8]&0x7F)!=0x23 || F3(i[8])!=0 || S1(i[8])!=DST || S2(i[8])!=C1 || (int32_t)rv_simm(i[8])!=-2) return false;
+    if ((i[9]&0x7F)!=0x03 || F3(i[9])!=4 || S1(i[9])!=P || rv_iimm(i[9])!=2) return false;
+    uint32_t C2=RD(i[9]);
+    if ((i[10]&0x7F)!=0x23 || F3(i[10])!=0 || S1(i[10])!=DST || S2(i[10])!=C2 || (int32_t)rv_simm(i[10])!=-1) return false;
+    if ((i[11]&0x7F)!=0x23 || F3(i[11])!=0 || S1(i[11])!=DST || rv_simm(i[11])!=0) return false;
+    uint32_t ALPHA=S2(i[11]);
+    if ((i[12]&0x7F)!=0x13 || F3(i[12])!=0 || RD(i[12])!=DST || S1(i[12])!=DST || rv_iimm(i[12])!=4) return false;
+    if ((i[13]&0x7F)!=0x63 || F3(i[13])!=1) return false;                            // bne SRC,END,→top
+    uint32_t END;
+    if (S1(i[13])==SRC) END=S2(i[13]); else if (S2(i[13])==SRC) END=S1(i[13]); else return false;
+    uint32_t bpc=base+(uint32_t)(w+13)*4;
+    if ((int)((bpc+rv_bimm(i[13])-base)>>2) != w) return false;
+    // Aliasing rules. The five live regs follow the interpreter matcher (PAL/END/ALPHA may alias
+    // each other — all invariant). Temps must not alias any live reg (they'd break an invariant or
+    // the loop-carried SRC/DST), and only the temp-temp aliases that violate a read-after-write
+    // inside one iteration are excluded: T==IDX (i2 kills IDX before i3), P==T (i3 kills T before
+    // i4), C0/C1==P (i5/i7 kill P before i7/i9). Everything else (P==IDX, C2==P, C0==C1==T — all
+    // present in clang's actual register allocation) is exact because the closed form re-derives
+    // the temps in guest write order.
+    uint32_t live[5] = {SRC,DST,PAL,END,ALPHA}, tmp[6] = {IDX,T,P,C0,C1,C2};
+    for (int a=0; a<5; a++) if (live[a]==0) return false;
+    if (SRC==DST||SRC==PAL||SRC==END||SRC==ALPHA||DST==PAL||DST==END||DST==ALPHA) return false;
+    for (int a=0; a<6; a++) { if (tmp[a]==0) return false;
+        for (int b=0; b<5; b++) if (tmp[a]==live[b]) return false; }
+    if (T==IDX || P==T || C0==P || C1==P) return false;
+    o.SRC=SRC; o.DST=DST; o.PAL=PAL; o.END=END; o.ALPHA=ALPHA;
+    o.IDX=IDX; o.T=T; o.P=P; o.C0=C0; o.C1=C1; o.C2=C2;
+    return true;
+}
+
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
 // linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
@@ -2739,9 +2802,9 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
     // state than the per-instruction path, so the exits must be reset points.
-    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0);
-    int ncpy = 0, nfill = 0;
-    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr;
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0);
+    int ncpy = 0, nfill = 0, npal = 0;
+    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr;
       for (int w=0; w+13 < N; w++)
           if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
       for (int w=0; w+7 < N; w++)
@@ -2751,12 +2814,15 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               if (comp[w] && rvx_match_copyloop(img, N, base, w, cr)) { cpyhit[w] = 1; targ[w+5] = 1; ncpy++; }
           for (int w=0; w+3 < N; w++)
               if (comp[w] && rvx_match_fillloop(img, N, base, w, fr)) { fillhit[w] = (uint8_t)fr.nw; targ[w+fr.nw] = 1; nfill++; }
+          for (int w=0; w+14 < N; w++)
+              if (comp[w] && rvx_match_palexp(img, N, base, w, pr)) { palhit[w] = 1; targ[w+14] = 1; npal++; }
       } }
     if (getenv("RVX_STATS") && ncpy) fprintf(stderr, "[xblk] copyloop sites: %d\n", ncpy);
     if (getenv("RVX_STATS") && nfill) fprintf(stderr, "[xblk] fillloop sites: %d\n", nfill);
+    if (getenv("RVX_STATS") && npal) fprintf(stderr, "[xblk] palexp sites: %d\n", npal);
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0), std::string());
+    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0), std::string());
     // ── xcopy unit (knee-ISOLATED: assembles alone in microseconds). Word-widened forward byte copy:
     //    byte head until DST is 4-aligned, then a funnel-shift body (the +8 B buffer guard covers the
     //    high word of an unaligned source), then a byte tail. Callers guarantee n ≥ 1 and NO forward
@@ -2806,6 +2872,25 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               "add.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra FT;\n"
               "FE:\nret;\n}\n";
     }
+    // ── xpal unit (knee-ISOLATED — the r11/r13 inline emissions of this loop tripped the ptxas
+    //    knee; the dedicated unit assembles alone). Per pixel: idx = src[i]; r,g,b = pal[idx*3..];
+    //    ONE word store r|g<<8|b<<16|va (va = alpha<<24, precomputed by the call site, which also
+    //    guarantees d word-aligned, n ≥ 1, and dst disjoint from src and palette).
+    if (npal) {
+        std::string& xp = units[1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0)];
+        xp  = hdr;
+        xp += ".visible .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa)\n{\n"
+              ".reg .b64 %s,%d,%pl,%pe;\n.reg .b32 %n,%i,%r,%g,%b,%w,%va;\n.reg .pred %q;\n"
+              "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u64 %pl,[pp];\n"
+              "ld.param.u32 %n,[pn];\nld.param.u32 %va,[pa];\n"
+              "PX:\nld.global.u8 %i, [%s];\nadd.u64 %s, %s, 1;\n"
+              "mul.lo.u32 %i, %i, 3;\ncvt.u64.u32 %pe, %i;\nadd.u64 %pe, %pe, %pl;\n"
+              "ld.global.u8 %r, [%pe];\nld.global.u8 %g, [%pe+1];\nld.global.u8 %b, [%pe+2];\n"
+              "shl.b32 %g, %g, 8;\nshl.b32 %b, %b, 16;\nor.b32 %w, %r, %g;\n"
+              "or.b32 %w, %w, %b;\nor.b32 %w, %w, %va;\nst.global.u32 [%d], %w;\n"
+              "add.u64 %d, %d, 4;\nsub.u32 %n, %n, 1;\nsetp.ne.u32 %q, %n, 0;\n@%q bra PX;\n"
+              "ret;\n}\n";
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -2816,8 +2901,9 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
         if (ncpy) ptx += ".extern .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn);\n";
         if (nfill) ptx += ".extern .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn);\n";
+        if (npal) ptx += ".extern .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
-        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss;\n.reg .b32 %x<32>,%t0,%t1,%t2,%pc,%budget,%cnt;\n"
+        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
         ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
         // Shadow return stack base: after all XS slots — %ss = XS + 168*ntid + 128*tid (16 × 8 B / thread).
@@ -2943,6 +3029,58 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 if (F0.ND) rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", F0.ND, F0.END);
                 rvx_app(ptx, "bra L%u;\n", base+(w+(uint32_t)F0.nw)*4);
                 rvx_app(ptx, "FIORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
+            }
+            // Palette-expand loop → xpal call (one word store per pixel). Guards route to the kept
+            // original loop: n==0 (the do-while would wrap 2^32), n>16M (bound the atomic retire),
+            // DST-3 not word-aligned (the unit stores words), and dst overlapping src or the
+            // palette (the unit re-reads pal per pixel and the closed form re-reads the last pixel
+            // — disjointness makes both exact). Closed form: retire 14·n, SRC=END, DST+=4n, temps
+            // IDX/T/P/C0/C1/C2 re-derived from the last pixel in guest write order (all 11 regs
+            // pairwise distinct per the matcher, so no aliasing).
+            else if (palhit[w] && (int)w+14 < N && regof[w+14]==r && comp[w+14]) {
+                RvxPal P0; rvx_match_palexp(img, N, base, (int)w, P0);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"                      // n = END - SRC
+                             "setp.eq.u32 %%p0, %%t0, 0;\n"
+                             "setp.gt.u32 %%p1, %%t0, 16777216;\nor.pred %%p0, %%p0, %%p1;\n",
+                             P0.END, P0.SRC);
+                rvx_app(ptx, "sub.u32 %%t1, %%x%u, 3;\n"                          // t1 = dst word base
+                             "and.b32 %%t2, %%t1, 3;\nsetp.ne.u32 %%p1, %%t2, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             P0.DST);
+                ptx += "shl.b32 %t2, %t0, 2;\n";                                  // t2 = 4n
+                rvx_app(ptx, "add.u32 %%t3, %%x%u, %%t0;\nsetp.lt.u32 %%p1, %%t1, %%t3;\n"   // dst ∩ src
+                             "add.u32 %%t3, %%t1, %%t2;\nsetp.lt.u32 %%p2, %%x%u, %%t3;\n"
+                             "and.pred %%p1, %%p1, %%p2;\nor.pred %%p0, %%p0, %%p1;\n",
+                             P0.SRC, P0.SRC);
+                rvx_app(ptx, "add.u32 %%t3, %%x%u, 768;\nsetp.lt.u32 %%p1, %%t1, %%t3;\n"    // dst ∩ pal
+                             "add.u32 %%t3, %%t1, %%t2;\nsetp.lt.u32 %%p2, %%x%u, %%t3;\n"
+                             "and.pred %%p1, %%p1, %%p2;\nor.pred %%p0, %%p0, %%p1;\n",
+                             P0.PAL, P0.PAL);
+                rvx_app(ptx, "@%%p0 bra PXORIG%u;\n", pc);
+                ptx += "mul.lo.u32 %t3, %t0, 14;\nadd.s32 %cnt, %cnt, %t3;\n";
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n"   // src
+                             "cvt.u64.u32 %%a1, %%t1;\nadd.u64 %%a1, %%a1, %%M;\n"    // dst word base
+                             "cvt.u64.u32 %%ad, %%x%u;\nadd.u64 %%ad, %%ad, %%M;\n"   // palette
+                             "shl.b32 %%t3, %%x%u, 24;\n",                            // alpha<<24
+                             P0.SRC, P0.PAL, P0.ALPHA);
+                ptx += "{ .param .b64 ps; .param .b64 pd; .param .b64 pp; .param .b32 pn; .param .b32 pa;\n"
+                       "st.param.b64 [ps], %a0;\nst.param.b64 [pd], %a1;\nst.param.b64 [pp], %ad;\n"
+                       "st.param.b32 [pn], %t0;\nst.param.b32 [pa], %t3;\n"
+                       "call.uni xpal, (ps, pd, pp, pn, pa);\n}\n";
+                rvx_app(ptx, "sub.u32 %%t3, %%x%u, 1;\n"                          // last pixel idx
+                             "cvt.u64.u32 %%a0, %%t3;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "ld.global.u8 %%x%u, [%%a0];\n", P0.END, P0.IDX);
+                rvx_app(ptx, "shl.b32 %%x%u, %%x%u, 1;\n", P0.T, P0.IDX);
+                rvx_app(ptx, "add.u32 %%x%u, %%x%u, %%x%u;\nadd.u32 %%x%u, %%x%u, %%x%u;\n",
+                             P0.P, P0.PAL, P0.IDX, P0.P, P0.P, P0.T);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "ld.global.u8 %%x%u, [%%a0];\nld.global.u8 %%x%u, [%%a0+1];\nld.global.u8 %%x%u, [%%a0+2];\n",
+                             P0.P, P0.C0, P0.C1, P0.C2);
+                rvx_app(ptx, "add.u32 %%x%u, %%t1, %%t2;\nadd.u32 %%x%u, %%x%u, 3;\n"   // DST = base+4n+3
+                             "mov.b32 %%x%u, %%x%u;\n", P0.DST, P0.DST, P0.DST, P0.SRC, P0.END);
+                rvx_app(ptx, "bra L%u;\n", base+(w+14)*4);
+                rvx_app(ptx, "PXORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();
             }
             else rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
