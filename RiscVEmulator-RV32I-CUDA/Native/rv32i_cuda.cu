@@ -284,7 +284,7 @@ template<bool NC1> __global__ void __launch_bounds__(256)
 rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2* __restrict__ uops, const uint8_t* __restrict__ uw,
              const uint32_t* __restrict__ pc2uop, const uint32_t* __restrict__ uop2pc,
              const uint32_t* __restrict__ ext,
-             int ncores, int nwords, uint32_t base, int budget, unsigned long long* __restrict__ retd) {
+             int ncores, int nwords, uint32_t base, int budget, int xstop, unsigned long long* __restrict__ retd) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncores) return;
     CoreState& g = st[id];
@@ -319,7 +319,13 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
         const uint32_t pred = (w0 >> 26) & 7;
         const uint32_t selc = (w0 >> 29) & 7;
         const int32_t  s1 = (int32_t)u1, s2 = (int32_t)u2;
-        const int      wt = __ldg(&uw[ui]);          // guest-instructions this uop retires
+        const int      uwb = __ldg(&uw[ui]);         // bit7 = exec-entry stop flag; bits 6:0 = retired weight
+        const int      wt  = uwb & 0x7F;             // guest-instructions this uop retires
+        // exec-entry self-stop: when the exec_block is live (xstop==0x80) and this uop's pc is a
+        // dispatch entry, exit BEFORE executing it (gi>0: always make progress first) — the driver
+        // re-enters the register-resident exec_block there instead of interpreting onward. This is
+        // what lets the dispatch-entry set be SPARSE without stranding whole chunks in the interpreter.
+        if ((uwb & xstop) && gi) break;
 
         // predicate-producing uops: compute P / SEL, no rd write, fall through linearly
         if (pred == RP_SETP) {
@@ -2019,12 +2025,13 @@ API int cuda_rvcud_step_all(int budget) {
                 }
             }
         }
+        int xstop = g_xblk_ok ? 0x80 : 0;             // self-stop only while exec is live (else: no relaunch storm)
         if (g_ncores == 1)
             rvcud_kernel<true ><<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
-                                                        g_ncores, g_pc2words, g_base, rem, g_ret);
+                                                        g_ncores, g_pc2words, g_base, rem, xstop, g_ret);
         else
             rvcud_kernel<false><<<grid, block, shmem>>>(g_state, g_mem, g_uops, g_uw, g_pc2uop, g_uop2pc, g_ext,
-                                                        g_ncores, g_pc2words, g_base, rem, g_ret);
+                                                        g_ncores, g_pc2words, g_base, rem, xstop, g_ret);
         cudaError_t le = cudaGetLastError(), se = cudaDeviceSynchronize();
         if (le != cudaSuccess) return (int)le;
         if (se != cudaSuccess) return (int)se;
@@ -2034,8 +2041,9 @@ API int cuda_rvcud_step_all(int budget) {
         int w = (pc >= g_base) ? (int)((pc - g_base) >> 2) : -1;
         if (w >= 0 && w < g_pc2words && g_pc2uop_h[w] == RC_BADUOP) {
             if (rvcud_translate_miss(pc)) continue;   // translated the missed block → resume
+            break;                                    // untranslatable pc — bail
         }
-        break;                                        // normal: budget spent at a translated pc
+        continue;                                     // interp self-stopped at an exec entry (or budget end) → re-evaluate
     }
     *g_ret = (unsigned long long)total;               // report TOTAL retired (verify gate reads this)
     return 0;
@@ -2056,17 +2064,31 @@ API unsigned long long cuda_rvcud_iters() { unsigned long long h=0; cudaMemcpyFr
 static void rvx_app(std::string& s, const char* fmt, ...) {
     char b[512]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap); s += b;
 }
-// Emit PTX for one guest instruction. Guest regs are %x0..%x31 (%x0 holds 0); %t0/%t1 b32, %a0 b64
+// Cross-instruction codegen state, valid ONLY along a fall-through run that cannot be entered
+// sideways (rvx_codegen resets it at every possible branch target / region-entry brx word).
+//  - abBase: guest reg cached in %ab == %M + zext(x[abBase]); an imm==0 access off the unchanged
+//    base reuses [%ab] directly (bit-exact: same inputs as a fresh compute).
+//  - a0Base/a0Imm: %a0 == %M + zext(x[a0Base]+a0Imm); an IDENTICAL (base,imm) repeat reuses %a0
+//    (exact incl. 32-bit wrap — same rs1 value, same imm). t0Valid: %t0 still == x[a0Base]+a0Imm.
+//  - mod4[r]: x[r] mod 4 (0..3) or 0xFF UNKNOWN. A PROVEN (mod4[rs1]+imm)%align==0 drops the runtime
+//    misalignment check. Soundness over coverage: all regs START UNKNOWN (sp is never trusted).
+struct RvxCse {
+    int abBase, a0Base; int32_t a0Imm; bool t0Valid;
+    uint8_t mod4[32];
+    void reset() { abBase = a0Base = -1; t0Valid = false; memset(mod4, 0xFF, sizeof mod4); mod4[0] = 0; }
+};
+// Emit PTX for one guest instruction. Guest regs are %x0..%x31 (%x0 holds 0); %t0/%t1 b32, %a0/%ab b64
 // temps; %p0 pred; %M global-mem base. Memory is byte-wise assembled (ncores==1 ⇒ linear layout):
-// every load/store uses only ld/st.global.u8 so a misaligned guest address can never raise the
-// unrecoverable misaligned-access fault that aligned ld.global.u32 would. Branch/jal to a SAME-REGION
+// unless alignment is statically PROVEN via cse.mod4, every load/store runtime-checks and falls back
+// to ld/st.global.u8 so a misaligned guest address can never raise the unrecoverable misaligned-access
+// fault that aligned ld.global.u32 would. Branch/jal to a SAME-REGION
 // compiled FORWARD target → direct bra L<t>; BACKWARD (loop) → inline budget check + bra; jalr → the
 // region-local XDISP (same-region targets stay in-register). Cross-region or uncompiled target → set pc,
 // bra XSAVE (the region epilogue spills to XS and returns; the dispatcher re-enters the right region
 // on-device, or exits to the host/interpreter when pc2idx has no entry for pc).
 static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                      const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base,
-                     const std::vector<int>& regof, int myreg) {
+                     const std::vector<int>& regof, int myreg, RvxCse& cse) {
     const uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
     auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2;
         return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w] && regof[w]==myreg; };
@@ -2084,54 +2106,83 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
         }
         else                       rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XSAVE;\n",pg,t,pg);          // leaves region/compiled set
     };
-    // guest byte address (rs1+imm) into %a0 (b64, + %M); leaves %t0/%t1 free as scratch.
-    auto addr=[&](int32_t imm){ rvx_app(s,"add.s32 %%t0, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t0;\nadd.u64 %%a0, %%a0, %%M;\n",rs1,imm); };
+    // Register write: update the alignment lattice (m = new mod4 or 0xFF) and kill any cached address
+    // derived from r. Call AFTER any cse.mod4[] reads for this instruction (sources are pre-write values).
+    auto wr=[&](uint32_t r, int m){ if(!r) return; cse.mod4[r]=(uint8_t)m;
+        if(cse.abBase==(int)r) cse.abBase=-1;
+        if(cse.a0Base==(int)r){ cse.a0Base=-1; cse.t0Valid=false; } };
+    // Guest byte address rs1+imm. Sets A = b64 operand for [A]/[A+k], T = b32 reg holding the guest
+    // address (runtime alignment check), alok = (x[rs1]+imm) % align == 0 statically proven.
+    char A[8]="%a0", T[8]="%t0"; bool alok=false;
+    auto addr=[&](int32_t imm, int align){
+        alok = (align<=1) || (cse.mod4[rs1]!=0xFF &&
+                              ((((uint32_t)cse.mod4[rs1]+(uint32_t)imm) & (uint32_t)(align-1)) == 0));
+        strcpy(A,"%a0"); strcpy(T,"%t0");
+        if (cse.a0Base==(int)rs1 && cse.a0Imm==imm) {                       // identical repeat → reuse %a0
+            if (!alok && !cse.t0Valid) { rvx_app(s,"add.s32 %%t0, %%x%u, %d;\n",rs1,imm); cse.t0Valid=true; }
+            return;
+        }
+        if (imm==0 && cse.abBase==(int)rs1) {                               // same base, imm 0 → [%ab]
+            strcpy(A,"%ab"); snprintf(T,sizeof T,"%%x%u",rs1); return;      // guest addr IS x[rs1]
+        }
+        rvx_app(s,"add.s32 %%t0, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t0;\nadd.u64 %%a0, %%a0, %%M;\n",rs1,imm);
+        cse.a0Base=(int)rs1; cse.a0Imm=imm; cse.t0Valid=true;
+        if (imm==0) { s += "mov.u64 %ab, %a0;\n"; cse.abBase=(int)rs1; }    // seed the base cache
+    };
     switch(op) {
-    case 0x37: if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,instr&0xFFFFF000u); break;
-    case 0x17: if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+(instr&0xFFFFF000u)); break;
-    case 0x6F:{ uint32_t t=pc+rv_jimm(instr); if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); xfer(false,t); } break;
+    case 0x37: if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,instr&0xFFFFF000u); wr(rd,0); } break;     // low 12 bits zero
+    case 0x17: if(rd){ uint32_t v=pc+(instr&0xFFFFF000u); rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,v); wr(rd,(int)(v&3)); } break;
+    case 0x6F:{ uint32_t t=pc+rv_jimm(instr); if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); } xfer(false,t); } break;
     case 0x67:{ rvx_app(s,"add.s32 %%t0, %%x%u, %d;\nand.b32 %%t0, %%t0, 4294967294;\n",rs1,(int)rv_iimm(instr));
-                if(rd) rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); s += "mov.b32 %pc, %t0;\nbra XDISP;\n"; } break;
+                cse.t0Valid=false;
+                if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); } s += "mov.b32 %pc, %t0;\nbra XDISP;\n"; } break;
     case 0x63:{ uint32_t t=pc+rv_bimm(instr); const char* cc; bool sg=false;
                 switch(f3){case 0:cc="eq";break;case 1:cc="ne";break;case 4:cc="lt";sg=true;break;case 5:cc="ge";sg=true;break;case 6:cc="lt";break;default:cc="ge";}
                 rvx_app(s,"setp.%s.%s %%p0, %%x%u, %%x%u;\n",cc,sg?"s32":"u32",rs1,rs2);
                 xfer(true,t); } break;                                                               // not-taken falls through to next emitted word
-    case 0x03:{ if(!rd) break; addr((int)rv_iimm(instr));                                             // %t0=guest addr, %a0=M+addr
-                if(f3==0){ rvx_app(s,"ld.global.s8 %%x%u, [%%a0];\n",rd); break; }                     // lb (always 1-aligned)
-                if(f3==4){ rvx_app(s,"ld.global.u8 %%x%u, [%%a0];\n",rd); break; }                     // lbu
-                if(f3==1||f3==5){ // lh/lhu: aligned ld.u16 fast path, else byte-wise (predicated ⇒ misaligned ld.u16 skipped)
+    case 0x03:{ if(!rd) break; addr((int)rv_iimm(instr), f3==2?4:(f3==1||f3==5)?2:1); wr(rd,0xFF);     // loaded value: unknown mod 4
+                if(f3==0){ rvx_app(s,"ld.global.s8 %%x%u, [%s];\n",rd,A); break; }                     // lb (always 1-aligned)
+                if(f3==4){ rvx_app(s,"ld.global.u8 %%x%u, [%s];\n",rd,A); break; }                     // lbu
+                if(f3==1||f3==5){ // lh/lhu: proven-aligned → bare ld; else runtime check + byte-wise fallback
                     const char* sty=(f3==1)?"s16":"u16"; const char* hib=(f3==1)?"s8":"u8";
-                    rvx_app(s,"and.b32 %%t1, %%t0, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
-                              "@%%p0 ld.global.%s %%x%u, [%%a0];\n"
-                              "@!%%p0 ld.global.u8 %%x%u, [%%a0];\n@!%%p0 ld.global.%s %%t1, [%%a0+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
-                              sty,rd, rd,hib,rd,rd); break; }
-                // lw: aligned ld.u32 fast path (the common case), else byte-wise — predication makes the
-                //     misaligned ld.u32 a no-op, so the unrecoverable misaligned fault can never fire.
-                rvx_app(s,"and.b32 %%t1, %%t0, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
-                          "@%%p0 ld.global.u32 %%x%u, [%%a0];\n"
-                          "@!%%p0 ld.global.u8 %%x%u, [%%a0];\n"
-                          "@!%%p0 ld.global.u8 %%t1, [%%a0+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
-                          "@!%%p0 ld.global.u8 %%t1, [%%a0+2];\n@!%%p0 shl.b32 %%t1, %%t1, 16;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
-                          "@!%%p0 ld.global.u8 %%t1, [%%a0+3];\n@!%%p0 shl.b32 %%t1, %%t1, 24;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
-                          rd, rd, rd,rd, rd,rd, rd,rd);
+                    if(alok){ rvx_app(s,"ld.global.%s %%x%u, [%s];\n",sty,rd,A); break; }
+                    rvx_app(s,"and.b32 %%t1, %s, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                              "@%%p0 ld.global.%s %%x%u, [%s];\n"
+                              "@!%%p0 ld.global.u8 %%x%u, [%s];\n@!%%p0 ld.global.%s %%t1, [%s+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
+                              T, sty,rd,A, rd,A, hib,A, rd,rd); break; }
+                // lw: proven-aligned → bare ld.u32; else aligned fast path + byte-wise fallback — predication
+                //     makes the misaligned ld.u32 a no-op, so the unrecoverable misaligned fault can never fire.
+                if(alok){ rvx_app(s,"ld.global.u32 %%x%u, [%s];\n",rd,A); break; }
+                rvx_app(s,"and.b32 %%t1, %s, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                          "@%%p0 ld.global.u32 %%x%u, [%s];\n"
+                          "@!%%p0 ld.global.u8 %%x%u, [%s];\n"
+                          "@!%%p0 ld.global.u8 %%t1, [%s+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
+                          "@!%%p0 ld.global.u8 %%t1, [%s+2];\n@!%%p0 shl.b32 %%t1, %%t1, 16;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
+                          "@!%%p0 ld.global.u8 %%t1, [%s+3];\n@!%%p0 shl.b32 %%t1, %%t1, 24;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
+                          T, rd,A, rd,A, A,rd,rd, A,rd,rd, A,rd,rd);
               } break;
-    case 0x23:{ addr((int)rv_simm(instr));
-                if(f3==0){ rvx_app(s,"st.global.u8 [%%a0], %%x%u;\n",rs2); break; }                    // sb
-                if(f3==1){ // sh: aligned st.u16 fast path, else byte-wise
-                    rvx_app(s,"and.b32 %%t1, %%t0, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
-                              "@%%p0 st.global.u16 [%%a0], %%x%u;\n"
-                              "@!%%p0 st.global.u8 [%%a0], %%x%u;\n@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%%a0+1], %%t1;\n",
-                              rs2,rs2,rs2); break; }
-                // sw: aligned st.u32 fast path, else byte-wise
-                rvx_app(s,"and.b32 %%t1, %%t0, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
-                          "@%%p0 st.global.u32 [%%a0], %%x%u;\n"
-                          "@!%%p0 st.global.u8 [%%a0], %%x%u;\n"
-                          "@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%%a0+1], %%t1;\n"
-                          "@!%%p0 shr.b32 %%t1, %%x%u, 16;\n@!%%p0 st.global.u8 [%%a0+2], %%t1;\n"
-                          "@!%%p0 shr.b32 %%t1, %%x%u, 24;\n@!%%p0 st.global.u8 [%%a0+3], %%t1;\n",
-                          rs2, rs2, rs2,rs2,rs2);
+    case 0x23:{ addr((int)rv_simm(instr), f3==2?4:(f3==1)?2:1);
+                if(f3==0){ rvx_app(s,"st.global.u8 [%s], %%x%u;\n",A,rs2); break; }                    // sb
+                if(f3==1){ // sh: proven-aligned → bare st; else runtime check + byte-wise fallback
+                    if(alok){ rvx_app(s,"st.global.u16 [%s], %%x%u;\n",A,rs2); break; }
+                    rvx_app(s,"and.b32 %%t1, %s, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                              "@%%p0 st.global.u16 [%s], %%x%u;\n"
+                              "@!%%p0 st.global.u8 [%s], %%x%u;\n@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%s+1], %%t1;\n",
+                              T, A,rs2, A,rs2, rs2, A); break; }
+                // sw: proven-aligned → bare st.u32; else aligned fast path + byte-wise fallback
+                if(alok){ rvx_app(s,"st.global.u32 [%s], %%x%u;\n",A,rs2); break; }
+                rvx_app(s,"and.b32 %%t1, %s, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
+                          "@%%p0 st.global.u32 [%s], %%x%u;\n"
+                          "@!%%p0 st.global.u8 [%s], %%x%u;\n"
+                          "@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%s+1], %%t1;\n"
+                          "@!%%p0 shr.b32 %%t1, %%x%u, 16;\n@!%%p0 st.global.u8 [%s+2], %%t1;\n"
+                          "@!%%p0 shr.b32 %%t1, %%x%u, 24;\n@!%%p0 st.global.u8 [%s+3], %%t1;\n",
+                          T, A,rs2, A,rs2, rs2,A, rs2,A, rs2,A);
               } break;
     case 0x13:{ if(!rd) break; int im=(int)rv_iimm(instr); uint32_t sh=im&0x1F;
+                int nm = 0xFF;                                                          // lattice: addi propagates, slli>=2 zeroes
+                if (f3==0 && cse.mod4[rs1]!=0xFF) nm = (int)(((uint32_t)cse.mod4[rs1]+(uint32_t)im)&3);
+                else if (f3==1 && sh>=2) nm = 0;
                 switch(f3){
                   case 0: rvx_app(s,"add.s32 %%x%u, %%x%u, %d;\n",rd,rs1,im); break;
                   case 2: rvx_app(s,"setp.lt.s32 %%p0, %%x%u, %d;\nselp.b32 %%x%u, 1, 0, %%p0;\n",rs1,im,rd); break;
@@ -2140,17 +2191,23 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                   case 6: rvx_app(s,"or.b32 %%x%u, %%x%u, %u;\n",rd,rs1,(uint32_t)im); break;
                   case 7: rvx_app(s,"and.b32 %%x%u, %%x%u, %u;\n",rd,rs1,(uint32_t)im); break;
                   case 1: rvx_app(s,"shl.b32 %%x%u, %%x%u, %u;\n",rd,rs1,sh); break;
-                  default: rvx_app(s,"shr.%s %%x%u, %%x%u, %u;\n",(f7==0x20)?"s32":"u32",rd,rs1,sh); } } break;
+                  default: rvx_app(s,"shr.%s %%x%u, %%x%u, %u;\n",(f7==0x20)?"s32":"u32",rd,rs1,sh); }
+                wr(rd,nm); } break;
     case 0x33:{ if(!rd) break;
+                int nm = 0xFF;                                                          // lattice: add/sub combine if both known
+                if (f3==0 && cse.mod4[rs1]!=0xFF && cse.mod4[rs2]!=0xFF)
+                    nm = (int)(((f7==0x20) ? (uint32_t)cse.mod4[rs1]-(uint32_t)cse.mod4[rs2]
+                                           : (uint32_t)cse.mod4[rs1]+(uint32_t)cse.mod4[rs2]) & 3);
                 switch(f3){
                   case 0: rvx_app(s,"%s.s32 %%x%u, %%x%u, %%x%u;\n",(f7==0x20)?"sub":"add",rd,rs1,rs2); break;
-                  case 1: rvx_app(s,"and.b32 %%t0, %%x%u, 31;\nshl.b32 %%x%u, %%x%u, %%t0;\n",rs2,rd,rs1); break;
+                  case 1: rvx_app(s,"and.b32 %%t0, %%x%u, 31;\nshl.b32 %%x%u, %%x%u, %%t0;\n",rs2,rd,rs1); cse.t0Valid=false; break;
                   case 2: rvx_app(s,"setp.lt.s32 %%p0, %%x%u, %%x%u;\nselp.b32 %%x%u, 1, 0, %%p0;\n",rs1,rs2,rd); break;
                   case 3: rvx_app(s,"setp.lt.u32 %%p0, %%x%u, %%x%u;\nselp.b32 %%x%u, 1, 0, %%p0;\n",rs1,rs2,rd); break;
                   case 4: rvx_app(s,"xor.b32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); break;
-                  case 5: rvx_app(s,"and.b32 %%t0, %%x%u, 31;\nshr.%s %%x%u, %%x%u, %%t0;\n",rs2,(f7==0x20)?"s32":"u32",rd,rs1); break;
+                  case 5: rvx_app(s,"and.b32 %%t0, %%x%u, 31;\nshr.%s %%x%u, %%x%u, %%t0;\n",rs2,(f7==0x20)?"s32":"u32",rd,rs1); cse.t0Valid=false; break;
                   case 6: rvx_app(s,"or.b32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); break;
-                  default: rvx_app(s,"and.b32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); } } break;
+                  default: rvx_app(s,"and.b32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); }
+                wr(rd,nm); } break;
     case 0x0F: break;                                                                     // fence → nop
     default: rvx_app(s,"mov.u32 %%pc, %u;\nbra XSAVE;\n",pc|0x80000000u); break;           // system/illegal → halt
     }
@@ -2246,6 +2303,17 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     for (int r=0; r<K; r++) if (rtgt[r].empty())            // never enterable, but keep the PTX well-formed
         for (int i=0; i<nb; i++) if (regof[body[i]]==r) { pc2idx[body[i]]=(uint32_t)r<<20; rtgt[r].push_back(body[i]); break; }
+    // Possible-target bitmap: words enterable SIDEWAYS (branch/jal target anywhere in the image, or a
+    // region-entry brx word). Cross-instruction CSE/alignment state is only valid along fall-through,
+    // so it is reset at every such word. Scanning the whole image (incl. data words) is conservative-safe.
+    std::vector<uint8_t> targ(N, 0);
+    for (int w=0; w<N; w++) {
+        uint32_t in = img[w], o = in&0x7F;
+        if (pc2idx[w] != 0xFFFFFFFFu) targ[w] = 1;
+        if (o!=0x63 && o!=0x6F) continue;
+        uint32_t t = base + (uint32_t)w*4 + (o==0x63 ? rv_bimm(in) : rv_jimm(in));
+        if (t>=base && ((t-base)&3)==0 && ((t-base)>>2) < (uint32_t)N) targ[(t-base)>>2] = 1;
+    }
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
     units.assign(1+K, std::string());
@@ -2258,7 +2326,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx  = hdr;
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B at launch) — per-CTA, far cheaper than .global per region transition
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
-        ptx += ".reg .b64 %M,%P2I,%a0,%ad;\n.reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n"
+        ptx += ".reg .b64 %M,%P2I,%a0,%ab,%ad;\n.reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n"
                ".reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0,%p1,%p2;\n";
         ptx += "mov.b32 %x0, 0;\n";
         for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%x%u, [XS+%d];\n", g, g*4);
@@ -2267,15 +2335,20 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx += "BT: .branchtargets ";
         for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
         ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
+        RvxCse cse; cse.reset();
+        int prev = -2;
         for (; bi<nb && regof[body[bi]]==r; bi++) {
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
+            if ((int)w != prev+1 || targ[w]) cse.reset();   // run start or sideways-enterable
             rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
-            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r);
+            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse);
             bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
             if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
                 int nw = (int)w + 1;
                 if (nw>=N || !comp[nw] || regof[nw]!=r) rvx_app(ptx,"mov.u32 %%pc, %u;\nbra XSAVE;\n", base+(uint32_t)nw*4);
             }
+            else cse.reset();                               // nothing falls through a terminator
+            prev = (int)w;
         }
         ptx += "XDISP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
         rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
@@ -2448,12 +2521,26 @@ static void rvxblk_build() {
     }
     if (cnt == 0) return;
 
-    // Dispatch entries = compiled words that are also statically-translated LEADERS. Those are exactly the
-    // pcs the interpreter can hand back (it leaves pc at uop boundaries) and the valid jalr re-entry points.
-    // Restricting branchtargets to this subset keeps the brx.idx fan-out small (avoids the JIT blowup).
+    // SPARSE dispatch entries: only pcs where execution can actually (re)enter the exec_block —
+    // branch/jal targets, return sites (word after jal/jalr — also catches function entries, which
+    // follow the previous function's terminator), and resume sites after uncompilable words (ecall
+    // returns). The old rule (every translated leader) made 92% of compiled words brx targets, which
+    // bloats every region's branchtargets table and resets the cross-instruction codegen state in
+    // rvx_emit every ~1.1 instructions. The interpreter cooperates: uops at entry pcs carry uw bit7
+    // and the kernel self-stops there, so the sparse set can't strand whole chunks in the interpreter.
+    // Scanning ALL image words (incl. data decoding as branches) only ADDS spurious entries — safe.
     std::vector<uint8_t> disp(N, 0);
+    auto entry=[&](int t){ if (t>=0 && t<N && comp[t] && g_pc2uop_h[t]!=RC_BADUOP) disp[t]=1; };
+    for (int w=0; w<N; w++) {
+        uint32_t in=g_img[w], op=in&0x7F; uint32_t pc=g_base+(uint32_t)w*4;
+        uint32_t t=0; bool ht=false;
+        if (op==0x63)      { t=pc+rv_bimm(in); ht=true; }
+        else if (op==0x6F) { t=pc+rv_jimm(in); ht=true; entry(w+1); }    // target + return site
+        else if (op==0x67 || !rvx_compilable(op)) entry(w+1);            // return / post-ecall resume site
+        if (ht && t>=g_base && ((t-g_base)&3)==0) entry((int)((t-g_base)>>2));
+    }
     int ndisp = 0;
-    for (int w=0; w<N; w++) if (comp[w] && g_pc2uop_h[w] != RC_BADUOP) { disp[w]=1; ndisp++; }
+    for (int w=0; w<N; w++) ndisp += disp[w];
 
     std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
     rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp);
@@ -2474,7 +2561,20 @@ static void rvxblk_build() {
     cudaMemcpy(d_p2i, pc2idx.data(), (size_t)N*4, cudaMemcpyHostToDevice);
     g_xmod=mod; g_xfn=fn; g_x_pc2idx=d_p2i;
     g_xtab.assign(N, 0);
-    for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch (leader) words
+    for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch-entry words
+    // Stamp uw bit7 on the uops at entry pcs (the interpreter's self-stop sites). Skip if-converted
+    // body uops (RP_GP/GNP: their guest pc is not an architectural re-entry point mid-region) and
+    // anything whose weight would collide with the flag (never expected; weights are tiny).
+    { int nbits=0;
+      for (int w=0; w<N; w++) if (disp[w]) {
+          uint32_t ui = g_pc2uop_h[w]; if (ui & 0x80000000u) continue;
+          uint32_t pr = (g_w0h[ui]>>26)&7;
+          if (pr==RP_GP || pr==RP_GNP) continue;
+          if (g_uwh[ui] & 0x80) continue;
+          g_uwh[ui] |= 0x80; nbits++;
+      }
+      cudaMemcpy(g_uw, g_uwh.data(), (size_t)g_nuops, cudaMemcpyHostToDevice);
+      (void)nbits; }
     g_xblk_ok = getenv("RVX_OFF") ? 0 : 1;   // RVX_OFF=1 builds but disables exec (isolation probe)
     size_t psz = 0; for (auto& u : ptx) psz += u.size();
     int xnreg = -1, xlmem = -1;              // spill guardrail: ptxas register count + local (spill) bytes
