@@ -79,14 +79,28 @@ int _write(int fd, const void *buf, unsigned int count)
     return -1;
 }
 
-/* _read: receive bytes from fd. fd=0 (stdin) reads from UART (stubbed). */
+/* _read: receive bytes from fd. fd=0 (stdin) reads key-down events from the
+ * keyboard mailbox at 0x10001000: the host stages one event per kernel launch
+ * (bit 8 = key-down, low byte = ASCII) and clearing the status cell asks for
+ * the next one. Blocks (spinning across launches) until at least one byte
+ * arrives, then returns what is immediately available rather than waiting
+ * for the full count. */
 int _read(int fd, void *buf, unsigned int count)
 {
-    (void)fd;
-    (void)buf;
-    (void)count;
-    /* No stdin on bare metal — return 0 (EOF) */
-    return 0;
+    if (fd != 0) return -1;
+    volatile unsigned int *kbd = (volatile unsigned int *)0x10001000;
+    unsigned char *p = (unsigned char *)buf;
+    unsigned int got = 0;
+    while (got < count) {
+        if (kbd[0] == 0) {
+            if (got) break;
+            continue;
+        }
+        unsigned int ev = kbd[1];
+        kbd[0] = 0;
+        if (ev & 0x100u) p[got++] = (unsigned char)ev;
+    }
+    return (int)got;
 }
 
 /* _open: open a file. No filesystem — always fails. */

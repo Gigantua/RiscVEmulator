@@ -13,6 +13,7 @@
 
 /* Provided by syscalls.c */
 extern int _write(int fd, const void *buf, unsigned int count);
+extern int _read(int fd, void *buf, unsigned int count);
 
 /* ═══════════════════════════════════════════════════════════════════
  * I/O PRIMITIVES
@@ -35,6 +36,14 @@ int puts(const char *s)
     _write(1, &nl, 1);
     return 0;
 }
+
+int getchar(void)
+{
+    unsigned char c;
+    return _read(0, &c, 1) == 1 ? c : EOF;
+}
+/* fgets lives in stdio_file.c (opt-in FILE layer): it reads file streams from
+ * the in-RAM filesystem and falls back to getchar() for stdin. */
 
 /* ═══════════════════════════════════════════════════════════════════
  * STRING FUNCTIONS
@@ -204,6 +213,51 @@ static int _ultoa(unsigned long val, char *buf, int base, int uppercase)
     return _utoa((unsigned int)val, buf, base, uppercase);
 }
 
+/* Unsigned long long, for %llu/%llx/%lld. The 64-bit div/mod lower to
+ * __udivdi3/__umoddi3 from runtime.c. */
+static int _ulltoa(unsigned long long val, char *buf, int base, int uppercase)
+{
+    const char *digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
+    char tmp[22];
+    int len = 0;
+
+    if (val == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    while (val) {
+        tmp[len++] = digits[val % (unsigned)base];
+        val /= (unsigned)base;
+    }
+    for (int i = 0; i < len; i++)
+        buf[i] = tmp[len - 1 - i];
+    return len;
+}
+
+/* long double on riscv32 is IEEE binary128. Downconvert to double with pure
+ * integer bit work (sign, rebias 16383→1023, top 52 mantissa bits) so printf's
+ * %Lf needs no quad-precision softfloat support. Truncation instead of
+ * round-to-nearest costs < 1 ulp — irrelevant for text formatting. */
+static double _ld_to_d(long double lv)
+{
+    union { long double ld; unsigned int w[4]; } in;   /* w[3] = sign|exp|mantissa top */
+    union { unsigned long long u; double d; } out;
+    in.ld = lv;
+    unsigned long long sign = (unsigned long long)(in.w[3] >> 31) << 63;
+    int exp = (int)((in.w[3] >> 16) & 0x7FFF);
+    unsigned long long man =
+        ((((unsigned long long)(in.w[3] & 0xFFFF) << 32) | in.w[2]) << 4) | (in.w[1] >> 28);
+    if (exp == 0x7FFF)      out.u = sign | (0x7FFULL << 52) | (man ? 1 : 0);   /* inf/nan */
+    else if (exp == 0)      out.u = sign;                                      /* ±0 / subnormal → ±0 */
+    else {
+        int e = exp - 16383 + 1023;
+        if (e >= 0x7FF)     out.u = sign | (0x7FFULL << 52);                   /* overflow → inf */
+        else if (e <= 0)    out.u = sign;                                      /* underflow → 0 */
+        else                out.u = sign | ((unsigned long long)e << 52) | man;
+    }
+    return out.d;
+}
+
 /* Format a float (double promoted by varargs) using integer-only math.
  * We decompose the float into integer and fractional parts. */
 static void _fmt_float(_out_t *o, double val, int prec, int width,
@@ -307,23 +361,26 @@ static int _vprintf_core(_out_t *o, const char *fmt, va_list ap)
         }
 
         /* Length modifier */
-        int is_long = 0;
+        int is_long = 0, is_ll = 0, is_ldbl = 0;
+        if (*fmt == 'L') { is_ldbl = 1; fmt++; }
         if (*fmt == 'l') { is_long = 1; fmt++; }
-        if (*fmt == 'l') { fmt++; } /* skip ll, treat as long */
+        if (*fmt == 'l') { is_ll = 1; fmt++; }
 
         /* Conversion */
-        char numbuf[20];
+        char numbuf[24];
         int nlen = 0;
         const char *sval;
 
         switch (*fmt) {
         case 'd': case 'i': {
-            int val = is_long ? (int)va_arg(ap, long) : va_arg(ap, int);
+            long long val = is_ll ? va_arg(ap, long long)
+                          : is_long ? (long long)va_arg(ap, long)
+                          : (long long)va_arg(ap, int);
             int neg = 0;
-            unsigned int uval;
-            if (val < 0) { neg = 1; uval = (unsigned int)(-val); }
-            else uval = (unsigned int)val;
-            nlen = _utoa(uval, numbuf + 1, 10, 0);
+            unsigned long long uval;
+            if (val < 0) { neg = 1; uval = (unsigned long long)(-val); }
+            else uval = (unsigned long long)val;
+            nlen = _ulltoa(uval, numbuf + 1, 10, 0);
             char *start = numbuf + 1;
             if (neg) { start = numbuf; numbuf[0] = '-'; nlen++; }
             int pad = width - nlen;
@@ -337,9 +394,10 @@ static int _vprintf_core(_out_t *o, const char *fmt, va_list ap)
             break;
         }
         case 'u': {
-            unsigned int val = is_long ? (unsigned int)va_arg(ap, unsigned long)
-                                       : va_arg(ap, unsigned int);
-            nlen = _utoa(val, numbuf, 10, 0);
+            unsigned long long val = is_ll ? va_arg(ap, unsigned long long)
+                              : is_long ? (unsigned long long)va_arg(ap, unsigned long)
+                              : (unsigned long long)va_arg(ap, unsigned int);
+            nlen = _ulltoa(val, numbuf, 10, 0);
             int pad = width - nlen;
             if (!left_align) _emit_pad(o, zero_pad ? '0' : ' ', pad);
             _emit_str(o, numbuf, nlen);
@@ -347,9 +405,10 @@ static int _vprintf_core(_out_t *o, const char *fmt, va_list ap)
             break;
         }
         case 'x': case 'X': {
-            unsigned int val = is_long ? (unsigned int)va_arg(ap, unsigned long)
-                                       : va_arg(ap, unsigned int);
-            nlen = _utoa(val, numbuf, 16, *fmt == 'X');
+            unsigned long long val = is_ll ? va_arg(ap, unsigned long long)
+                              : is_long ? (unsigned long long)va_arg(ap, unsigned long)
+                              : (unsigned long long)va_arg(ap, unsigned int);
+            nlen = _ulltoa(val, numbuf, 16, *fmt == 'X');
             int pad = width - nlen;
             if (!left_align) _emit_pad(o, zero_pad ? '0' : ' ', pad);
             _emit_str(o, numbuf, nlen);
@@ -375,7 +434,8 @@ static int _vprintf_core(_out_t *o, const char *fmt, va_list ap)
         }
         case 'f': {
             /* float args are promoted to double by varargs */
-            double val = va_arg(ap, double);
+            double val = is_ldbl ? _ld_to_d(va_arg(ap, long double))
+                                 : va_arg(ap, double);
             _fmt_float(o, val, prec, width, zero_pad, left_align);
             break;
         }

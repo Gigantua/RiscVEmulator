@@ -31,6 +31,7 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
 
 /* ── Character / string output ────────────────────────────────────── */
 int putchar(int c);
+int getchar(void);
 int puts(const char *s);
 int fputs(const char *s, FILE *stream);
 int fputc(int c, FILE *stream);
