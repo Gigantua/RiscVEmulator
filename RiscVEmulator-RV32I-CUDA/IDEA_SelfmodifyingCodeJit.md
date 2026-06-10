@@ -1,154 +1,127 @@
-# IDEA: Self-Modifying / JIT Guests on the rvcud Transcompiled Core
+# PLAN: TinyCC (runtime-generated code) on the rvcud fast path
 
-**Status:** deferred (design note). rvcud is the *static* fast path; the base live-fetch
-core is the universal one. This documents how rvcud would grow into a dynamic binary
-translator (DBT) so it can also run runtime-compiled and self-modifying guests.
+**Status:** planned, v2 (2026-06). Rewritten against the current architecture — the v1 note
+predated exec_block, translate-on-miss, and the halt-pc work, all of which now exist. TinyCC
+today runs correctly but ONLY on the base per-instruction kernel (`Examples/CudaTinyCC` never
+sets `UseRvcud`); this plan is what it takes to run it on the rvcud uop core.
 
 ---
 
-## 1. The problem
+## 1. The three engines today, and what TinyCC needs
 
-We have two CUDA execution cores for the RV32I guest:
-
-| core | how it fetches | speed | runs |
+| engine | fetches from | covers | TinyCC status |
 |---|---|---|---|
-| **base** (`rv32i_kernel`) | live, per-instruction, from the core's own RAM (`ld_i` + inline `decode_imm`) | 1× | **anything** — static, indirect-heavy (DOOM), self-modifying / JIT (TinyCC) |
-| **rvcud** (`rvcud_kernel`) | a pre-built **uop stream** + `pc2uop[]` map, produced once by `rvcud_build` in `cuda_rvcud_set_code` | ~4.6× compute, ~1.8× data (bit-identical) | only **static, low-indirection** guests (the benchmarks) |
+| **base** (`rv32i_kernel`) | live guest RAM, per instruction | anything, incl. self-modifying | **works today** (slow, ~1× ) |
+| **rvcud** (uop interpreter) | pre-built uop stream over the static code span `[0, codeHi)` | static code + lazy 1:1 blocks via translate-on-miss | halts on JIT'd code (outside the map) |
+| **exec_block** (PTX JIT) | per-region PTX compiled at `set_code` from the static image | statically-reached words only | N/A for runtime code (by design — see §6) |
 
-rvcud is fast because it translates the guest **once, ahead of launch**, fusing
-multiple guest instructions into one uop. The price: it only knows about code that
-existed at translate time. Two things break it:
+TinyCC's guest flow: the statically-compiled TinyCC binary (≈400 KB, fully inside the
+translated span — rvcud + exec handle it fine) compiles C source from guest RAM into a
+**malloc'd buffer in the heap**, then `jalr`s into it. Two properties matter:
 
-1. **Code that appears after launch** — a JIT guest (TinyCC) compiles C → RV32I into
-   guest RAM *at runtime*, then `jalr`s into it. rvcud has no uop for that address.
-2. **Code that is overwritten after translation** — true self-modifying code; the
-   cached uops become stale.
+1. The generated code lives at heap addresses — **outside `g_pc2words`**, so not just
+   untranslated but *unmappable*: `rvcud_translate_miss` bounds-checks the pc against the
+   static window and bails. The JALR arm then can't even stop-at-target.
+2. The demo compiles three programs; if TCC reuses/frees+reallocs the buffer, previously
+   translated dynamic code is **overwritten** → stale uops (true SMC).
 
-(There is also a third, separate issue that blocks even *static* DOOM: indirect-call
-targets aren't uop leaders — see §5.)
+## 2. What v1 planned that is NOW BUILT (don't redo)
 
-When rvcud reaches untranslated code, `pc2uop[target] == RC_BADUOP` and the kernel sets
-`HALT_BIT` and stops. Today that just looks like a hang.
+- **Translate-on-miss** (`rvcud_translate_miss`): JALR to an untranslated *in-window* word
+  surfaces the pc (`resume_pc`), the driver translates a straight-line 1:1 run and resumes.
+  This is what unblocked DOOM's function-pointer dispatch.
+- **Miss/halt pc surfacing**: the interpreter epilogue now preserves the faulting pc next to
+  `HALT_BIT` (commit b88a617); `cuda_rv32i_get_pc/get_reg` exist for the host.
+- **Validation harness**: `cuda_rvcud_fuzz` (forward + jalr/backward phases) differentially
+  tests the full translator+interpreter pipeline; `RVCUD_FUSEMASK` / `RVCUD_TRACE` exist for
+  bisecting. Any work below gets a fuzz phase, not just an eyeball.
 
----
+## 3. The known break, measured (voxel postmortem, 2026-06)
 
-## 2. Key enabler: every guest write goes through the core
+Translate-on-miss is **fragile by design** for loopy code: miss-translated runs bake direct
+branch/jal targets against the *live* map; a target not yet translated bakes the
+`0xFFFFFFFF` sentinel, and **taking it kills the core** (`ui = 0xFFFFFFFF` → OOB `uop2pc`
+read → garbage pc / lost-halt). We hit exactly this when `ReadOnlyCodeSpan` truncation
+pushed `draw_triangle` into miss-translated territory: the first taken backward branch died.
+It is fine for the call-stub-sized blocks DOOM needed; it cannot host a JIT'd function with
+loops. **Fixing this is the core of the plan** — everything else is bookkeeping.
 
-On a CPU, a DBT detects self-modifying code with the MMU: mark the code page
-read-only, take a write fault, invalidate. **CUDA has no such mechanism** — device
-memory has no kernel-trappable write protection, and unified-memory page faults are for
-host↔device migration, not per-write notification.
+## 4. Phase D1 — dynamic code window (rvcud runs TinyCC output, no SMC yet)
 
-We don't need it. **Every guest load/store already funnels through `ld_i` / `st_i` in
-the kernel**, so the interpreter itself is the "MMU". We can detect both new-code
-execution and code overwrites in software, cheaply, at points we already control.
+1. **Cover the heap in the pc map.** Extend `pc2uop` to a second window (or simply widen
+   `g_pc2words` to all of guest RAM: 16 MB RAM → 4 M words → 16 MB device table + the same
+   for `uop2pc` growth — acceptable; allocate the map full-RAM, lazy-zero). Words outside
+   the static image start `RC_BADUOP` like any untranslated word.
+2. **Growable uop buffers.** `g_uopcap = nuops + 2N + 16` is sized for static re-emission
+   only. Dynamic guests need chunked growth: over-allocate (e.g. +64 K uops), and on
+   exhaustion realloc device buffers between launches (host owns mirrors already:
+   `g_w0h/g_w1h/g_uwh/g_u2pch`).
+3. **Make unresolved-taken recoverable** (the §3 fix). Two pieces:
+   - In the miss-translation, record a host-side **fixup list**: `(uop index, target word)`
+     for every branch/jal baked as `0xFFFFFFFF`.
+   - Kernel: a taken unresolved branch must exit with the TARGET pc surfaced, not poison
+     `ui`. Encode unresolved as a dedicated sentinel the BR/JAL arms test (`w1 ==
+     0xFFFFFFFF` → `resume_pc = <target pc>; break`). Target pc is computable: bake the
+     *guest target pc* in a side table, or re-derive from `uop2pc[ui]` + the original
+     instruction (host translates from there anyway).
+   - Driver: on such an exit, translate the target block, then walk the fixup list and
+     patch every recorded `w1` that now resolves (device patch = small `cudaMemcpy` into
+     `g_uops`, same as translate_miss does today). Resume. Each block faults at most once
+     per unresolved edge.
+4. **Fusion off for dynamic blocks** initially (1:1 classify, exactly like translate_miss
+   today). TCC's output is naive code — fusion would help — but correctness first; the
+   FUSEMASK machinery makes turning matchers on per-window a later A/B.
+5. **Driver loop placement:** all of this happens at the existing `cuda_rvcud_step_all`
+   miss-handling point — no host API change, `CudaEmulator` untouched except a `UseRvcud`
+   flag in the CudaTinyCC harness.
 
----
+**Gate:** CudaTinyCC output (fib/primes/mandel text) byte-identical base vs rvcud, plus a
+new fuzz phase: generate a random "stage-2" program into a heap address at runtime (host
+pokes it via `write_mem` mid-run), jalr to it, compare against `rvx_ref_step`.
 
-## 3. Translate-on-miss (handles *new* code) — lazy, per-basic-block
+## 5. Phase D2 — SMC invalidation (buffer reuse / recompiles)
 
-You never need to know "how big is the region to translate". You translate **one basic
-block at a time**, bounded by control flow, discovered by decoding. This is exactly how
-QEMU/TCG works.
+Unchanged from v1, with today's names:
 
-**Trigger.** rvcud already detects the miss: a `JALR` to an untranslated target, or a
-direct branch/`jal` whose baked target is the unresolved sentinel (`0xFFFFFFFF`), makes
-`ui` go negative → the run loop exits (halt). We just need to **surface the faulting
-guest pc** to the host (e.g. stash it in `g_ret` / a status word instead of only setting
-`HALT_BIT`).
+1. **Store-path dirty mark.** In `st_i`/the ST arms: if the store address hits a page with
+   translated dynamic uops, set a device bitmap bit (4 KB pages; one range-compare + a
+   idempotent byte store; gate with a per-page "has-translations" bitmap so TCC's
+   compile-phase stores into *not-yet-executed* buffers cost nothing and invalidate
+   nothing).
+2. **Between launches** the host scans the bitmap; dirty page → reset that page's `pc2uop`
+   words to `RC_BADUOP` (uops themselves become garbage-but-unreachable; space is
+   reclaimed only by a full rebuild — acceptable: TCC recompiles are rare events). The
+   fixup list entries pointing into the page are dropped.
+3. The **static** span keeps its no-write assumption (sp-proof and exec depend on it); a
+   store into the *static* code span should disable exec + force a full retranslate (rare,
+   loud `fprintf` — TinyCC never does this).
 
-**Translate one block.** From the miss `pc`, decode forward (RV32I is fixed 4-byte) and
-emit uops until the first **control-transfer instruction**, inclusive:
-- `jal` / `jalr` (unconditional) → block ends,
-- conditional `branch` → block ends (two successors),
-- (optional) an already-translated instruction → stop, we've rejoined known code.
+**Gate:** extend the fuzz phase: overwrite the stage-2 region with a second random program
+mid-run, re-enter, compare. Plus a CudaTinyCC variant that compiles the same source twice
+into the same buffer.
 
-The block's *extent is the decode itself* — entry → first terminator. No size hint, no
-symbols needed. Fusion still applies *within* the block (it never crosses control flow
-anyway).
+## 6. Non-goals (decided)
 
-**Wire it up.** Append the new uops to the stream, set `pc2uop[entry]`, and patch the
-branch/`jalr` that pointed here. Direct targets that are still untranslated are baked as
-the unresolved sentinel → taking them faults → translate *those* blocks on their own
-misses. Each reachable block is translated the first time it is entered.
+- **exec_block for dynamic code.** A region build costs seconds of ptxas wall (even
+  parallelized, 7c65f67) — per TCC compile that's worse than interpreting. The hybrid
+  already mixes engines by pc; dynamic code simply stays on the interpreter tier. If a JIT
+  guest ever runs ONE buffer hot for minutes, revisit with a "promote after N entries"
+  counter.
+- **Fused arms inside dynamic blocks** (D1.4) until the plain version is gated.
+- **True per-store SMC inside a single launch** (store→execute within one batch without a
+  host trip). The batch boundary is the consistency point; TCC flushes/compiles long before
+  executing. Document as a known relaxation vs hardware.
 
-**Loop:** `run → halt-on-miss → host reads miss pc → translate that block from live RAM →
-append uops + set pc2uop + patch predecessor → resume.`
+## 7. Order & effort
 
-This is batch-friendly: misses surface at `StepN` boundaries where the host already has
-control.
+| step | size | risk |
+|---|---|---|
+| D1.1 full-RAM pc map | small | low (memory math only) |
+| D1.2 growable uop buffers | medium | low |
+| D1.3 unresolved-taken recovery + fixups | **the real work** | medium — kernel BR/JAL arms + driver loop; fuzz4 extension is the safety net |
+| D1.4 harness `--rvcud` + output gate | small | — |
+| D2 dirty bitmap + invalidation | medium | low once D1 is solid |
 
----
-
-## 4. SMC invalidation (handles *overwritten* code) — store-path dirty bitmap
-
-New code is covered by §3. **Overwriting** already-translated code needs invalidation.
-Do it in the store path:
-
-- Keep a device-side **dirty bitmap**, one bit per small code page (e.g. 4 KB → bit =
-  `addr >> 12`; finer pages = less re-translation per hit, bigger bitmap).
-- In `st_i` (the store handler), after the address is known:
-  ```
-  if (addr - codeLo < codeSpan) dirty[(addr - codeLo) >> PAGE_SHIFT] = 1;
-  ```
-  A single range compare, and a write only when a store actually lands in the code span
-  (rare for ordinary data stores). Branchless, no atomics needed (idempotent set).
-- **Between launches**, the host scans the bitmap; for each dirty page it reads that page
-  back from `g_mem` (`cuda_rv32i_read_mem`), re-translates it, patches uops + `pc2uop`,
-  clears the bit, resumes.
-
-`addr >> 12` into a bitmap is about as cheap as SMC detection gets — and it's only paid
-by stores that hit the code range.
-
-Execution-miss (§3) and SMC (§4) are **orthogonal**: misses = jumping to *new* code,
-caught by the `BADUOP` halt; SMC = clobbering *old* code, caught by the store flag.
-Together they form a complete lazy DBT.
-
----
-
-## 5. Separate blocker: indirect-call leaders (breaks even static DOOM)
-
-Independent of JIT/SMC, rvcud can't run DOOM today. `rvcud_build` marks uop **leaders**
-only at direct branch/jump targets, the entry, and fall-throughs. A function reached
-**only through a function pointer** (`jalr`) has no leader at its entry → `pc2uop` =
-`BADUOP` → the indirect call halts. DOOM is saturated with function-pointer dispatch
-(think/action tables), so it halts early; the benchmark guests have ~none, so they run.
-
-The translate-on-miss machinery in §3 **also fixes this**: an indirect call to an
-untranslated entry is just a miss → translate that block on demand. So §3 is the higher-
-value piece — it unblocks both DOOM (static indirection) and TinyCC (runtime code).
-§4 (SMC) is only needed for guests that truly overwrite live code.
-
----
-
-## 6. Scope / required changes
-
-1. **Surface the miss pc** — kernel writes the faulting guest pc to a status word on halt
-   (small change to the `BADUOP`/`HALT_BIT` paths).
-2. **Incremental `rvcud_build`** — translate a *single block* from a given pc and *append*
-   to the uop / `pc2uop` / `uop2pc` / weight buffers, instead of whole-image-once. Buffers
-   must be growable (over-allocate + realloc, or a free-list).
-3. **Predecessor patching** — when a block is translated, fix up the unresolved branch
-   targets that point at it.
-4. **(SMC only) store-path dirty bitmap** + between-launch scan/readback/re-translate.
-5. **Host driver** in `CudaEmulator.StepN` — on a miss-halt, run translate-on-miss and
-   resume within the same `StepN`.
-
----
-
-## 7. Tradeoffs / when to use which core
-
-- **rvcud (static)** — fastest; use for guests whose code is fixed after entry and that
-  don't lean on pointer-only dispatch (the benchmark class). No DBT machinery, no SMC tax.
-- **rvcud + translate-on-miss** — would run DOOM and any code-after-launch guest; pays a
-  one-time translation cost per first-executed block (amortized over the run).
-- **rvcud + SMC bitmap** — additionally correct for guests that overwrite live code
-  (TinyCC reusing a code buffer); pays a per-store range-check on the hot path.
-- **base live-fetch core** — always correct for everything (re-reads live RAM each fetch),
-  zero translation machinery; the universal fallback. This is what runs DOOM and TinyCC
-  today.
-
-**Recommendation:** keep rvcud as the static fast path and the base core as the universal
-one. Implement §3 (translate-on-miss) first if/when rvcud needs to cover DOOM-class or JIT
-guests — it's the bigger unlock and is correctness-safe. Add §4 (SMC) only for guests that
-actually self-modify.
+Worth doing when: TinyCC-class guests matter for more than the demo, or when DOOM-class
+guests start shipping code the static span misses. The base kernel remains the universal
+fallback throughout — `--no-jit` style, exactly like CudaVoxel.
