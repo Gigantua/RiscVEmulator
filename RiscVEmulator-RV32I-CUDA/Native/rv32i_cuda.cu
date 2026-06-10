@@ -2043,7 +2043,11 @@ API int cuda_rvcud_step_all(int budget) {
                     // that pc into a real leader first — otherwise the guest wrongly appears halted.
                     int ew = (epc >= g_base) ? (int)((epc - g_base) >> 2) : -1;
                     if (ew >= 0 && ew < g_pc2words && g_pc2uop_h[ew] == RC_BADUOP) rvcud_translate_miss(epc);
-                    continue;                                // re-evaluate: exec_block or interpreter for the new pc
+                    // Single-core: re-evaluate exec vs interpreter for the new pc immediately.
+                    // Multi-core: fall THROUGH to the interpreter — cores whose pc was not an exec
+                    // entry made no progress in that launch; the interp launch advances them (cores
+                    // at entry pcs self-stop after ≥1 instruction, so it costs the fast cores little).
+                    if (g_ncores == 1) continue;
                 }
             }
         }
@@ -2112,7 +2116,7 @@ struct RvxCse {
 // on-device, or exits to the host/interpreter when pc2idx has no entry for pc).
 static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                      const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base,
-                     const std::vector<int>& regof, int myreg, RvxCse& cse) {
+                     const std::vector<int>& regof, int myreg, RvxCse& cse, int nc) {
     const uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
     auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2;
         return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w] && regof[w]==myreg; };
@@ -2135,8 +2139,12 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
     auto wr=[&](uint32_t r, int m){ if(!r) return; cse.mod4[r]=(uint8_t)m;
         if(cse.abBase==(int)r) cse.abBase=-1;
         if(cse.a0Base==(int)r){ cse.a0Base=-1; cse.t0Valid=false; } };
-    // Guest byte address rs1+imm. Sets A = b64 operand for [A]/[A+k], T = b32 reg holding the guest
-    // address (runtime alignment check), alok = (x[rs1]+imm) % align == 0 statically proven.
+    // Guest byte address rs1+imm. Sets A = b64 operand for [A] (and [A+k] when nc==1), T = b32 reg
+    // holding the guest address (runtime alignment check), alok = (x[rs1]+imm)%align==0 statically
+    // proven. nc==1 ⇒ flat layout: dev = %M + a. nc>1 ⇒ word-interleaved (word w of core c at
+    // g_mem[w*nc+c]): dev = %M' + (a&~3)*nc + (a&3), where %M (= M + 4*core) is pre-offset by the
+    // dispatcher. Either way %a0/%ab cache the DEV byte address of a — the CSE reuse logic is
+    // layout-independent.
     char A[8]="%a0", T[8]="%t0"; bool alok=false;
     auto addr=[&](int32_t imm, int align){
         alok = (align<=1) || (cse.mod4[rs1]!=0xFF &&
@@ -2149,9 +2157,29 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
         if (imm==0 && cse.abBase==(int)rs1) {                               // same base, imm 0 → [%ab]
             strcpy(A,"%ab"); snprintf(T,sizeof T,"%%x%u",rs1); return;      // guest addr IS x[rs1]
         }
-        rvx_app(s,"add.s32 %%t0, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t0;\nadd.u64 %%a0, %%a0, %%M;\n",rs1,imm);
+        rvx_app(s,"add.s32 %%t0, %%x%u, %d;\n",rs1,imm);
+        if (nc == 1)
+            s += "cvt.u64.u32 %a0, %t0;\nadd.u64 %a0, %a0, %M;\n";
+        else if (alok && align==4)                                          // a%4==0 proven ⇒ (a&~3)==a, (a&3)==0
+            rvx_app(s,"mul.wide.u32 %%a0, %%t0, %d;\nadd.u64 %%a0, %%a0, %%M;\n",nc);
+        else
+            rvx_app(s,"and.b32 %%t1, %%t0, -4;\nmul.wide.u32 %%a0, %%t1, %d;\n"
+                      "and.b32 %%t1, %%t0, 3;\ncvt.u64.u32 %%a1, %%t1;\n"
+                      "add.u64 %%a0, %%a0, %%a1;\nadd.u64 %%a0, %%a0, %%M;\n",nc);
         cse.a0Base=(int)rs1; cse.a0Imm=imm; cse.t0Valid=true;
         if (imm==0) { s += "mov.u64 %ab, %a0;\n"; cse.abBase=(int)rs1; }    // seed the base cache
+    };
+    // Address operand for byte i (i≥1) of a misaligned byte-wise fallback, emitted under @!%p0.
+    // Flat: the bytes are adjacent → textual [A+i]. Interleaved: byte a+i may live in the NEXT word
+    // (nc*4 bytes away) → recompute its device address into %a1 (clobbers %t1/%t2/%ad as scratch).
+    char FB[12];
+    auto fbaddr=[&](int i)->const char*{
+        if (nc == 1) { snprintf(FB,sizeof FB,"%s+%d",A,i); return FB; }
+        rvx_app(s,"@!%%p0 add.s32 %%t2, %s, %d;\n"
+                  "@!%%p0 and.b32 %%t1, %%t2, -4;\n@!%%p0 mul.wide.u32 %%a1, %%t1, %d;\n"
+                  "@!%%p0 and.b32 %%t2, %%t2, 3;\n@!%%p0 cvt.u64.u32 %%ad, %%t2;\n"
+                  "@!%%p0 add.u64 %%a1, %%a1, %%ad;\n@!%%p0 add.u64 %%a1, %%a1, %%M;\n", T, i, nc);
+        strcpy(FB,"%a1"); return FB;
     };
     switch(op) {
     case 0x37: if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,instr&0xFFFFF000u); wr(rd,0); } break;     // low 12 bits zero
@@ -2172,18 +2200,20 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                     if(alok){ rvx_app(s,"ld.global.%s %%x%u, [%s];\n",sty,rd,A); break; }
                     rvx_app(s,"and.b32 %%t1, %s, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
                               "@%%p0 ld.global.%s %%x%u, [%s];\n"
-                              "@!%%p0 ld.global.u8 %%x%u, [%s];\n@!%%p0 ld.global.%s %%t1, [%s+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
-                              T, sty,rd,A, rd,A, hib,A, rd,rd); break; }
+                              "@!%%p0 ld.global.u8 %%x%u, [%s];\n",
+                              T, sty,rd,A, rd,A);
+                    rvx_app(s,"@!%%p0 ld.global.%s %%t1, [%s];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
+                              hib, fbaddr(1), rd,rd); break; }
                 // lw: proven-aligned → bare ld.u32; else aligned fast path + byte-wise fallback — predication
                 //     makes the misaligned ld.u32 a no-op, so the unrecoverable misaligned fault can never fire.
                 if(alok){ rvx_app(s,"ld.global.u32 %%x%u, [%s];\n",rd,A); break; }
                 rvx_app(s,"and.b32 %%t1, %s, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
                           "@%%p0 ld.global.u32 %%x%u, [%s];\n"
-                          "@!%%p0 ld.global.u8 %%x%u, [%s];\n"
-                          "@!%%p0 ld.global.u8 %%t1, [%s+1];\n@!%%p0 shl.b32 %%t1, %%t1, 8;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
-                          "@!%%p0 ld.global.u8 %%t1, [%s+2];\n@!%%p0 shl.b32 %%t1, %%t1, 16;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n"
-                          "@!%%p0 ld.global.u8 %%t1, [%s+3];\n@!%%p0 shl.b32 %%t1, %%t1, 24;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
-                          T, rd,A, rd,A, A,rd,rd, A,rd,rd, A,rd,rd);
+                          "@!%%p0 ld.global.u8 %%x%u, [%s];\n",
+                          T, rd,A, rd,A);
+                for (int i=1;i<4;i++)
+                    rvx_app(s,"@!%%p0 ld.global.u8 %%t1, [%s];\n@!%%p0 shl.b32 %%t1, %%t1, %d;\n@!%%p0 or.b32 %%x%u, %%x%u, %%t1;\n",
+                              fbaddr(i), 8*i, rd,rd);
               } break;
     case 0x23:{ addr((int)rv_simm(instr), f3==2?4:(f3==1)?2:1);
                 if(f3==0){ rvx_app(s,"st.global.u8 [%s], %%x%u;\n",A,rs2); break; }                    // sb
@@ -2191,17 +2221,17 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                     if(alok){ rvx_app(s,"st.global.u16 [%s], %%x%u;\n",A,rs2); break; }
                     rvx_app(s,"and.b32 %%t1, %s, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
                               "@%%p0 st.global.u16 [%s], %%x%u;\n"
-                              "@!%%p0 st.global.u8 [%s], %%x%u;\n@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%s+1], %%t1;\n",
-                              T, A,rs2, A,rs2, rs2, A); break; }
+                              "@!%%p0 st.global.u8 [%s], %%x%u;\n",
+                              T, A,rs2, A,rs2);
+                    rvx_app(s,"@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%s], %%t1;\n", rs2, fbaddr(1)); break; }
                 // sw: proven-aligned → bare st.u32; else aligned fast path + byte-wise fallback
                 if(alok){ rvx_app(s,"st.global.u32 [%s], %%x%u;\n",A,rs2); break; }
                 rvx_app(s,"and.b32 %%t1, %s, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
                           "@%%p0 st.global.u32 [%s], %%x%u;\n"
-                          "@!%%p0 st.global.u8 [%s], %%x%u;\n"
-                          "@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%s+1], %%t1;\n"
-                          "@!%%p0 shr.b32 %%t1, %%x%u, 16;\n@!%%p0 st.global.u8 [%s+2], %%t1;\n"
-                          "@!%%p0 shr.b32 %%t1, %%x%u, 24;\n@!%%p0 st.global.u8 [%s+3], %%t1;\n",
-                          T, A,rs2, A,rs2, rs2,A, rs2,A, rs2,A);
+                          "@!%%p0 st.global.u8 [%s], %%x%u;\n",
+                          T, A,rs2, A,rs2);
+                for (int i=1;i<4;i++)
+                    rvx_app(s,"@!%%p0 shr.b32 %%t1, %%x%u, %d;\n@!%%p0 st.global.u8 [%s], %%t1;\n", rs2, 8*i, fbaddr(i));
               } break;
     case 0x13:{ if(!rd) break; int im=(int)rv_iimm(instr); uint32_t sh=im&0x1F;
                 int nm = 0xFF;                                                          // lattice: addi propagates, slli>=2 zeroes
@@ -2267,11 +2297,12 @@ static inline bool rvx_compilable(uint32_t op){
 #endif
 static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& pc2idx,
                         const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
-                        const std::vector<uint8_t>& disp) {
+                        const std::vector<uint8_t>& disp, int nc) {
     std::vector<uint32_t> body;
     for (int w=0; w<N; w++) if (comp[w]) body.push_back((uint32_t)w);
     const int nb = (int)body.size();
     int regw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) regw=v; }
+    if (nc > 1 && regw > 4000) regw = 4000;   // interleaved memops emit ~2× the PTX — keep the per-unit ptxas peak flat
     if (regw >= (1<<20)) regw = (1<<20)-1;                  // local ordinal must fit pc2idx bits 19:0
     int K = nb ? (nb + regw - 1) / regw : 1; if (K > 2048) K = 2048;   // region id fits 12 bits (no 0xFFFFFFFF alias)
     // Region cuts: start from equal-compiled-word-count ideals, then slide each cut (±700 body slots)
@@ -2348,14 +2379,15 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     for (int r=0; r<K; r++) {
         std::string& ptx = units[1+r];
         ptx  = hdr;
-        ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B at launch) — per-CTA, far cheaper than .global per region transition
+        ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
-        ptx += ".reg .b64 %M,%P2I,%a0,%ab,%ad;\n.reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n"
-               ".reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0,%p1,%p2;\n";
+        ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs;\n.reg .b32 %x<32>,%t0,%t1,%t2,%pc,%budget,%cnt;\n"
+               ".reg .u32 %wi,%bidx,%rg,%tx;\n.reg .pred %p0,%p1,%p2;\n";
+        ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
         ptx += "mov.b32 %x0, 0;\n";
-        for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%x%u, [XS+%d];\n", g, g*4);
-        ptx += "ld.shared.u32 %cnt, [XS+132];\nld.shared.u32 %budget, [XS+136];\n"
-               "ld.shared.u64 %M, [XS+144];\nld.shared.u64 %P2I, [XS+152];\nld.shared.u32 %bidx, [XS+160];\n";
+        for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%x%u, [%%xs+%d];\n", g, g*4);
+        ptx += "ld.shared.u32 %cnt, [%xs+132];\nld.shared.u32 %budget, [%xs+136];\n"
+               "ld.shared.u64 %M, [%xs+144];\nld.shared.u64 %P2I, [%xs+152];\nld.shared.u32 %bidx, [%xs+160];\n";
         ptx += "BT: .branchtargets ";
         for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
         ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
@@ -2365,7 +2397,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
             if ((int)w != prev+1 || targ[w]) cse.reset();   // run start or sideways-enterable
             rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
-            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse);
+            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc);
             bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
             if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
                 int nw = (int)w + 1;
@@ -2382,8 +2414,8 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         rvx_app(ptx, "shr.u32 %%rg, %%bidx, 20;\nsetp.ne.u32 %%p0, %%rg, %d;\n@%%p0 bra XSAVE;\n", r);
         ptx += "and.b32 %bidx, %bidx, 1048575;\nbra JBRX;\n";
         ptx += "XSAVE:\n";
-        for (int g=1; g<32; g++) rvx_app(ptx, "st.shared.u32 [XS+%d], %%x%u;\n", g*4, g);
-        ptx += "st.shared.u32 [XS+128], %pc;\nst.shared.u32 [XS+132], %cnt;\nret;\n}\n";
+        for (int g=1; g<32; g++) rvx_app(ptx, "st.shared.u32 [%%xs+%d], %%x%u;\n", g*4, g);
+        ptx += "st.shared.u32 [%xs+128], %pc;\nst.shared.u32 [%xs+132], %cnt;\nret;\n}\n";
     }
     // ── dispatcher unit: state→XS, then loop { budget/bounds/pc2idx gate → call region } → state←XS.
     std::string& ptx = units[0];
@@ -2391,25 +2423,34 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     ptx += ".extern .shared .align 8 .b8 XS[];\n";       // same dynamic-shared segment the region units alias
     for (int r=0; r<K; r++) rvx_app(ptx, ".extern .func xr%d;\n", r);
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
-    ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0;\n";
+    ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad,%xs;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg,%gid,%tx;\n.reg .pred %p0,%pz;\n";
     ptx += "ld.param.u64 %M,[pM];\nld.param.u64 %S,[pS];\nld.param.u32 %budget,[pBud];\n"
            "ld.param.u64 %P2I,[pP2I];\nld.param.u64 %RET,[pRet];\n";
-    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.shared.u32 [XS+%d], %%t0;\n", g*4, g*4);
+    // One thread per guest core: gid-guard, per-thread XS slot (168 B), per-core CoreState (%S +=
+    // gid*132) and interleave lane base (%M += 4*gid — the regions' address math then only needs
+    // the (a&~3)*nc word term). Core 0 alone reports the retired count.
+    ptx += "mov.u32 %tx, %tid.x;\nmov.u32 %rg, %ctaid.x;\nmov.u32 %wi, %ntid.x;\nmad.lo.u32 %gid, %rg, %wi, %tx;\n";
+    rvx_app(ptx, "setp.ge.u32 %%pz, %%gid, %d;\n@%%pz ret;\n", nc);
+    ptx += "mov.u64 %xs, XS;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
+    ptx += "mul.wide.u32 %ad, %gid, 132;\nadd.u64 %S, %S, %ad;\n";
+    if (nc > 1) ptx += "mul.wide.u32 %ad, %gid, 4;\nadd.u64 %M, %M, %ad;\n";
+    ptx += "setp.eq.u32 %pz, %gid, 0;\n";
+    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.shared.u32 [%%xs+%d], %%t0;\n", g*4, g*4);
     rvx_app(ptx, "ld.global.u32 %%pc, [%%S+%d];\nmov.b32 %%cnt, 0;\n", 32*4);
-    ptx += "st.shared.u32 [XS+132], %cnt;\nst.shared.u32 [XS+136], %budget;\n"
-           "st.shared.u64 [XS+144], %M;\nst.shared.u64 [XS+152], %P2I;\n";
+    ptx += "st.shared.u32 [%xs+132], %cnt;\nst.shared.u32 [%xs+136], %budget;\n"
+           "st.shared.u64 [%xs+144], %M;\nst.shared.u64 [%xs+152], %P2I;\n";
     ptx += "DLOOP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
     rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
     rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
     ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n";
     ptx += "setp.eq.u32 %p0, %bidx, 4294967295;\n@%p0 bra XSAVE;\n";
-    ptx += "shr.u32 %rg, %bidx, 20;\nand.b32 %bidx, %bidx, 1048575;\nst.shared.u32 [XS+160], %bidx;\n";
+    ptx += "shr.u32 %rg, %bidx, 20;\nand.b32 %bidx, %bidx, 1048575;\nst.shared.u32 [%xs+160], %bidx;\n";
     for (int r=0; r<K; r++) rvx_app(ptx, "setp.eq.u32 %%p0, %%rg, %d;\n@%%p0 call.uni xr%d;\n", r, r);
-    ptx += "ld.shared.u32 %pc, [XS+128];\nld.shared.u32 %cnt, [XS+132];\nbra DLOOP;\n";
-    // save architectural state and return retired count
+    ptx += "ld.shared.u32 %pc, [%xs+128];\nld.shared.u32 %cnt, [%xs+132];\nbra DLOOP;\n";
+    // save architectural state; core 0 alone returns the retired count
     ptx += "XSAVE:\n";
-    for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%t0, [XS+%d];\nst.global.u32 [%%S+%d], %%t0;\n", g*4, g*4);
-    rvx_app(ptx,"st.global.u32 [%%S+%d], %%pc;\nst.global.u32 [%%RET], %%cnt;\nret;\n}\n", 32*4);
+    for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%t0, [%%xs+%d];\nst.global.u32 [%%S+%d], %%t0;\n", g*4, g*4);
+    rvx_app(ptx,"st.global.u32 [%%S+%d], %%pc;\n@%%pz st.global.u32 [%%RET], %%cnt;\nret;\n}\n", 32*4);
 }
 
 // Compile each PTX unit OUT-OF-PROCESS with the toolkit's ptxas (-c --disable-optimizer-constants),
@@ -2521,7 +2562,9 @@ static void rvxblk_build() {
     // Default ON again: MULTIMOD's per-region out-of-process assembly removed the single-function ptxas
     // memory knee (the old monolith transiently committed ~13 GB on any PTX change; now ≤~1.4 GB peak
     // with each region assembled in a spawned ptxas). RVX_OFF=1 still disables exec entirely.
-    if (g_ncores != 1 || g_img.empty()) return;
+    // Multi-core: one thread per guest core (same hybrid), word-interleaved addressing baked into the
+    // generated PTX; lockstep guests run the regions in SIMT just like the interpreter.
+    if (g_ncores < 1 || g_img.empty()) return;
     int maxw = RVX_MAXW; if (const char* e=getenv("RVX_MAXW")) { int v=atoi(e); if (v>0) maxw=v; }
     int N = g_pc2words;
     std::vector<uint8_t> comp(N, 0), seen(N, 0);
@@ -2567,7 +2610,7 @@ static void rvxblk_build() {
     for (int w=0; w<N; w++) ndisp += disp[w];
 
     std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp);
+    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp, g_ncores);
     if (const char* dp = getenv("RVX_DUMP"))                 // offline ptxas experiments: <prefix><u>.ptx per unit
         for (size_t u=0; u<ptx.size(); u++) {
             char fn[512]; snprintf(fn, sizeof fn, "%s%zu.ptx", dp, u);
@@ -2621,7 +2664,9 @@ static long long rvxblk_step(long long budget) {
     *g_ret = 0;
     unsigned bud = (budget > 0x7fffffff) ? 0x7fffffffu : (unsigned)budget;
     void* args[] = { &g_mem, &g_state, &bud, &g_x_pc2idx, &g_ret };
-    CUresult r = cuLaunchKernel(g_xfn, 1,1,1, 1,1,1, 168,0, args, nullptr);   // 168 B dynamic shared = XS spill block
+    int block = g_ncores < 64 ? g_ncores : 64;                                // one thread per guest core (2-warp blocks)
+    int grid  = (g_ncores + block - 1) / block;
+    CUresult r = cuLaunchKernel(g_xfn, grid,1,1, block,1,1, 168*block,0, args, nullptr);   // 168 B dynamic shared per thread = XS spill slots
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] launch %d\n",(int)r); return -1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr,"[xblk] sync fault\n"); return -1; }
     return (long long)*g_ret;
@@ -2649,7 +2694,7 @@ API int cuda_rvexec_selftest() {
     if (cuModuleGetFunction(&fn, mod, "k") != CUDA_SUCCESS) { cuModuleUnload(mod); return 0; }
     unsigned* d=nullptr; cudaMalloc(&d,4); cudaMemset(d,0,4);
     void* args[]={&d};
-    CUresult lr = cuLaunchKernel(fn, 1,1,1, 1,1,1, 0,0, args, nullptr);
+    CUresult lr = cuLaunchKernel(fn, 1,1,1, 1,1,1, 168,0, args, nullptr);
     cudaDeviceSynchronize();
     unsigned h=0; cudaMemcpy(&h,d,4,cudaMemcpyDeviceToHost);
     cudaFree(d); cuModuleUnload(mod);
@@ -2683,7 +2728,7 @@ API int cuda_rvexec_blocktest() {
     std::vector<uint8_t> comp(N,0);
     for (int w=0; w<N; w++) if (rvx_compilable(img[w]&0x7F)) comp[w]=1;   // word 8 (ebreak) stays 0
     std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, img.data(), N, base, comp, comp);   // tests: every compiled word is a dispatch entry
+    rvx_codegen(ptx, pc2idx, img.data(), N, base, comp, comp, 1);   // tests: every compiled word is a dispatch entry
 
     cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
@@ -2698,7 +2743,7 @@ API int cuda_rvexec_blocktest() {
     unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
     unsigned bud=1000;
     void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-    CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr);
+    CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr);
     cudaError_t se=cudaDeviceSynchronize();
     cudaMemcpy(&st,d_st,sizeof st,cudaMemcpyDeviceToHost);
     unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
@@ -2790,7 +2835,7 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // exec_block run
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2798,7 +2843,7 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
         unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
         unsigned bud=300000; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
         cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
         cudaFree(d_st); cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_ret); cuModuleUnload(mod);
         bool ok = (lr==CUDA_SUCCESS && se==cudaSuccess && cs.pc==ref_pc && (long long)ret==rs);
@@ -2857,7 +2902,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
         compared++;
         uint32_t ref_pc=pc;
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=1;
-        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz2] prog %d module fail\n",p); fails++; continue; }
         CoreState cs; memset(&cs,0,sizeof cs); cs.pc=base;
         CoreState* d_st=nullptr; cudaMalloc(&d_st,sizeof cs); cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
@@ -2865,7 +2910,7 @@ API int cuda_rvexec_fuzz2(int seed, int nprog) {
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
         unsigned* d_ret=nullptr; cudaMalloc(&d_ret,4); cudaMemset(d_ret,0,4);
         unsigned bud=(unsigned)rs+64; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+        CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
         cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); unsigned ret=0; cudaMemcpy(&ret,d_ret,4,cudaMemcpyDeviceToHost);
         cudaFree(d_st); cudaFree(d_mem); cudaFree(d_p2i); cudaFree(d_ret); cuModuleUnload(mod);
         bool ok = (lr==CUDA_SUCCESS && se==cudaSuccess && cs.pc==ref_pc && (long long)ret==rs);
@@ -2915,7 +2960,7 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
         uint32_t ref_pc=pc;
         // random compiled subset (≈70%); never compile the ebreak
         std::vector<uint8_t> comp(N,0); for(int w=0;w<PL;w++) comp[w]=(rnd()%100)<70;
-        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp);
+        std::vector<std::string> ptx; std::vector<uint32_t> pc2idx; rvx_codegen(ptx,pc2idx,img.data(),N,base,comp,comp,1);
         CUmodule mod; CUfunction fn; if(rvx_load_module(ptx,&mod,&fn)!=0){ fprintf(stderr,"[fuzz3] prog %d module fail\n",p); fails++; continue; }
         void* d_mem=nullptr; cudaMalloc(&d_mem,MEMB); cudaMemset(d_mem,0,MEMB);
         void* d_p2i=nullptr; cudaMalloc(&d_p2i,(size_t)N*4); cudaMemcpy(d_p2i,pc2idx.data(),(size_t)N*4,cudaMemcpyHostToDevice);
@@ -2930,7 +2975,7 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
                 cudaMemcpy(d_st,&cs,sizeof cs,cudaMemcpyHostToDevice);
                 cudaMemcpy(d_mem,Mh.data(),MEMB,cudaMemcpyHostToDevice);
                 cudaMemset(d_ret,0,4); unsigned bud=100000; void* args[]={&d_mem,&d_st,&bud,&d_p2i,&d_ret};
-                CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,0,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
+                CUresult lr=cuLaunchKernel(fn,1,1,1,1,1,1,168,0,args,nullptr); cudaError_t se=cudaDeviceSynchronize();
                 if(lr!=CUDA_SUCCESS||se!=cudaSuccess){ blew=true; break; }
                 cudaMemcpy(&cs,d_st,sizeof cs,cudaMemcpyDeviceToHost); cudaMemcpy(Mh.data(),d_mem,MEMB,cudaMemcpyDeviceToHost);
                 for(int r=0;r<32;r++) Rh[r]=cs.regs[r]; Rh[0]=0; pc=cs.pc;

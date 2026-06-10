@@ -160,10 +160,59 @@ if (args.Contains("--bench"))
     Console.WriteLine(allpass ? "  → rvcud bit-identical ✓\n" : "  → rvcud MISMATCH ✗\n");
 }
 
+// ── multi-core exec_block correctness gate ── a per-core-seeded HALTING guest (aligned +
+// misaligned memory traffic, branchy) runs to completion on both backends, so per-core final
+// state is comparable without retired-count bookkeeping. Every core's scratch-RAM+sink hash
+// must match between rv32i and rvcud(exec) at 32 cores (one warp) and 64 (one block).
+{
+    var vg = Build("verify_guest");
+    Console.WriteLine("[multicore verify] rv32i vs rvcud(exec), run-to-halt, per-core RAM hash");
+    bool allok = true;
+    foreach (int cores in new[] { 32, 64 })
+    {
+        ulong[] Go(bool rvcud)
+        {
+            var image = new byte[RamBytes];
+            ElfLoader.Load(vg.elf, new ArrayBus(image));
+            cuda_rv32i_init(cores, RamBytes);
+            for (int c = 0; c < cores; c++)
+            {
+                cuda_rv32i_write_mem(c, image, 0, (uint)image.Length);
+                cuda_rv32i_write_mem(c, BitConverter.GetBytes((uint)c), SeedAddr, 4);
+                cuda_rv32i_set_reg(c, 2, Sp);
+                cuda_rv32i_set_entry(c, vg.entry);
+            }
+            if (rvcud) cuda_rvcud_set_code(image, (uint)image.Length, 0, vg.entry);
+            Func<int,int> st = rvcud ? cuda_rvcud_step_all : cuda_rv32i_step_all;
+            for (int i = 0; i < 4; i++) st(1_000_000);           // guest halts at ~1.7M retired
+            var r = new ulong[cores];
+            var buf = new byte[0x2004];                          // scratch 0x4000..0x6000 + sink
+            for (int c = 0; c < cores; c++)
+            {
+                cuda_rv32i_read_mem(c, buf, 0x4000, 0x2000);
+                byte[] sink = new byte[4]; cuda_rv32i_read_mem(c, sink, 0x3000, 4);
+                ulong h = 1469598103934665603UL;
+                foreach (var b in buf) { h = (h ^ b) * 1099511628211UL; }
+                foreach (var b in sink) { h = (h ^ b) * 1099511628211UL; }
+                r[c] = h;
+            }
+            cuda_rv32i_shutdown();
+            return r;
+        }
+        var a = Go(false); var b2 = Go(true);
+        int bad = -1; for (int c = 0; c < cores; c++) if (a[c] != b2[c]) { bad = c; break; }
+        bool ok = bad < 0;
+        allok &= ok;
+        Console.WriteLine($"  {cores,3} cores  rv32i[0]=0x{a[0]:X16}  rvcud[0]=0x{b2[0]:X16}  " +
+                          (ok ? "PASS (all cores match)" : $"FAIL (core {bad})"));
+    }
+    Console.WriteLine(allok ? "  → multicore exec bit-identical ✓\n" : "  → multicore exec MISMATCH ✗\n");
+}
+
 // ── 1) Single-core latency ──
 // verify = result-sink word after a fixed budget; deterministic per guest, so it
 // is a correctness fingerprint that must stay constant across kernel changes.
-Console.WriteLine("[single core] 1 core — interpreter MIPS");
+Console.WriteLine("[single core] 1 core — guest MIPS (rvcud + exec_block JIT)");
 Console.WriteLine("  guest      MIPS/core    verify");
 Console.WriteLine("  ───────    ─────────    ──────────");
 foreach (var (g, name, va) in new[] { (comp, "compute", 0x3000u), (bench, "data", 0x4000u), (div, "diverge", 0x80u) })
@@ -177,7 +226,7 @@ Console.WriteLine();
 // block=32, grid=1, so all 32 lanes issue in SIMT lockstep within a single warp.
 // compute/data run lockstep (≈32× the single-core rate, free SIMT parallelism);
 // diverge gives each lane its own seed, exposing the warp-divergence penalty.
-Console.WriteLine("[single warp] 32 cores (1 block = 1 warp) — interpreter MIPS");
+Console.WriteLine("[single warp] 32 cores (1 block = 1 warp) — guest MIPS (rvcud + exec_block JIT)");
 Console.WriteLine("  guest      warp MIPS    MIPS/core");
 Console.WriteLine("  ───────    ─────────    ─────────");
 foreach (var (g, name) in new[] { (comp, "compute"), (bench, "data"), (div, "diverge") })
@@ -205,8 +254,8 @@ if (args.Contains("--sweep"))
 }
 else Console.WriteLine("[throughput] skipped — pass --sweep to run (≤32768 cores, ≤1 GB).");
 
-Console.WriteLine("\nSingle-core is interpreter-bound (~2.5 MIPS); aggregate throughput scales with");
-Console.WriteLine("core count (bounded by VRAM / per-core RAM).");
+Console.WriteLine("\nSingle-core runs register-resident in the exec_block JIT; lockstep warps get SIMT");
+Console.WriteLine("nearly free. Aggregate scales with core count (bounded by VRAM / per-core RAM).");
 return 0;
 
 // Minimal IMemoryBus over a byte[] so ElfLoader can build the image.
