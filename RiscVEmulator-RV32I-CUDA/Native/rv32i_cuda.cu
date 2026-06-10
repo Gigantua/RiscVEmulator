@@ -166,8 +166,20 @@ rv32i_kernel(CoreState* st, uint32_t* mem, int ncores, int budget) {
             r = alu(f3, u1, d0, (uint32_t)sh, false, f7 == 0x20);
         }
         else if (op == 0x33) {
-            if (f7 != 0x00 && !(f7 == 0x20 && (f3 == 0 || f3 == 5))) { pc |= HALT_BIT; continue; }
-            r = alu(f3, u1, u2, (uint32_t)(s2 & 0x1F), f7 == 0x20, f7 == 0x20);
+            if (f7 == 0x01) {                            // M extension (exact RV32M semantics)
+                switch (f3) {
+                    case 0: r = u1 * u2; break;
+                    case 1: r = (uint32_t)(((int64_t)s1 * (int64_t)s2) >> 32); break;
+                    case 2: r = (uint32_t)(((int64_t)s1 * (int64_t)(uint64_t)u2) >> 32); break;
+                    case 3: r = (uint32_t)(((uint64_t)u1 * (uint64_t)u2) >> 32); break;
+                    case 4: r = (u2==0) ? 0xFFFFFFFFu : (s1==(int32_t)0x80000000 && s2==-1) ? 0x80000000u : (uint32_t)(s1/s2); break;
+                    case 5: r = (u2==0) ? 0xFFFFFFFFu : (u1/u2); break;
+                    case 6: r = (u2==0) ? u1 : (s1==(int32_t)0x80000000 && s2==-1) ? 0u : (uint32_t)(s1%s2); break;
+                    default:r = (u2==0) ? u1 : (u1%u2); break;
+                }
+            }
+            else if (f7 != 0x00 && !(f7 == 0x20 && (f3 == 0 || f3 == 5))) { pc |= HALT_BIT; continue; }
+            else r = alu(f3, u1, u2, (uint32_t)(s2 & 0x1F), f7 == 0x20, f7 == 0x20);
         }
         else if (op == 0x03) {
             uint32_t addr = (uint32_t)(s1 + (int32_t)d0);
@@ -683,8 +695,13 @@ rvcud_kernel(CoreState* __restrict__ st, uint32_t* __restrict__ mem, const uint2
     }
     #pragma unroll
     for (int i = 0; i < 32; i++) g.regs[i] = regs[i];
-    // Resume pc: a missed JALR target (→ host translates it), else the current uop's pc, else halt.
-    g.pc = (resume_pc != HALT_BIT) ? resume_pc : (((int32_t)ui >= 0) ? __ldg(&uop2pc[ui]) : HALT_BIT);
+    // Resume pc: a missed JALR target (→ host translates it), else the current uop's pc. On halt,
+    // PRESERVE the faulting pc next to the bit (the base kernel does; HALT_BIT alone made every
+    // guest fault read as pc=0 — undebuggable).
+    g.pc = (resume_pc != HALT_BIT) ? resume_pc
+         : (((int32_t)ui >= 0)     ? __ldg(&uop2pc[ui])
+         : (ui != HALT_BIT)        ? (__ldg(&uop2pc[ui & 0x7FFFFFFFu]) | HALT_BIT)
+                                   : (pc | HALT_BIT));
     if (id == 0 && retd) { *retd = (unsigned long long)gi; g_dev_iters += iters; }          // retired guest-instructions (for the verify gate)
 }
 
@@ -757,6 +774,8 @@ API void cuda_rv32i_set_reg  (int core, int i, unsigned int v) {
 }
 API void cuda_rv32i_set_entry(int core, unsigned int pc)       { g_state[core].pc = pc; }
 API void cuda_rv32i_set_halted(int core, int v) { if (v) g_state[core].pc |= HALT_BIT; else g_state[core].pc &= ~HALT_BIT; }
+API unsigned int cuda_rv32i_get_pc(int core)  { return g_state ? g_state[core].pc : 0u; }
+API unsigned int cuda_rv32i_get_reg(int core, int i) { return g_state ? g_state[core].regs[i & 31] : 0u; }
 
 // Host I/O scatters/gathers words into the interleaved layout (one word per 2D
 // "row", stride g_ncores words). off/len are word-aligned for all call sites.
@@ -1948,31 +1967,36 @@ static void rvcud_build(RvcudBuild& B) {
     }
     rvcud_liveness(B);
     // Pass 2 — emit uops (fusion may consume >1 word, never crossing/swallowing a leader).
+    // RVCUD_FUSEMASK (hex bitmask, default all-on) gates each matcher — debug/bisect tool.
+    unsigned fm = 0xFFFFFFFFu;
+    { const char* s = getenv("RVCUD_FUSEMASK"); if (s) fm = (unsigned)strtoul(s, nullptr, 16); }
+    auto FM = [&](int i){ return (fm >> i) & 1u; };
     B.pc2uop.assign(N, RC_BADUOP);
     uint32_t ui = 0;
     for (int w = 0; w < N; ) {
-        int consumed = rvcud_try_mulloop(B, w, ui);                // shift-add software-multiply loop → 1 hw multiply
-        if (consumed == 0) consumed = rvcud_try_divloop(B, w, ui);  // bit-serial software-divide loop → 1 hw divide
-        if (consumed == 0) consumed = rvcud_try_palexp(B, w, ui);   // 8bpp→32bpp palette-expand loop → 1 native loop uop
-        if (consumed == 0) consumed = rvcud_try_texspan(B, w, ui);  // texture-mapped span loop → 1 native loop uop
-        if (consumed == 0) consumed = rvcud_try_texcol(B, w, ui);   // textured-column loop → 1 native loop uop
-        if (consumed == 0) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
-        if (consumed == 0) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
-        if (consumed == 0) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
-        if (consumed == 0) consumed = rvcud_try_memset(B, w, ui);    // whole byte-fill (memset) loop → 1 native uop
-        if (consumed == 0) consumed = rvcud_try_wordfill(B, w, ui);  // direct-form sX-fill loop → 1 native uop
-        if (consumed == 0) consumed = rvcud_try_wordscan(B, w, ui);  // counted search loop → 1 native uop
-        if (consumed == 0) consumed = rvcud_try_copyloopt(B, w, ui);   // temp-advance strided copy loop → 1 native uop
-        if (consumed == 0) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
-        if (consumed == 0) consumed = rvcud_try_copyloops(B, w, ui); // whole strided copy loop → 1 native uop
-        if (consumed == 0) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
-        if (consumed == 0) consumed = rvcud_try_ldxs(B, w, ui);     // slli + add + load → scaled-indexed load (1 uop)
-        if (consumed == 0) consumed = rvcud_try_ldx(B, w, ui);      // add + load/store → indexed mem op (1 uop)
-        if (consumed == 0) consumed = rvcud_try_postinc(B, w, ui);  // load/store + base post-increment → 1 uop
+        int consumed = FM(0) ? rvcud_try_mulloop(B, w, ui) : 0;    // shift-add software-multiply loop → 1 hw multiply
+        if (consumed == 0 && FM(1)) consumed = rvcud_try_divloop(B, w, ui);  // bit-serial software-divide loop → 1 hw divide
+        if (consumed == 0 && FM(2)) consumed = rvcud_try_palexp(B, w, ui);   // 8bpp→32bpp palette-expand loop → 1 native loop uop
+        if (consumed == 0 && FM(3)) consumed = rvcud_try_texspan(B, w, ui);  // texture-mapped span loop → 1 native loop uop
+        if (consumed == 0 && FM(4)) consumed = rvcud_try_texcol(B, w, ui);   // textured-column loop → 1 native loop uop
+        if (consumed == 0 && FM(5)) consumed = rvcud_try_incbr(B, w, ui);   // counted-loop addi+branch → INCBR
+        if (consumed == 0 && FM(6)) consumed = rvcud_try_ifconv(B, w, ui);  // if-conversion (short forward branch → predicated)
+        if (consumed == 0 && FM(7)) consumed = rvcud_try_affine(B, w, ui);  // affine ×const fold → MULADD/MULC + ADD chain
+        if (consumed == 0 && FM(8)) consumed = rvcud_try_memset(B, w, ui);    // whole byte-fill (memset) loop → 1 native uop
+        if (consumed == 0 && FM(9)) consumed = rvcud_try_wordfill(B, w, ui);  // direct-form sX-fill loop → 1 native uop
+        if (consumed == 0 && FM(10)) consumed = rvcud_try_wordscan(B, w, ui);  // counted search loop → 1 native uop
+        if (consumed == 0 && FM(11)) consumed = rvcud_try_copyloopt(B, w, ui);   // temp-advance strided copy loop → 1 native uop
+        if (consumed == 0 && FM(12)) consumed = rvcud_try_copyloop(B, w, ui);  // whole byte-memcpy loop → 1 word-widened uop
+        if (consumed == 0 && FM(13)) consumed = rvcud_try_copyloops(B, w, ui); // whole strided copy loop → 1 native uop
+        if (consumed == 0 && FM(14)) consumed = rvcud_try_copy(B, w, ui);     // lb;sb;addi;addi memory-copy step → 1 uop
+        if (consumed == 0 && FM(15)) consumed = rvcud_try_ldxs(B, w, ui);     // slli + add + load → scaled-indexed load (1 uop)
+        if (consumed == 0 && FM(16)) consumed = rvcud_try_ldx(B, w, ui);      // add + load/store → indexed mem op (1 uop)
+        if (consumed == 0 && FM(17)) consumed = rvcud_try_postinc(B, w, ui);  // load/store + base post-increment → 1 uop
         if (consumed == 0) {
             B.pc2uop[w] = ui;
             uint32_t a0, a1, t; uint8_t wt;
-            consumed = rvcud_try_fuse(B, w, a0, a1, wt, t);   // ≥1; swallowed words stay BADUOP (LEA/CONST/XSH)
+            if (FM(18)) consumed = rvcud_try_fuse(B, w, a0, a1, wt, t);   // ≥1; swallowed words stay BADUOP (LEA/CONST/XSH)
+            else        consumed = rvcud_classify(B, w, a0, a1, wt, t);   // bisect mode: pure 1:1
             B.w0.push_back(a0); B.w1.push_back(a1); B.uw.push_back(wt);
             B.u2pc.push_back(B.base + (uint32_t)w*4); B.tgt.push_back(t);
             ui++;
@@ -2175,6 +2199,8 @@ API int cuda_rvcud_step_all(int budget) {
         if (s_stats) { s_il++; s_iret += (long long)*g_ret; }
         total += (long long)*g_ret;                  // core 0 retired this launch
         uint32_t pc = g_state[0].pc;                 // managed memory → host-readable
+        { static int s_trc = -1; if (s_trc < 0) s_trc = getenv("RVCUD_TRACE") ? 1 : 0;
+          if (s_trc) fprintf(stderr, "[trc] pc=%08X ret=%llu total=%lld\n", pc, *g_ret, total); }
         if (pc & 0x80000000u) break;                 // halted (illegal instr / guest done)
         int w = (pc >= g_base) ? (int)((pc - g_base) >> 2) : -1;
         if (w >= 0 && w < g_pc2words && g_pc2uop_h[w] == RC_BADUOP) {
@@ -2452,6 +2478,39 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                   default: rvx_app(s,"shr.%s %%x%u, %%x%u, %u;\n",(f7==0x20)?"s32":"u32",rd,rs1,sh); }
                 wr(rd,nm); } break;
     case 0x33:{ if(!rd) break;
+                if (f7==0x01) {                                                         // M extension (exact RV32M semantics)
+                    switch(f3){
+                      case 0: rvx_app(s,"mul.lo.s32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); break;
+                      case 1: rvx_app(s,"mul.hi.s32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); break;
+                      case 2: rvx_app(s,"cvt.s64.s32 %%a0, %%x%u;\ncvt.u64.u32 %%a1, %%x%u;\n"   // mulhsu: (s64)x * (u64)y >> 32
+                                        "mul.lo.s64 %%a0, %%a0, %%a1;\nshr.u64 %%a0, %%a0, 32;\n"
+                                        "cvt.u32.u64 %%x%u, %%a0;\n",rs1,rs2,rd); break;
+                      case 3: rvx_app(s,"mul.hi.u32 %%x%u, %%x%u, %%x%u;\n",rd,rs1,rs2); break;
+                      case 4: // div: y==0 → -1; INT_MIN/-1 → INT_MIN (divisor forced to 1 covers it: INT_MIN/1)
+                              rvx_app(s,"setp.eq.s32 %%p0, %%x%u, 0;\n"
+                                        "setp.eq.s32 %%p1, %%x%u, -2147483648;\nsetp.eq.s32 %%p2, %%x%u, -1;\n"
+                                        "and.pred %%p1, %%p1, %%p2;\nor.pred %%p2, %%p0, %%p1;\n"
+                                        "selp.b32 %%t0, 1, %%x%u, %%p2;\n"
+                                        "div.s32 %%t1, %%x%u, %%t0;\n"
+                                        "selp.b32 %%x%u, -1, %%t1, %%p0;\n",
+                                        rs2, rs1, rs2, rs2, rs1, rd); cse.t0Valid=false; break;
+                      case 5: rvx_app(s,"setp.eq.u32 %%p0, %%x%u, 0;\nselp.b32 %%t0, 1, %%x%u, %%p0;\n"
+                                        "div.u32 %%t1, %%x%u, %%t0;\nselp.b32 %%x%u, -1, %%t1, %%p0;\n",
+                                        rs2, rs2, rs1, rd); cse.t0Valid=false; break;
+                      case 6: // rem: y==0 → x; INT_MIN%-1 → 0 (x%1 == 0 covers it)
+                              rvx_app(s,"setp.eq.s32 %%p0, %%x%u, 0;\n"
+                                        "setp.eq.s32 %%p1, %%x%u, -2147483648;\nsetp.eq.s32 %%p2, %%x%u, -1;\n"
+                                        "and.pred %%p1, %%p1, %%p2;\nor.pred %%p2, %%p0, %%p1;\n"
+                                        "selp.b32 %%t0, 1, %%x%u, %%p2;\n"
+                                        "rem.s32 %%t1, %%x%u, %%t0;\n"
+                                        "selp.b32 %%x%u, %%x%u, %%t1, %%p0;\n",
+                                        rs2, rs1, rs2, rs2, rs1, rd, rs1); cse.t0Valid=false; break;
+                      default:rvx_app(s,"setp.eq.u32 %%p0, %%x%u, 0;\nselp.b32 %%t0, 1, %%x%u, %%p0;\n"
+                                        "rem.u32 %%t1, %%x%u, %%t0;\nselp.b32 %%x%u, %%x%u, %%t1, %%p0;\n",
+                                        rs2, rs2, rs1, rd, rs1); cse.t0Valid=false; break;
+                    }
+                    wr(rd,0xFF); break;
+                }
                 int nm = 0xFF;                                                          // lattice: add/sub combine if both known
                 if (f3==0 && cse.mod4[rs1]!=0xFF && cse.mod4[rs2]!=0xFF)
                     nm = (int)(((f7==0x20) ? (uint32_t)cse.mod4[rs1]-(uint32_t)cse.mod4[rs2]
@@ -3579,6 +3638,19 @@ static uint32_t rvx_ref_step(uint32_t* R, uint8_t* M, uint32_t pc, uint32_t inst
                               case 1:v=u1<<sh;break;default:v=(f7==0x20)?(uint32_t)((int32_t)u1>>sh):(u1>>sh);}
                    wr(v); return pc+4; }
       case 0x33: { uint32_t u1=R[rs1],u2=R[rs2],sh=u2&31,v;
+                   if (f7==0x01) {                          // M extension (exact RV32M semantics)
+                     int32_t s1=(int32_t)u1,s2=(int32_t)u2;
+                     switch(f3){
+                       case 0: v=u1*u2; break;
+                       case 1: v=(uint32_t)(((int64_t)s1*(int64_t)s2)>>32); break;
+                       case 2: v=(uint32_t)(((int64_t)s1*(int64_t)(uint64_t)u2)>>32); break;
+                       case 3: v=(uint32_t)(((uint64_t)u1*(uint64_t)u2)>>32); break;
+                       case 4: v=(u2==0)?0xFFFFFFFFu:(s1==(int32_t)0x80000000&&s2==-1)?0x80000000u:(uint32_t)(s1/s2); break;
+                       case 5: v=(u2==0)?0xFFFFFFFFu:(u1/u2); break;
+                       case 6: v=(u2==0)?u1:(s1==(int32_t)0x80000000&&s2==-1)?0u:(uint32_t)(s1%s2); break;
+                       default:v=(u2==0)?u1:(u1%u2); }
+                     wr(v); return pc+4;
+                   }
                    switch(f3){case 0:v=(f7==0x20)?(u1-u2):(u1+u2);break;case 1:v=u1<<sh;break;case 2:v=((int32_t)u1<(int32_t)u2)?1:0;break;
                               case 3:v=(u1<u2)?1:0;break;case 4:v=u1^u2;break;case 5:v=(f7==0x20)?(uint32_t)((int32_t)u1>>sh):(u1>>sh);break;
                               case 6:v=u1|u2;break;default:v=u1&u2;}
@@ -3619,7 +3691,9 @@ API int cuda_rvexec_fuzz(int seed, int nprog) {
                 instr=(((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
             else if (k<84) { uint32_t f3=rnd()&7, imm12=rnd()&0xFFF, f7=(f3==5&&(rnd()&1))?0x20:0;        // op-imm
                 instr=(imm12<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; if(f3==1||f3==5) instr=(f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
-            else { uint32_t f3=rnd()&7, f7=((f3==0||f3==5)&&(rnd()&1))?0x20:0;                             // op (R)
+            else { uint32_t f3=rnd()&7, f7;                                                                // op (R) — incl. M extension
+                if (rnd()%10 < 3) f7=0x01;                                                                 // mul/mulh[s]u/div[u]/rem[u]
+                else f7=((f3==0||f3==5)&&(rnd()&1))?0x20:0;
                 instr=(f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
             img[w]=instr;
         }
@@ -3790,6 +3864,140 @@ API int cuda_rvexec_fuzz3(int seed, int nprog) {
         }
     }
     fprintf(stderr,"[fuzz3] %d programs, %d failures (seed=%d)\n", nprog, fails, seed);
+    return fails;
+}
+
+// Differential fuzz #4: the FULL rvcud pipeline (translator incl. all fusion arms + the interpreter
+// kernel ladder) vs rvx_ref_step, on forward-only random programs INCLUDING the M extension. The
+// exec fuzzers (#1-#3) cover rvx_emit only — an interpreter-arm bug ships undetected if nothing
+// dynamic exercises it (RC_MEXT was exactly that). Compares final regs + pc + the data scratch.
+API int cuda_rvcud_fuzz(int seed, int nprog) {
+    if (!g_state && cuda_rv32i_init(1, 1u << 20) != 0) return -1;
+    _putenv("RVX_OFF=1");                          // interpreter-only: skip the per-program exec build
+    uint32_t st = (uint32_t)seed; auto rnd = [&]() { st = st*1664525u + 1013904223u; return st; };
+    const uint32_t base = 0x1000, DLO = 0x200, DHI = 0x400;
+    int fails = 0;
+    std::vector<uint8_t> zero(0x1000, 0);
+    for (int p = 0; p < nprog; p++) {
+        int PL = 8 + (int)(rnd() % 56);
+        std::vector<uint32_t> img(PL + 1);
+        for (int w = 0; w < PL; w++) {
+            uint32_t k = rnd()%100, rd = rnd()&31, rs1 = rnd()&31, rs2 = rnd()&31, instr;
+            if (k < 20) instr = (((rnd()&0xFFFFF)<<12)) | (rd<<7) | ((rnd()&1) ? 0x37 : 0x17);
+            else if (k < 28 && w+1 < PL) {
+                uint32_t f3 = (uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                int hop = 1 + (int)(rnd() % ((PL-w) > 6 ? 6 : (PL-w))); uint32_t i = (uint32_t)(hop*4);
+                instr = (((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63;
+            }
+            else if (k < 32 && w+1 < PL) {
+                int hop = 1 + (int)(rnd() % ((PL-w) > 6 ? 6 : (PL-w))); uint32_t i = (uint32_t)(hop*4);
+                instr = (((i>>20)&1)<<31)|(((i>>1)&0x3FF)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xFF)<<12)|(rd<<7)|0x6F;
+            }
+            else if (k < 50) { uint32_t f3 = rnd()%5, ty = (uint32_t)"\x00\x01\x02\x04\x05"[f3];
+                uint32_t imm = DLO + (rnd() % (DHI-DLO)); instr = (imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+            else if (k < 68) { uint32_t f3 = rnd()%3; uint32_t imm = DLO + (rnd() % (DHI-DLO));
+                instr = (((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+            else if (k < 84) { uint32_t f3 = rnd()&7;
+                if (f3==1 || f3==5) { uint32_t f7 = (f3==5 && (rnd()&1)) ? 0x20 : 0;
+                    instr = (f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+                else instr = ((rnd()&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+            else { uint32_t f3 = rnd()&7, f7;
+                if (rnd()%10 < 4) f7 = 0x01;                          // M: mul/mulh[s]u/div[u]/rem[u]
+                else f7 = ((f3==0||f3==5) && (rnd()&1)) ? 0x20 : 0;
+                instr = (f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+            img[w] = instr;
+        }
+        img[PL] = 0x00100073u;                                        // ebreak terminator
+        int N = PL + 1;
+        // reference run
+        uint32_t R[32] = {0}; std::vector<uint8_t> M(8192, 0); uint32_t pc = base;
+        for (int g = 0; g < 200000; g++) {
+            int w = (int)((pc - base) >> 2); if (w < 0 || w >= N) break;
+            uint32_t ni = rvx_ref_step(R, M.data(), pc, img[w]); if (ni & 0x80000000u) break;
+            pc = ni; R[0] = 0;
+        }
+        uint32_t ref_pc = pc;
+        // rvcud pipeline run (fusion arms at their defaults)
+        if (cuda_rvcud_set_code(img.data(), (unsigned)N*4, base, base) != 0) { fails++; continue; }
+        cuda_rv32i_write_mem(0, zero.data(), 0, 0x1000);
+        for (int i = 0; i < 32; i++) cuda_rv32i_set_reg(0, i, 0);
+        cuda_rv32i_set_entry(0, base);
+        cuda_rvcud_step_all(400000);
+        uint32_t epc = cuda_rv32i_get_pc(0) & 0x7FFFFFFFu;
+        bool ok = (epc == ref_pc);
+        for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2]) { ok = false; break; }
+        if (ok) { std::vector<uint8_t> gm(DHI-DLO);
+            cuda_rv32i_read_mem(0, gm.data(), DLO, DHI-DLO);
+            if (memcmp(gm.data(), M.data()+DLO, DHI-DLO) != 0) ok = false; }
+        if (!ok) { fails++;
+            fprintf(stderr, "[fuzz4] FAIL prog %d (PL=%d) ref_pc=0x%X rvcud_pc=0x%X\n", p, PL, ref_pc, epc);
+            for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2])
+                fprintf(stderr, "    x%d ref=%08X rvcud=%08X\n", r2, R[r2], cuda_rv32i_get_reg(0, r2));
+            if (fails >= 5) { fprintf(stderr, "[fuzz4] stopping after 5 fails\n"); break; }
+        }
+    }
+    // Phase 2: programs WITH backward branches and JALR (fuzz2's generator) — exercises INCBR,
+    // translate-on-miss, and the JALR ladder arm, which the forward-only phase never reaches.
+    int compared = 0;
+    for (int p = 0; p < nprog && fails < 5; p++) {
+        int PL = 12 + (int)(rnd() % 52);
+        std::vector<uint32_t> img(PL + 1);
+        img[0] = (0u<<12) | (31<<7) | 0x17;                           // auipc x31,0 → x31 = base
+        for (int w = 1; w < PL; w++) {
+            uint32_t k = rnd()%100, rd = rnd()%31, rs1 = rnd()&31, rs2 = rnd()&31, instr;
+            if (k < 10) instr = (((rnd()&0xFFFFF)<<12)) | (rd<<7) | ((rnd()&1) ? 0x37 : 0x17);
+            else if (k < 24) { uint32_t f3 = (uint32_t)"\x00\x01\x04\x05\x06\x07"[rnd()%6];
+                int tw = 1 + (int)(rnd() % (PL-1)); int off = (tw-w)*4; uint32_t i = (uint32_t)off;
+                instr = (((i>>12)&1)<<31)|(((i>>5)&0x3F)<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(((i>>1)&0xF)<<8)|(((i>>11)&1)<<7)|0x63; }
+            else if (k < 30) { int tw = 1 + (int)(rnd() % (PL-1)); uint32_t imm = (uint32_t)(tw*4)&0xFFF;
+                instr = (imm<<20)|(31<<15)|(0<<12)|(rd<<7)|0x67; }
+            else if (k < 36) { int tw = 1 + (int)(rnd() % (PL-1)); int off = (tw-w)*4; uint32_t i = (uint32_t)off;
+                instr = (((i>>20)&1)<<31)|(((i>>1)&0x3FF)<<21)|(((i>>11)&1)<<20)|(((i>>12)&0xFF)<<12)|(rd<<7)|0x6F; }
+            else if (k < 52) { uint32_t f3 = rnd()%5, ty = (uint32_t)"\x00\x01\x02\x04\x05"[f3];
+                uint32_t imm = DLO + (rnd() % (DHI-DLO)); instr = (imm<<20)|(0<<15)|(ty<<12)|(rd<<7)|0x03; }
+            else if (k < 66) { uint32_t f3 = rnd()%3; uint32_t imm = DLO + (rnd() % (DHI-DLO));
+                instr = (((imm>>5)&0x7F)<<25)|(rs2<<20)|(0<<15)|(f3<<12)|((imm&0x1F)<<7)|0x23; }
+            else if (k < 82) { uint32_t f3 = rnd()&7;
+                if (f3==1 || f3==5) { uint32_t f7 = (f3==5 && (rnd()&1)) ? 0x20 : 0;
+                    instr = (f7<<25)|((rnd()&0x1F)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+                else instr = ((rnd()&0xFFF)<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x13; }
+            else { uint32_t f3 = rnd()&7, f7;
+                if (rnd()%10 < 4) f7 = 0x01;
+                else f7 = ((f3==0||f3==5) && (rnd()&1)) ? 0x20 : 0;
+                instr = (f7<<25)|(rs2<<20)|(rs1<<15)|(f3<<12)|(rd<<7)|0x33; }
+            img[w] = instr;
+        }
+        img[PL] = 0x00100073u; int N = PL + 1;
+        uint32_t R[32] = {0}; std::vector<uint8_t> M(8192, 0); uint32_t pc = base; bool term = false;
+        for (uint32_t g = 0; g < 20000; g++) {
+            int w = (int)((pc - base) >> 2); if (w < 0 || w >= N) { term = true; break; }
+            uint32_t ni = rvx_ref_step(R, M.data(), pc, img[w]); if (ni & 0x80000000u) { term = true; break; }
+            pc = ni; R[0] = 0;
+        }
+        if (!term) continue;                                          // looping program — skip
+        compared++;
+        uint32_t ref_pc = pc;
+        if (cuda_rvcud_set_code(img.data(), (unsigned)N*4, base, base) != 0) { fails++; continue; }
+        cuda_rv32i_write_mem(0, zero.data(), 0, 0x1000);
+        for (int i = 0; i < 32; i++) cuda_rv32i_set_reg(0, i, 0);
+        cuda_rv32i_set_entry(0, base);
+        for (int c = 0; c < 64 && !(cuda_rv32i_get_pc(0) & 0x80000000u); c++)
+            if (cuda_rvcud_step_all(40000) != 0) break;               // chunked: lets translate-on-miss fire
+        uint32_t epc = cuda_rv32i_get_pc(0) & 0x7FFFFFFFu;
+        bool ok = (epc == ref_pc);
+        for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2]) { ok = false; break; }
+        if (ok) { std::vector<uint8_t> gm(DHI-DLO);
+            cuda_rv32i_read_mem(0, gm.data(), DLO, DHI-DLO);
+            if (memcmp(gm.data(), M.data()+DLO, DHI-DLO) != 0) ok = false; }
+        if (!ok) { fails++;
+            fprintf(stderr, "[fuzz4b] FAIL prog %d (PL=%d) ref_pc=0x%X rvcud_pc=0x%X\n", p, PL, ref_pc, epc);
+            for (int r2 = 1; r2 < 32; r2++) if (cuda_rv32i_get_reg(0, r2) != R[r2])
+                fprintf(stderr, "    x%d ref=%08X rvcud=%08X\n", r2, R[r2], cuda_rv32i_get_reg(0, r2));
+        }
+    }
+    _putenv("RVX_OFF=");
+    fprintf(stderr, "[fuzz4] %d+%d programs (%d jalr-phase compared), %d failures (seed=%d)\n",
+            nprog, nprog, compared, fails, seed);
     return fails;
 }
 

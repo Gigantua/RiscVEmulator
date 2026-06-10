@@ -24,6 +24,22 @@ const string Lib = "rv32i_cuda";
 [DllImport(Lib)] static extern int    cuda_rvcud_set_code(byte[] src, uint len, uint baseAddr, uint entry);
 [DllImport(Lib)] static extern int    cuda_rvcud_step_all(int budget);
 [DllImport(Lib)] static extern ulong  cuda_rvcud_retired();
+// exec_block differential fuzzers (random guest programs vs a host reference stepper).
+[DllImport(Lib)] static extern int    cuda_rvexec_fuzz(int seed, int nprog);
+[DllImport(Lib)] static extern int    cuda_rvexec_fuzz2(int seed, int nprog);
+[DllImport(Lib)] static extern int    cuda_rvexec_fuzz3(int seed, int nprog);
+[DllImport(Lib)] static extern int    cuda_rvcud_fuzz(int seed, int nprog);
+
+if (args.Contains("--fuzz"))
+{
+    int f1 = cuda_rvexec_fuzz(12345, 200);
+    int f2 = cuda_rvexec_fuzz2(54321, 200);
+    int f3 = cuda_rvexec_fuzz3(99999, 200);
+    int f4 = cuda_rvcud_fuzz(13579, 150);
+    Console.WriteLine(f1 + f2 + f3 + f4 == 0 ? "fuzz: all programs bit-identical ✓"
+                                             : $"fuzz: FAILURES f1={f1} f2={f2} f3={f3} f4={f4}");
+    return f1 + f2 + f3 + f4 == 0 ? 0 : 1;
+}
 
 // rvcud (the RV32I→CUDA-uarch translator) is the DEFAULT execution path; pass --base to run the
 // per-instruction kernel instead. (--rvcud still accepted for explicitness/back-compat.)
@@ -45,7 +61,7 @@ string buildDir = Path.Combine(exeDir, "build"); Directory.CreateDirectory(build
     string srcPath = Path.Combine(root, "Examples", "CudaBench", "Programs", name + ".c");
     string elfPath = Path.Combine(buildDir, name + ".elf");
     var psi = new ProcessStartInfo(clang) { RedirectStandardError = true, UseShellExecute = false };
-    foreach (var a in new[] { "--target=riscv32-unknown-elf","-march=rv32i","-mabi=ilp32",
+    foreach (var a in new[] { "--target=riscv32-unknown-elf","-march=rv32im","-mabi=ilp32",
             "-nostdlib","-nostartfiles","-O3","-fno-builtin","-ffreestanding",
             "-fuse-ld=lld","-Wl,-e,_start","-Wl,--image-base=0x1000", srcPath, "-o", elfPath })
         psi.ArgumentList.Add(a);
