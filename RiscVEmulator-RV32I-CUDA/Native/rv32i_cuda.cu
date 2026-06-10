@@ -2321,17 +2321,22 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                 xfer(true,t); } break;                                                               // not-taken falls through to next emitted word
     case 0x03:{ if(!rd) break;
                 { int32_t im=(int)rv_iimm(instr);
-                  bool al4 = cse.mod4[rs1]!=0xFF && ((((uint32_t)cse.mod4[rs1]+(uint32_t)im)&3u)==0);
-                  if (f3==2 && !al4 && nc==1) {
-                      // lw, alignment unproven, flat layout: BRANCH-FREE funnel load — the two aligned
-                      // words overlapping the address (the +8 B buffer guard makes the high word safe)
-                      // and one shf.r. 9 instructions, no predication, both loads issue independently;
-                      // the checked path was ~14 with a predicated 4×byte fallback.
+                  int aln = f3==2?4:(f3==1||f3==5)?2:1;
+                  bool alk = aln>1 && cse.mod4[rs1]!=0xFF &&
+                             ((((uint32_t)cse.mod4[rs1]+(uint32_t)im)&(uint32_t)(aln-1))==0);
+                  if ((f3==2||f3==1||f3==5) && !alk && nc==1) {
+                      // lw/lh/lhu, alignment unproven, flat layout: BRANCH-FREE funnel load — the two
+                      // aligned words overlapping the address (the +8 B buffer guard makes the high
+                      // word safe) and one shf.r extract. No predication, no fault possible, both
+                      // loads issue independently; the checked path was 10-14 instructions with a
+                      // predicated byte-wise fallback.
                       rvx_app(s,"add.s32 %%t0, %%x%u, %d;\n"
                                 "and.b32 %%t1, %%t0, -4;\ncvt.u64.u32 %%a1, %%t1;\nadd.u64 %%a1, %%a1, %%M;\n"
                                 "ld.global.u32 %%t1, [%%a1];\nld.global.u32 %%t2, [%%a1+4];\n"
-                                "and.b32 %%t0, %%t0, 3;\nshl.b32 %%t0, %%t0, 3;\n"
-                                "shf.r.wrap.b32 %%x%u, %%t1, %%t2, %%t0;\n", rs1, im, rd);
+                                "and.b32 %%t0, %%t0, 3;\nshl.b32 %%t0, %%t0, 3;\n", rs1, im);
+                      if      (f3==2) rvx_app(s,"shf.r.wrap.b32 %%x%u, %%t1, %%t2, %%t0;\n", rd);
+                      else if (f3==5) rvx_app(s,"shf.r.wrap.b32 %%t1, %%t1, %%t2, %%t0;\nand.b32 %%x%u, %%t1, 65535;\n", rd);
+                      else            rvx_app(s,"shf.r.wrap.b32 %%t1, %%t1, %%t2, %%t0;\ncvt.s32.s16 %%x%u, %%t1;\n", rd);
                       cse.t0Valid=false; wr(rd,0xFF); break;
                   } }
                 addr((int)rv_iimm(instr), f3==2?4:(f3==1||f3==5)?2:1); wr(rd,0xFF);     // loaded value: unknown mod 4
