@@ -25,7 +25,9 @@ using RiscVEmulator.Core.Cuda;
 //                    doesn't finish quickly continue on the JIT engine
 //                    (one at a time — the translated code image is global).
 //                    --interp is the debug profile: pure interpreter, no JIT.
-//                    Default dir: C:\dev\tinycc\c-testsuite\tests\single-exec
+//                    Default dir: Examples/CudaTests/c-testsuite/single-exec
+//                    (vendored; 00040.c — the ~390M-instruction 8-queens
+//                    solver — is deliberately excluded as too long-running).
 
 const string Lib = "rv32i_cuda";
 [DllImport(Lib)] static extern int  cuda_rv32i_init(int n, uint memBytes);
@@ -55,7 +57,8 @@ string buildDir = Path.Combine(exeDir, "build"); Directory.CreateDirectory(build
 
 if (args.Length > 0 && args[0] == "--tests")
     return RunTests(
-        args.Skip(1).FirstOrDefault(a => !a.StartsWith("--")) ?? @"C:\dev\tinycc\c-testsuite\tests\single-exec",
+        args.Skip(1).FirstOrDefault(a => !a.StartsWith("--"))
+            ?? Path.Combine(root, "Examples", "CudaTests", "c-testsuite", "single-exec"),
         args.Contains("--interp"));
 
 // ── Interactive echo mode ─────────────────────────────────────────────
@@ -199,8 +202,8 @@ int RunTests(string suiteDir, bool interpOnly)
     // all-cores progress and names the stragglers once only a few remain.
     // The phase ends when several batches pass without ANY core finishing:
     // quickly when the JIT phase will take over, or after 600M instructions
-    // of grace in --interp mode (the heaviest real test, the 00040.c
-    // 8-queens solver, needs ~390M — anything beyond that is declared hung).
+    // of grace in --interp mode (anything beyond that is declared hung; the
+    // vendored suite excludes 00040.c, whose 8-queens solver alone ran ~390M).
     var sw = Stopwatch.StartNew();
     int staleMax = interpOnly ? 300 : 10;
     int halted = 0, stale = 0;
