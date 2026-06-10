@@ -13,6 +13,7 @@ using RiscVEmulator.Frontend;
 const uint StackPointer = 0x00EFFF00;
 const int  RamMB = 16;
 bool headless = args.Contains("--headless");
+bool useRvcud = !args.Contains("--no-jit");   // rvcud uop core + exec_block JIT (default ON; --no-jit = base kernel)
 string clang = @"C:\Program Files\LLVM\bin\clang.exe";
 string exeDir = AppContext.BaseDirectory;
 
@@ -64,6 +65,8 @@ Console.WriteLine($"  voxel.elf: {new FileInfo(elfPath).Length:N0} bytes");
 using var emu = new CudaEmulator(RamMB * 1024 * 1024);
 emu.OutputHandler = c => Console.Write(c);
 uint entry = emu.LoadElf(File.ReadAllBytes(elfPath));
+if (useRvcud) Console.WriteLine("rvcud: cross-compiling the guest to the CUDA uop core + exec_block JIT.");
+emu.UseRvcud = useRvcud;
 emu.CommitImage();
 emu.SetReg(2, StackPointer);
 emu.SetEntry(entry);
@@ -94,8 +97,11 @@ if (headless)
 }
 
 Console.WriteLine("Starting Voxel (CUDA core)...  Esc/Alt+F4 to exit.");
-Console.WriteLine("Note: a single GPU thread is slow for this softfloat-heavy guest;");
-Console.WriteLine("world generation + first frame take a while (see CudaGfx for a fast demo).");
+if (!useRvcud)
+{
+    Console.WriteLine("Note: --no-jit runs the base kernel; a single GPU thread is slow for this");
+    Console.WriteLine("softfloat-heavy guest — world generation + first frame take a while.");
+}
 var window = new SdlWindow(emu.Framebuffer, emu.Display, emu.Keyboard, emu.Mouse,
                            emu.AudioBuffer, emu.AudioControl, emu, opts, emu.Midi);
 return window.Run();
