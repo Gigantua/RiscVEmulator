@@ -2248,7 +2248,7 @@ static bool rvx_sp_writer_ok(uint32_t in) {
 static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                      const std::vector<uint8_t>& comp, const std::vector<uint8_t>& leader, int N, uint32_t base,
                      const std::vector<int>& regof, int myreg, RvxCse& cse, int nc,
-                     const std::vector<uint32_t>& p2i) {
+                     const std::vector<uint32_t>& p2i, std::string& cold) {
     const uint32_t op=instr&0x7F, rd=(instr>>7)&0x1F, f3=(instr>>12)&7, rs1=(instr>>15)&0x1F, rs2=(instr>>20)&0x1F, f7=(instr>>25)&0x7F;
     auto goable=[&](uint32_t t)->int{ if(t<base) return 0; uint32_t w=(t-base)>>2;
         return ((t-base)&3)==0 && (int)w<N && comp[w] && leader[w] && regof[w]==myreg; };
@@ -2402,15 +2402,32 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
               } break;
     case 0x23:{ addr((int)rv_simm(instr), f3==2?4:(f3==1)?2:1);
                 if(f3==0){ rvx_app(s,"st.global.u8 [%s], %%x%u;\n",A,rs2); break; }                    // sb
-                if(f3==1){ // sh: proven-aligned → bare st; else runtime check + byte-wise fallback
+                if(f3==1){ // sh: proven-aligned → bare st; else aligned fast path, byte fallback COLD
                     if(alok){ rvx_app(s,"st.global.u16 [%s], %%x%u;\n",A,rs2); break; }
+                    if(nc==1){
+                        // Branch-over-fallback: predicated-off instructions still consume issue slots,
+                        // so the old form charged the (almost always aligned) store ~5 squashed issues.
+                        // The misaligned case jumps to a cold block after the region body.
+                        rvx_app(s,"and.b32 %%t1, %s, 1;\nsetp.ne.u32 %%p0, %%t1, 0;\n@%%p0 bra CF%u;\n"
+                                  "st.global.u16 [%s], %%x%u;\nCJ%u:\n", T, pc, A,rs2, pc);
+                        rvx_app(cold,"CF%u:\nst.global.u8 [%s], %%x%u;\nshr.b32 %%t1, %%x%u, 8;\nst.global.u8 [%s+1], %%t1;\nbra CJ%u;\n",
+                                  pc, A,rs2, rs2, A, pc);
+                        break; }
                     rvx_app(s,"and.b32 %%t1, %s, 1;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
                               "@%%p0 st.global.u16 [%s], %%x%u;\n"
                               "@!%%p0 st.global.u8 [%s], %%x%u;\n",
                               T, A,rs2, A,rs2);
                     rvx_app(s,"@!%%p0 shr.b32 %%t1, %%x%u, 8;\n@!%%p0 st.global.u8 [%s], %%t1;\n", rs2, fbaddr(1)); break; }
-                // sw: proven-aligned → bare st.u32; else aligned fast path + byte-wise fallback
+                // sw: proven-aligned → bare st.u32; else aligned fast path, byte fallback COLD (flat layout)
                 if(alok){ rvx_app(s,"st.global.u32 [%s], %%x%u;\n",A,rs2); break; }
+                if(nc==1){
+                    rvx_app(s,"and.b32 %%t1, %s, 3;\nsetp.ne.u32 %%p0, %%t1, 0;\n@%%p0 bra CF%u;\n"
+                              "st.global.u32 [%s], %%x%u;\nCJ%u:\n", T, pc, A,rs2, pc);
+                    rvx_app(cold,"CF%u:\nst.global.u8 [%s], %%x%u;\n", pc, A,rs2);
+                    for (int i=1;i<4;i++)
+                        rvx_app(cold,"shr.b32 %%t1, %%x%u, %d;\nst.global.u8 [%s+%d], %%t1;\n", rs2, 8*i, A, i);
+                    rvx_app(cold,"bra CJ%u;\n", pc);
+                    break; }
                 rvx_app(s,"and.b32 %%t1, %s, 3;\nsetp.eq.u32 %%p0, %%t1, 0;\n"
                           "@%%p0 st.global.u32 [%s], %%x%u;\n"
                           "@!%%p0 st.global.u8 [%s], %%x%u;\n",
@@ -2581,12 +2598,13 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
         ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
         RvxCse cse; cse.spInit = sptrust ? 0 : 0xFF; cse.reset();
+        std::string cold;                               // misaligned-store fallbacks, emitted after the body
         int prev = -2;
         for (; bi<nb && regof[body[bi]]==r; bi++) {
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
             if ((int)w != prev+1 || targ[w]) cse.reset();   // run start or sideways-enterable
             rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
-            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc, pc2idx);
+            rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc, pc2idx, cold);
             bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
             if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
                 int nw = (int)w + 1;
@@ -2595,6 +2613,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             else cse.reset();                               // nothing falls through a terminator
             prev = (int)w;
         }
+        ptx += cold;                                    // cold misaligned-store blocks (each ends with bra CJ<pc>)
         ptx += "XDISP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
         rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
         rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
