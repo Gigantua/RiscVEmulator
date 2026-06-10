@@ -726,6 +726,7 @@ static void*      g_x_pc2idx = nullptr;      // device u32[N]: word → branchta
 static void       rvxblk_build();
 static long long  rvxblk_step(long long budget);
 static int        g_x_sptrust = 0;           // exec PTX was built under the global sp-alignment proof
+static int        g_rvx_regw_force = 0;      // nonzero: region-size override for assemble-failure retries
 static bool       rvx_sp_writer_ok(uint32_t in);
 
 API int cuda_rv32i_init(int nCores, unsigned int memBytes) {
@@ -2511,6 +2512,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     for (int w=0; w<N; w++) if (comp[w]) body.push_back((uint32_t)w);
     const int nb = (int)body.size();
     int regw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) regw=v; }
+    if (g_rvx_regw_force > 0) regw = g_rvx_regw_force;      // assemble-failure retry (rvxblk_build halves it)
     if (nc > 1 && regw > 4000) regw = 4000;   // interleaved memops emit ~2× the PTX — keep the per-unit ptxas peak flat
     if (regw >= (1<<20)) regw = (1<<20)-1;                  // local ordinal must fit pc2idx bits 19:0
     int K = nb ? (nb + regw - 1) / regw : 1;
@@ -2698,10 +2700,26 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
     STARTUPINFOA si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
     int rc = -1;
     if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
+        // WATCHDOG: ptxas sits on a knife edge for large brx-heavy units — pathological inputs have
+        // been observed to spin for minutes at multi-GB commits. Hard limits (2.5 GB private bytes /
+        // 120 s wall) kill the child and report failure; the caller then retries with smaller regions.
+        DWORD waited = 0; bool wkilled = false;
+        while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
+            waited += 250;
+            PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;
+            bool over = GetProcessMemoryInfo(pi.hProcess, &pmc, sizeof pmc) &&
+                        pmc.PagefileUsage > (SIZE_T)2560u * 1024u * 1024u;
+            if (over || waited > 120000) {
+                TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000);
+                wkilled = true;
+                fprintf(stderr, "[xblk] ptxas watchdog: killed child (%s after %lu ms, %.2f GB)\n",
+                        over ? "memory" : "timeout", (unsigned long)waited, pmc.PagefileUsage / 1073741824.0);
+                break;
+            }
+        }
         DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-        if (ec == 0 && (f = fopen(fout, "rb")) != nullptr) {
+        if (!wkilled && ec == 0 && (f = fopen(fout, "rb")) != nullptr) {
             fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
             cubin.resize((size_t)sz);
             rc = (fread(cubin.data(), 1, (size_t)sz, f) == (size_t)sz) ? 0 : -1;
@@ -2752,8 +2770,14 @@ static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod,
         char nm[24]; snprintf(nm, sizeof nm, "xu%zu", u);
         if (rvx_assemble_unit(units[u], cubins[u]) == 0)
             r = cuLinkAddData(ls, CU_JIT_INPUT_CUBIN, cubins[u].data(), cubins[u].size(), nm, 0, nullptr, nullptr);
-        else                                                  // no standalone ptxas — in-driver fallback
+        else if (units[u].size() < (size_t)256 * 1024)        // no standalone ptxas — in-driver fallback,
             r = cuLinkAddData(ls, CU_JIT_INPUT_PTX, (void*)units[u].c_str(), units[u].size()+1, nm, 0, nullptr, nullptr);
+        else {                                                // …but NEVER for big units: the in-process
+            // JIT has the same knee with no process isolation (13 GB commits observed historically).
+            // Fail so the caller retries with smaller regions.
+            fprintf(stderr,"[xblk] unit %zu (%zu KB) failed standalone assembly — rebuilding smaller\n", u, units[u].size()/1024);
+            cuLinkDestroy(ls); return -2;
+        }
         if (r != CUDA_SUCCESS) {
             fprintf(stderr,"[xblk] add (%s): %d %s\n", nm, (int)r, log); cuLinkDestroy(ls); return -2; }
     }
@@ -2841,19 +2865,34 @@ static void rvxblk_build() {
     int ndisp = 0;
     for (int w=0; w<N; w++) ndisp += disp[w];
 
-    std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
-    rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp, g_ncores, sptrust);
-    if (const char* dp = getenv("RVX_DUMP"))                 // offline ptxas experiments: <prefix><u>.ptx per unit
-        for (size_t u=0; u<ptx.size(); u++) {
-            char fn[512]; snprintf(fn, sizeof fn, "%s%zu.ptx", dp, u);
-            if (FILE* f = fopen(fn, "wb")) { fwrite(ptx[u].data(), 1, ptx[u].size(), f); fclose(f); }
-        }
-
     cuInit(0);
     CUcontext ctx=nullptr; cuCtxGetCurrent(&ctx);
     if (!ctx) { CUdevice dev; cuDeviceGet(&dev,0); cuDevicePrimaryCtxRetain(&ctx,dev); cuCtxSetCurrent(ctx); }
     CUmodule mod; CUfunction fn;
-    if (rvx_load_module(ptx, &mod, &fn) != 0) { fprintf(stderr,"[xblk] build failed (%d words)\n", cnt); return; }
+    std::vector<std::string> ptx; std::vector<uint32_t> pc2idx;
+    // Build with assemble-failure RETRY: big regions are the fastest (r10) but live near the ptxas
+    // knee — if a unit trips the child watchdog, halve the region size and regenerate. Worst case
+    // ends at the long-proven 6000-word regions; only then give up (interpreter-only).
+    {
+        int defw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) defw=v; }
+        int tryw = 0;
+        for (;;) {
+            g_rvx_regw_force = tryw;
+            ptx.clear(); pc2idx.clear();
+            rvx_codegen(ptx, pc2idx, g_img.data(), N, g_base, comp, disp, g_ncores, sptrust);
+            g_rvx_regw_force = 0;
+            if (const char* dp = getenv("RVX_DUMP"))         // offline ptxas experiments: <prefix><u>.ptx per unit
+                for (size_t u=0; u<ptx.size(); u++) {
+                    char fnm[512]; snprintf(fnm, sizeof fnm, "%s%zu.ptx", dp, u);
+                    if (FILE* f = fopen(fnm, "wb")) { fwrite(ptx[u].data(), 1, ptx[u].size(), f); fclose(f); }
+                }
+            if (rvx_load_module(ptx, &mod, &fn) == 0) break;
+            int cur = tryw ? tryw : defw;
+            if (cur <= 6000) { fprintf(stderr,"[xblk] build failed (%d words)\n", cnt); return; }
+            tryw = cur / 2;
+            fprintf(stderr,"[xblk] assembly failed at region size %d — retrying with %d\n", cur, tryw);
+        }
+    }
 
     void* d_p2i=nullptr;
     if (cudaMalloc(&d_p2i, (size_t)N*4) != cudaSuccess) { cuModuleUnload(mod); return; }
