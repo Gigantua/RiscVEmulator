@@ -2256,14 +2256,14 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     for (int r=0; r<K; r++) {
         std::string& ptx = units[1+r];
         ptx  = hdr;
-        ptx += ".extern .global .align 8 .b8 XS[168];\n";
+        ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B at launch) — per-CTA, far cheaper than .global per region transition
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
         ptx += ".reg .b64 %M,%P2I,%a0,%ad;\n.reg .b32 %x<32>,%t0,%t1,%pc,%budget,%cnt;\n"
                ".reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0,%p1,%p2;\n";
         ptx += "mov.b32 %x0, 0;\n";
-        for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%x%u, [XS+%d];\n", g, g*4);
-        ptx += "ld.global.u32 %cnt, [XS+132];\nld.global.u32 %budget, [XS+136];\n"
-               "ld.global.u64 %M, [XS+144];\nld.global.u64 %P2I, [XS+152];\nld.global.u32 %bidx, [XS+160];\n";
+        for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%x%u, [XS+%d];\n", g, g*4);
+        ptx += "ld.shared.u32 %cnt, [XS+132];\nld.shared.u32 %budget, [XS+136];\n"
+               "ld.shared.u64 %M, [XS+144];\nld.shared.u64 %P2I, [XS+152];\nld.shared.u32 %bidx, [XS+160];\n";
         ptx += "BT: .branchtargets ";
         for (size_t i=0; i<rtgt[r].size(); i++) rvx_app(ptx, "%sL%u", i?",":"", base+rtgt[r][i]*4);
         ptx += ";\nJBRX:\nbrx.idx %bidx, BT;\n";            // the ONLY brx in this unit (XDISP reuses it)
@@ -2285,33 +2285,33 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         rvx_app(ptx, "shr.u32 %%rg, %%bidx, 20;\nsetp.ne.u32 %%p0, %%rg, %d;\n@%%p0 bra XSAVE;\n", r);
         ptx += "and.b32 %bidx, %bidx, 1048575;\nbra JBRX;\n";
         ptx += "XSAVE:\n";
-        for (int g=1; g<32; g++) rvx_app(ptx, "st.global.u32 [XS+%d], %%x%u;\n", g*4, g);
-        ptx += "st.global.u32 [XS+128], %pc;\nst.global.u32 [XS+132], %cnt;\nret;\n}\n";
+        for (int g=1; g<32; g++) rvx_app(ptx, "st.shared.u32 [XS+%d], %%x%u;\n", g*4, g);
+        ptx += "st.shared.u32 [XS+128], %pc;\nst.shared.u32 [XS+132], %cnt;\nret;\n}\n";
     }
     // ── dispatcher unit: state→XS, then loop { budget/bounds/pc2idx gate → call region } → state←XS.
     std::string& ptx = units[0];
     ptx  = hdr;
-    ptx += ".visible .global .align 8 .b8 XS[168];\n";
+    ptx += ".extern .shared .align 8 .b8 XS[];\n";       // same dynamic-shared segment the region units alias
     for (int r=0; r<K; r++) rvx_app(ptx, ".extern .func xr%d;\n", r);
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
     ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg;\n.reg .pred %p0;\n";
     ptx += "ld.param.u64 %M,[pM];\nld.param.u64 %S,[pS];\nld.param.u32 %budget,[pBud];\n"
            "ld.param.u64 %P2I,[pP2I];\nld.param.u64 %RET,[pRet];\n";
-    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.global.u32 [XS+%d], %%t0;\n", g*4, g*4);
+    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.shared.u32 [XS+%d], %%t0;\n", g*4, g*4);
     rvx_app(ptx, "ld.global.u32 %%pc, [%%S+%d];\nmov.b32 %%cnt, 0;\n", 32*4);
-    ptx += "st.global.u32 [XS+132], %cnt;\nst.global.u32 [XS+136], %budget;\n"
-           "st.global.u64 [XS+144], %M;\nst.global.u64 [XS+152], %P2I;\n";
+    ptx += "st.shared.u32 [XS+132], %cnt;\nst.shared.u32 [XS+136], %budget;\n"
+           "st.shared.u64 [XS+144], %M;\nst.shared.u64 [XS+152], %P2I;\n";
     ptx += "DLOOP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
     rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
     rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
     ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n";
     ptx += "setp.eq.u32 %p0, %bidx, 4294967295;\n@%p0 bra XSAVE;\n";
-    ptx += "shr.u32 %rg, %bidx, 20;\nand.b32 %bidx, %bidx, 1048575;\nst.global.u32 [XS+160], %bidx;\n";
+    ptx += "shr.u32 %rg, %bidx, 20;\nand.b32 %bidx, %bidx, 1048575;\nst.shared.u32 [XS+160], %bidx;\n";
     for (int r=0; r<K; r++) rvx_app(ptx, "setp.eq.u32 %%p0, %%rg, %d;\n@%%p0 call.uni xr%d;\n", r, r);
-    ptx += "ld.global.u32 %pc, [XS+128];\nld.global.u32 %cnt, [XS+132];\nbra DLOOP;\n";
+    ptx += "ld.shared.u32 %pc, [XS+128];\nld.shared.u32 %cnt, [XS+132];\nbra DLOOP;\n";
     // save architectural state and return retired count
     ptx += "XSAVE:\n";
-    for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [XS+%d];\nst.global.u32 [%%S+%d], %%t0;\n", g*4, g*4);
+    for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%t0, [XS+%d];\nst.global.u32 [%%S+%d], %%t0;\n", g*4, g*4);
     rvx_app(ptx,"st.global.u32 [%%S+%d], %%pc;\nst.global.u32 [%%RET], %%cnt;\nret;\n}\n", 32*4);
 }
 
@@ -2477,8 +2477,11 @@ static void rvxblk_build() {
     for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch (leader) words
     g_xblk_ok = getenv("RVX_OFF") ? 0 : 1;   // RVX_OFF=1 builds but disables exec (isolation probe)
     size_t psz = 0; for (auto& u : ptx) psz += u.size();
-    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s)\n",
-            cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF");
+    int xnreg = -1, xlmem = -1;              // spill guardrail: ptxas register count + local (spill) bytes
+    cuFuncGetAttribute(&xnreg, CU_FUNC_ATTRIBUTE_NUM_REGS, fn);
+    cuFuncGetAttribute(&xlmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn);
+    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s), %d regs, %d B local\n",
+            cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF", xnreg, xlmem);
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;     // ptxas memory-knee watch: peak build commit
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
@@ -2494,7 +2497,7 @@ static long long rvxblk_step(long long budget) {
     *g_ret = 0;
     unsigned bud = (budget > 0x7fffffff) ? 0x7fffffffu : (unsigned)budget;
     void* args[] = { &g_mem, &g_state, &bud, &g_x_pc2idx, &g_ret };
-    CUresult r = cuLaunchKernel(g_xfn, 1,1,1, 1,1,1, 0,0, args, nullptr);
+    CUresult r = cuLaunchKernel(g_xfn, 1,1,1, 1,1,1, 168,0, args, nullptr);   // 168 B dynamic shared = XS spill block
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] launch %d\n",(int)r); return -1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr,"[xblk] sync fault\n"); return -1; }
     return (long long)*g_ret;

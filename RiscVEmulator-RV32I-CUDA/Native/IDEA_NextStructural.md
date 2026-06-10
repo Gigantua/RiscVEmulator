@@ -75,3 +75,10 @@ weights, deterministic `--ttf`, pixel-exact shots.
 Net this round: ttf30 14.08 → 16.30 (+15.8%); ttf90 15.61 → 16.60; aggregate diverge ratio improved
 0.773 → 0.804 (BR 2nd helps the branchy guest), compute 3.42 → 3.58, data within noise. Gate
 bit-identical throughout; f1 = 60,589 px pixel-exact; f40 clean.
+
+## MEASURED OUTCOMES (50/75-MIPS iteration loop, post-MULTIMOD, baseline ~29.0 same-session)
+
+| # | Idea | ttf30 (interleaved A/B) | Verdict |
+|---|---|---:|---|
+| i1 | cgmem port: cross-instruction address CSE + mod-4 alignment lattice in rvx_emit | 28.9 vs 28.9 | **REVERTED (neutral)** — root cause measured: 99,562 of 108,645 compiled words are dispatch entries (brx targets), so the fall-through state resets every ~1.1 instructions; PTX dump: 0 `[%ab]` reuses, ~125 proven-aligned ops of 146k. Sparsifying entries requires interpreter-handback machinery (archived neutral, thrash-risky). Dead-end as long as dispatch entries ≈ all leaders. |
+| i2 | XS spill block .global → dynamic .shared (region transitions + entry/exit spill 62 ld/st) | 29.26 vs 28.97 | **KEPT (+1.0%)** — wins or ties every interleaved pair; `.extern .shared .b8 XS[]` in every unit aliases the 168 B dynamic-shared segment, launch passes 168 B. |
