@@ -10,6 +10,8 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <thread>
+#include <atomic>
 #include <cuda_runtime.h>
 #include <cuda.h>            // driver API (cuModuleLoadDataEx / cuLaunchKernel) — for the tiered exec_block cross-compiler
 #ifdef _WIN32                // peak-commit reporting for the exec_block build (ptxas memory-knee watch)
@@ -3209,19 +3211,28 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
 //   2. ptxas' multi-GB brx working set then lives (and dies) in a child process, not ours.
 // If ptxas.exe can't be found/run, falls back to in-driver PTX compilation (fine for small programs).
 // RVX_STATS=1 prints the JIT/link info log. Returns 0 on success.
+// RVX_PTXAS_O overrides the ptxas opt level (default 3). Lower levels assemble several times faster;
+// runtime quality must be A/B'd (r7/r8 found -O3's extra passes win little on this machine-generated
+// PTX). The level is part of the cubin disk-cache key.
+static int rvx_ptxas_olvl() {
+    static int s = -1;
+    if (s < 0) { const char* o = getenv("RVX_PTXAS_O"); s = (o && *o >= '0' && *o <= '3') ? (*o - '0') : 3; }
+    return s;
+}
 static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
 #ifdef _WIN32
-    static int seq = 0;
+    static std::atomic<int> s_seq{0};
+    int seq = s_seq.fetch_add(1);
     char dir[MAX_PATH]; if (!GetTempPathA(sizeof dir, dir)) return -1;
     char fin[MAX_PATH], fout[MAX_PATH];
     snprintf(fin,  sizeof fin,  "%sxblk_%lu_%d.ptx",   dir, GetCurrentProcessId(), seq);
-    snprintf(fout, sizeof fout, "%sxblk_%lu_%d.cubin", dir, GetCurrentProcessId(), seq); seq++;
+    snprintf(fout, sizeof fout, "%sxblk_%lu_%d.cubin", dir, GetCurrentProcessId(), seq);
     FILE* f = fopen(fin, "wb"); if (!f) return -1;
     fwrite(ptx.data(), 1, ptx.size(), f); fclose(f);
     const char* cp = getenv("CUDA_PATH");
     char cmd[2048];
-    snprintf(cmd, sizeof cmd, "\"%s%sptxas.exe\" -arch=sm_86 -O3 -c --disable-optimizer-constants \"%s\" -o \"%s\"",
-             cp?cp:"", cp?"\\bin\\":"", fin, fout);
+    snprintf(cmd, sizeof cmd, "\"%s%sptxas.exe\" -arch=sm_86 -O%d -c --disable-optimizer-constants \"%s\" -o \"%s\"",
+             cp?cp:"", cp?"\\bin\\":"", rvx_ptxas_olvl(), fin, fout);
     STARTUPINFOA si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
     int rc = -1;
     if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -3271,7 +3282,8 @@ static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod,
     char cpath[300] = {0};
 #ifdef _WIN32
     { char dir[MAX_PATH]; if (GetTempPathA(sizeof dir, dir))
-        snprintf(cpath, sizeof cpath, "%srvcud_xblk_%016llx.cubin", dir, rvx_units_hash(units)); }
+        snprintf(cpath, sizeof cpath, "%srvcud_xblk_%016llx.cubin", dir,
+                 rvx_units_hash(units) ^ (unsigned long long)rvx_ptxas_olvl()); }   // opt level keys the cache
     if (cpath[0]) if (FILE* cf = fopen(cpath, "rb")) {
         fseek(cf, 0, SEEK_END); long sz = ftell(cf); fseek(cf, 0, SEEK_SET);
         std::vector<char> blob((size_t)(sz > 0 ? sz : 0));
@@ -3291,9 +3303,24 @@ static int rvx_load_module(const std::vector<std::string>& units, CUmodule* mod,
     CUresult r = cuLinkCreate(5, opt, val, &ls);
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] cuLinkCreate: %d\n",(int)r); return -1; }
     std::vector<std::vector<char>> cubins(units.size());     // keep alive until cuLinkComplete
+    // Assemble units in PARALLEL: each is an independent single-threaded ptxas -c child, so the
+    // cold build scales with cores. Concurrency capped (default 4, RVX_PTXAS_PAR=1..16) — a big
+    // brx-heavy region can transiently commit ~1 GB per child; the per-child watchdog still holds.
+    std::vector<int> arc(units.size(), -1);
+    {
+        int par = 4;
+        if (const char* p = getenv("RVX_PTXAS_PAR")) { int v = atoi(p); if (v >= 1 && v <= 16) par = v; }
+        std::atomic<size_t> next{0};
+        size_t nthr = units.size() < (size_t)par ? units.size() : (size_t)par;
+        std::vector<std::thread> th;
+        for (size_t t = 0; t < nthr; t++)
+            th.emplace_back([&]{ for (size_t u; (u = next.fetch_add(1)) < units.size(); )
+                                     arc[u] = rvx_assemble_unit(units[u], cubins[u]); });
+        for (auto& x : th) x.join();
+    }
     for (size_t u=0; u<units.size(); u++) {
         char nm[24]; snprintf(nm, sizeof nm, "xu%zu", u);
-        if (rvx_assemble_unit(units[u], cubins[u]) == 0)
+        if (arc[u] == 0)
             r = cuLinkAddData(ls, CU_JIT_INPUT_CUBIN, cubins[u].data(), cubins[u].size(), nm, 0, nullptr, nullptr);
         else if (units[u].size() < (size_t)256 * 1024)        // no standalone ptxas — in-driver fallback,
             r = cuLinkAddData(ls, CU_JIT_INPUT_PTX, (void*)units[u].c_str(), units[u].size()+1, nm, 0, nullptr, nullptr);
