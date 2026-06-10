@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <vector>
+#include <algorithm>
 #include <string>
 #include <cuda_runtime.h>
 #include <cuda.h>            // driver API (cuModuleLoadDataEx / cuLaunchKernel) — for the tiered exec_block cross-compiler
@@ -2476,6 +2477,51 @@ static inline bool rvx_compilable(uint32_t op){
     return op==0x37||op==0x17||op==0x6F||op==0x67||op==0x63||op==0x03||op==0x23||op==0x13||op==0x33||op==0x0F;
 }
 
+// Bit-serial restoring-divide loop shape (mirror of rvcud_try_divloop's body conditions; see that
+// matcher for per-instruction commentary). __udivsi3/__divsi3/__umodsi3 dominate Doom's boot path
+// (~27% of guest-pc samples): the 13-instruction loop runs exactly 32 iterations, so the region
+// codegen replaces it with ONE hardware div+rem — straight-line, no new loop shape (knee-light).
+// A runtime precondition test (R==0 ∧ Q==0 ∧ i==31, i.e. the canonical entry state the prologue
+// establishes) routes any mid-loop sideways re-entry to the original code, which stays emitted.
+struct RvxDiv { uint32_t Q,R,N,D,I; };
+static bool rvx_match_divloop(const uint32_t* img, int Nw, uint32_t base, int w, RvxDiv& o) {
+    if (w+13 >= Nw) return false;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;};
+    const uint32_t* i = img + w;
+    if ((i[0]&0x7F)!=0x13 || F3(i[0])!=1 || S2(i[0])!=1) return false;            // slli R,R,1
+    uint32_t R=RD(i[0]); if (S1(i[0])!=R || R==0) return false;
+    if ((i[1]&0x7F)!=0x33 || F3(i[1])!=5 || F7(i[1])!=0) return false;            // srl T1,N,i
+    uint32_t T1=RD(i[1]), Nr=S1(i[1]), ir=S2(i[1]);
+    if ((i[2]&0x7F)!=0x33 || F3(i[2])!=1 || F7(i[2])!=0 || S2(i[2])!=ir) return false;   // sll T2,ONE,i
+    uint32_t T2=RD(i[2]);
+    if ((i[3]&0x7F)!=0x13 || F3(i[3])!=0 || RD(i[3])!=ir || S1(i[3])!=ir || (int32_t)rv_iimm(i[3])!=-1) return false;
+    if ((i[4]&0x7F)!=0x13 || F3(i[4])!=7 || RD(i[4])!=T1 || S1(i[4])!=T1 || rv_iimm(i[4])!=1) return false;
+    if ((i[5]&0x7F)!=0x33 || F3(i[5])!=6 || F7(i[5])!=0 || RD(i[5])!=R) return false;
+    if (!((S1(i[5])==T1&&S2(i[5])==R)||(S1(i[5])==R&&S2(i[5])==T1))) return false;
+    if ((i[6]&0x7F)!=0x33 || F3(i[6])!=3 || F7(i[6])!=0 || RD(i[6])!=T1 || S1(i[6])!=R) return false;
+    uint32_t Dr=S2(i[6]);
+    if ((i[7]&0x7F)!=0x13 || F3(i[7])!=0 || RD(i[7])!=T1 || S1(i[7])!=T1 || (int32_t)rv_iimm(i[7])!=-1) return false;
+    if ((i[8]&0x7F)!=0x33 || F3(i[8])!=7 || F7(i[8])!=0 || RD(i[8])!=T2) return false;
+    if (!((S1(i[8])==T1&&S2(i[8])==T2)||(S1(i[8])==T2&&S2(i[8])==T1))) return false;
+    if ((i[9]&0x7F)!=0x33 || F3(i[9])!=7 || F7(i[9])!=0 || RD(i[9])!=T1) return false;
+    if (!((S1(i[9])==T1&&S2(i[9])==Dr)||(S1(i[9])==Dr&&S2(i[9])==T1))) return false;
+    if ((i[10]&0x7F)!=0x33 || F3(i[10])!=6 || F7(i[10])!=0) return false;
+    uint32_t Q=RD(i[10]);
+    if (!((S1(i[10])==T2&&S2(i[10])==Q)||(S1(i[10])==Q&&S2(i[10])==T2))) return false;
+    if ((i[11]&0x7F)!=0x33 || F3(i[11])!=0 || F7(i[11])!=0x20 || RD(i[11])!=R || S1(i[11])!=R || S2(i[11])!=T1) return false;
+    if ((i[12]&0x7F)!=0x63 || F3(i[12])!=1) return false;                          // bne i,NEG1,→top
+    if (S1(i[12])!=ir && S2(i[12])!=ir) return false;
+    uint32_t bpc=base+(uint32_t)(w+12)*4;
+    if ((int)((bpc+rv_bimm(i[12])-base)>>2) != w) return false;
+    if (R==0||Nr==0||Dr==0||ir==0||Q==0||T1==0||T2==0) return false;
+    if (R==Nr||R==Dr||R==Q||R==ir||Nr==Dr||Q==ir||T1==T2||R==T1||R==T2) return false;
+    if (Q==Nr||Q==Dr) return false;                    // Q write must not clobber the div inputs mid-replacement
+    o.Q=Q; o.R=R; o.N=Nr; o.D=Dr; o.I=ir;
+    return true;
+}
+
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
 // linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
@@ -2585,6 +2631,12 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         uint32_t t = base + (uint32_t)w*4 + (o==0x63 ? rv_bimm(in) : rv_jimm(in));
         if (t>=base && ((t-base)&3)==0 && ((t-base)>>2) < (uint32_t)N) targ[(t-base)>>2] = 1;
     }
+    // DIVLOOP pre-scan: the hardware-divide replacement jumps to the loop exit with different
+    // scratch/cache state than the per-instruction path, so the exit must be a reset point.
+    std::vector<uint8_t> divhit(N, 0);
+    { RvxDiv dr;
+      for (int w=0; w+13 < N; w++)
+          if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; } }
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
     units.assign(1+K, std::string());
@@ -2617,7 +2669,29 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         for (; bi<nb && regof[body[bi]]==r; bi++) {
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
             if ((int)w != prev+1 || targ[w]) cse.reset();   // run start or sideways-enterable
-            rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+            // Software-divide loop → ONE hardware div+rem. The precondition test (canonical entry
+            // state R==0, Q==0, i==31 — what the function prologue establishes) routes mid-loop
+            // sideways re-entries to the original code below; entering the header IN that state is
+            // the canonical entry regardless of how control got there, so the closed form is exact:
+            // Q=N/D, R=N%D, i=-1 (PTX div/rem by zero yield 0xFFFFFFFF and the dividend — exactly
+            // the soft loop's results), 13×32=416 retired atomically (overshoot is legal). The loop
+            // temps T1/T2 keep their pre-loop values — same treatment as the interpreter's
+            // RC_DIVLOOP arm (they are dead clang temps; the bit-identical gate covers it).
+            if (divhit[w] && (int)w+13 < N && regof[w+13]==r && comp[w+13]) {
+                RvxDiv D0; rvx_match_divloop(img, N, base, (int)w, D0);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "or.b32 %%t0, %%x%u, %%x%u;\nxor.b32 %%t1, %%x%u, 31;\nor.b32 %%t0, %%t0, %%t1;\n"
+                             "setp.ne.u32 %%p0, %%t0, 0;\n@%%p0 bra DORIG%u;\n", D0.R, D0.Q, D0.I, pc);
+                rvx_app(ptx, "add.s32 %%cnt, %%cnt, 416;\n"
+                             "div.u32 %%t0, %%x%u, %%x%u;\nrem.u32 %%t1, %%x%u, %%x%u;\n",
+                             D0.N, D0.D, D0.N, D0.D);
+                rvx_app(ptx, "mov.b32 %%x%u, %%t0;\nmov.b32 %%x%u, %%t1;\nmov.b32 %%x%u, -1;\n",
+                             D0.Q, D0.R, D0.I);
+                rvx_app(ptx, "bra L%u;\n", base+(w+13)*4);
+                rvx_app(ptx, "DORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();                                  // the test clobbered scratch state
+            }
+            else rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
             rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc, pc2idx, cold);
             bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
             if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
@@ -2875,7 +2949,26 @@ static void rvxblk_build() {
     // ends at the long-proven 6000-word regions; only then give up (interpreter-only).
     {
         int defw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) defw=v; }
+        // Persisted knee discovery: when an assembly attempt trips the ptxas watchdog, remember the
+        // region size that finally worked (keyed on the image content) — otherwise EVERY process
+        // start replays the ~10 s failed attempt, and the idle stall also de-boosts the GPU clocks
+        // right before the workload (measured as a fake ~25% slowdown).
+        char kpath[300] = {0};
+        {   unsigned long long h = 1469598103934665603ULL;
+            const uint8_t* p = (const uint8_t*)g_img.data();
+            for (size_t i = 0; i < g_img.size()*4; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+            h ^= (unsigned long long)defw * 2654435761u;
+#ifdef _WIN32
+            char dir[MAX_PATH]; if (GetTempPathA(sizeof dir, dir))
+                snprintf(kpath, sizeof kpath, "%srvcud_regw_%016llx.txt", dir, h);
+#endif
+        }
         int tryw = 0;
+        if (kpath[0]) if (FILE* kf = fopen(kpath, "rb")) {   // known-good size from a previous discovery
+            int v = 0; if (fscanf(kf, "%d", &v) == 1 && v >= 6000 && v < defw) tryw = v;
+            fclose(kf);
+        }
+        bool degraded = tryw != 0;
         for (;;) {
             g_rvx_regw_force = tryw;
             ptx.clear(); pc2idx.clear();
@@ -2890,8 +2983,11 @@ static void rvxblk_build() {
             int cur = tryw ? tryw : defw;
             if (cur <= 6000) { fprintf(stderr,"[xblk] build failed (%d words)\n", cnt); return; }
             tryw = cur / 2;
+            degraded = true;
             fprintf(stderr,"[xblk] assembly failed at region size %d — retrying with %d\n", cur, tryw);
         }
+        if (degraded && tryw && kpath[0])
+            if (FILE* kf = fopen(kpath, "wb")) { fprintf(kf, "%d", tryw); fclose(kf); }
     }
 
     void* d_p2i=nullptr;
@@ -2931,8 +3027,8 @@ static void rvxblk_build() {
 
 // Run the exec_block from g_state[0].pc for up to `budget` guest instructions. Updates g_state[0]
 // (regs+pc, managed mem) and returns instructions retired, or -1 on launch error.
-static long long rvxblk_step(long long budget) {
-    if (!g_xblk_ok || !g_ret) return -1;
+static std::vector<unsigned long long> g_prof_hist; static uint32_t g_prof_base = 0;
+static long long rvxblk_step_once(long long budget) {
     *g_ret = 0;
     unsigned bud = (budget > 0x7fffffff) ? 0x7fffffffu : (unsigned)budget;
     void* args[] = { &g_mem, &g_state, &bud, &g_x_pc2idx, &g_ret };
@@ -2942,6 +3038,42 @@ static long long rvxblk_step(long long budget) {
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] launch %d\n",(int)r); return -1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr,"[xblk] sync fault\n"); return -1; }
     return (long long)*g_ret;
+}
+static long long rvxblk_step(long long budget) {
+    if (!g_xblk_ok || !g_ret) return -1;
+    // RVX_PROF=K: statistical guest-pc PROFILER — split the budget into K slices and histogram the
+    // pc after each slice (pinned state, free to read). Relative bucket weights identify where guest
+    // time goes; the extra launches distort absolute MIPS, so profile runs are never benchmarks.
+    static int prof = -1;
+    if (prof < 0) { const char* e = getenv("RVX_PROF"); prof = e ? atoi(e) : 0;
+        if (prof > 1) atexit([]{
+            std::vector<std::pair<unsigned long long,size_t>> top;
+            for (size_t b = 0; b < g_prof_hist.size(); b++)
+                if (g_prof_hist[b]) top.push_back({g_prof_hist[b], b});
+            std::sort(top.rbegin(), top.rend());
+            unsigned long long tot = 0; for (auto& t : top) tot += t.first;
+            fprintf(stderr, "[prof] %llu samples, top buckets (256 B):\n", tot);
+            for (size_t i = 0; i < top.size() && i < 24; i++)
+                fprintf(stderr, "[prof]   0x%08X  %5.1f%%  (%llu)\n",
+                        g_prof_base + (uint32_t)(top[i].second << 8),
+                        100.0 * top[i].first / (double)tot, top[i].first);
+        }); }
+    if (prof > 1) {
+        if (g_prof_hist.empty()) { g_prof_hist.assign(((size_t)g_pc2words * 4 + 255) >> 8, 0); g_prof_base = g_base; }
+        long long total = 0, slice = budget / prof; if (slice < 1000) slice = 1000;
+        while (total < budget) {
+            long long did = rvxblk_step_once(slice < budget - total ? slice : budget - total);
+            if (did < 0) return -1;
+            total += did;
+            uint32_t pc = g_state[0].pc & ~HALT_BIT;
+            if (pc >= g_prof_base) { size_t b = (size_t)(pc - g_prof_base) >> 8;
+                                     if (b < g_prof_hist.size()) g_prof_hist[b]++; }
+            if (g_state[0].pc & HALT_BIT) break;
+            if (did == 0) break;                       // not enterable — let the interpreter run
+        }
+        return total;
+    }
+    return rvxblk_step_once(budget);
 }
 
 // ── exec_block foundation: driver-API PTX execution pipeline ─────────────────
