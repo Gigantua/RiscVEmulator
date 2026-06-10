@@ -2430,7 +2430,12 @@ API int cuda_rvcud_step_all(int budget) {
                 }
             }
         }
-        int xstop = g_xblk_ok ? 0x80 : 0;             // self-stop only while exec is live (else: no relaunch storm)
+        // Self-stop at exec entries only while exec is live AND no dynamic code exists: once a JIT
+        // guest's runtime code is translated (g_whi != 0), it constantly calls static helpers that
+        // are exec entries — each self-stop then costs TWO launch round-trips per call (measured:
+        // TinyCC mandelbrot 35.6 s vs 3.6 s). Without the stops the interpreter's own fusions own
+        // those helpers; exec still engages whenever a chunk STARTS in static code.
+        int xstop = (g_xblk_ok && g_whi == 0) ? 0x80 : 0;
         int irem = rem;                               // RVX_PROF: slice interpreter launches too, so
         { int pr = rvx_prof();                        // interpreter/JIT-dominated guests get samples
           if (pr > 1) { int sl = budget / pr; if (sl < 1000) sl = 1000; if (irem > sl) irem = sl; } }
