@@ -68,6 +68,7 @@
 #define MIDI_WR     (*(volatile unsigned int *)0x10005010)
 #define MIDI_RING   ((volatile unsigned int *)0x10005020)
 static unsigned int midi_wr = 0;
+static unsigned int midi_tick = 0;   /* 140 Hz sequencer tick — tags ring entries for host re-spacing */
 
 /* WAD location — host writes WAD data here and sets the size */
 #define WAD_BASE_ADDR  0x00A00000u  /* 10 MB offset into RAM */
@@ -190,6 +191,10 @@ static void poll_mouse(void)
         int dx = MOUSE_DX * 4;
         int dy = MOUSE_DY * 4;
         unsigned int btn = MOUSE_BTN;
+        /* Consume-ack (mirror of the keyboard fix): the CUDA host stages the next accumulated
+         * deltas only after we clear the status cell — without the ack it overwrote unconsumed
+         * deltas every launch and most motion was lost. No-op on the CPU guarded device. */
+        MOUSE_STATUS = 0;
 
         if (dx != 0 || dy != 0)
             doom_mouse_move(dx, dy);
@@ -372,18 +377,23 @@ void _start(void)
             /* Clamp catch-up. delta_us is wall-clock time, so a slow frame
              * asks the next frame to process more ticks — which costs more
              * time, which demands still more ticks: a compounding spiral.
-             * Cap the backlog so MIDI work per frame stays bounded. */
-            if (midi_accum_us > MIDI_TICK_US * 8)
-                midi_accum_us = MIDI_TICK_US * 8;
+             * Cap the backlog so MIDI work per frame stays bounded. (16 ticks
+             * = 114 ms: the old 8-tick cap DROPPED musical time on any frame
+             * slower than 57 ms, audibly slowing the tempo.) */
+            if (midi_accum_us > MIDI_TICK_US * 16)
+                midi_accum_us = MIDI_TICK_US * 16;
             while (midi_accum_us >= MIDI_TICK_US) {
                 midi_accum_us -= MIDI_TICK_US;
+                midi_tick++;
                 unsigned long midi;
                 while ((midi = doom_tick_midi()) != 0) {
-                    /* CUDA path: lossless ring at +0x20 (entry first, then the write index — the host
-                     * drains [rd..wr) once per launch; the old single-cell write kept only the LAST
-                     * message per batch, dropping chords/note-offs). CPU path: the guarded device
-                     * plays MIDI_DATA immediately and ignores the ring-cell writes. */
-                    MIDI_RING[midi_wr & 31u] = (unsigned int)midi;
+                    /* CUDA path: lossless 256-entry ring at +0x20 (entry first, then the write
+                     * index — the host drains [rd..wr) once per launch). The entry's HIGH BYTE
+                     * carries the 140 Hz tick counter so the host can re-space a burst of ticks
+                     * (a whole frame's worth arrives in one launch) at musical time instead of
+                     * playing it as one clump. CPU path: the guarded device plays MIDI_DATA
+                     * immediately and ignores the ring-cell writes. */
+                    MIDI_RING[midi_wr & 255u] = ((unsigned int)midi & 0x00FFFFFFu) | (midi_tick << 24);
                     MIDI_WR = ++midi_wr;
                     MIDI_DATA = (unsigned int)midi;
                 }

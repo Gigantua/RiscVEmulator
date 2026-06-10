@@ -680,8 +680,16 @@ static int is_solid(int x, int y, int z)
 static void player_update(float dt)
 {
     Player* p = &s_player;
-    int32_t mdx = MOUSE_DX;
-    int32_t mdy = MOUSE_DY;
+    /* Status-guarded read + consume-ack: the CUDA host stages accumulated deltas only after the
+     * previous staging is acked (else unconsumed motion was overwritten every launch), and the
+     * staged dx/dy cells go stale after the ack — reading them unguarded would re-apply old
+     * deltas every frame. On the CPU guarded device the reads clear and the write is a no-op. */
+    int32_t mdx = 0, mdy = 0;
+    if (MOUSE_BASE[0] & 1) {
+        mdx = MOUSE_DX;
+        mdy = MOUSE_DY;
+        MOUSE_BASE[0] = 0;
+    }
     p->yaw -= (float)mdx * MOUSE_SENS;
     p->pitch -= (float)mdy * MOUSE_SENS;
     if (p->pitch > 1.50f) p->pitch = 1.50f;

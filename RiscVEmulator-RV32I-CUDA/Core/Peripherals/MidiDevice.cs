@@ -7,7 +7,7 @@ namespace RiscVEmulator.Core.Peripherals
     public class MidiDevice : IPeripheral, IDisposable
     {
         public uint BaseAddress => 0x10005000;
-        public uint Size        => 0x100;
+        public uint Size        => 0x1000;   // covers the guest's 256-entry CUDA ring (+0x20..+0x420; no-op writes here)
         public bool IsGuarded   => true;
 
         // CRITICAL: this peripheral's Write runs inside the VEH callback,
@@ -31,15 +31,18 @@ namespace RiscVEmulator.Core.Peripherals
         private readonly uint[] _ring = new uint[RingMask + 1];
         private long _head;   // producer (VEH thread)
         private long _tail;   // consumer (drain thread)
+        private long _paceTarget;   // absolute Stopwatch deadline the pace-sleep chain extends
 
         [DllImport("winmm.dll")] private static extern int  midiOutOpen(out IntPtr lphMidiOut, uint uDeviceID, IntPtr dwCallback, IntPtr dwInstance, uint fdwOpen);
         [DllImport("winmm.dll")] private static extern int  midiOutShortMsg(IntPtr hMidiOut, uint dwMsg);
         [DllImport("winmm.dll")] private static extern int  midiOutReset(IntPtr hMidiOut);
         [DllImport("winmm.dll")] private static extern int  midiOutClose(IntPtr hMidiOut);
         [DllImport("winmm.dll")] private static extern uint midiOutGetNumDevs();
+        [DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint ms);
 
         public MidiDevice()
         {
+            timeBeginPeriod(1);   // pace-sleeps are ~7 ms (one 140 Hz tick); the default 15.6 ms timer would double them
             _drainThread = new Thread(DrainLoop)
             {
                 IsBackground = true,
@@ -115,7 +118,18 @@ namespace RiscVEmulator.Core.Peripherals
                         while (Volatile.Read(ref _head) == _tail) Thread.SpinWait(64);
                         uint ms = _ring[(int)(_tail & RingMask)];
                         _tail++;
-                        if (ms > 0 && ms <= 10_000) Thread.Sleep((int)ms);
+                        if (ms > 0 && ms <= 10_000)
+                        {
+                            // Absolute-schedule pacing: chain targets so per-sleep overshoot never
+                            // accumulates (a burst of 7 ms tick sleeps would otherwise stretch and
+                            // audibly slow the music). An idle gap resets the chain to "now".
+                            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                            if (_paceTarget < now) _paceTarget = now;
+                            _paceTarget += (long)ms * System.Diagnostics.Stopwatch.Frequency / 1000;
+                            long waitMs = (_paceTarget - now) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                            if (waitMs > 1) Thread.Sleep((int)(waitMs - 1));
+                            while (System.Diagnostics.Stopwatch.GetTimestamp() < _paceTarget) Thread.SpinWait(64);
+                        }
                     }
                     else
                     {

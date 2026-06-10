@@ -85,7 +85,7 @@ namespace RiscVEmulator.Core.Cuda
         private IntPtr _audioMirror;
         private byte[] _pcmTmp = new byte[4096];     // PCM slice scratch (grown on demand)
         private uint   _midiRd;                      // host read cursor into the guest MIDI ring
-        private readonly byte[] _midiBuf = new byte[128];
+        private readonly byte[] _midiBuf = new byte[1024];   // 256 ring entries × 4 B
         private const ulong TimebaseHz = 60_000_000UL;
 
         // Scratch for cell-level reconcile copies.
@@ -256,16 +256,22 @@ namespace RiscVEmulator.Core.Cuda
             BitConverter.TryWriteBytes(_b32.AsSpan(0), Keyboard.Read(0x08, 4));   // modifiers: always fresh
             cuda_rv32i_write_mem(CoreId, _b32, KBD_BASE + 8, 4);
 
-            // Mouse: stage accumulated deltas/buttons (the reads clear the C# side).
-            int  dx  = (int)Mouse.Read(0x04, 4);
-            int  dy  = (int)Mouse.Read(0x08, 4);
-            uint btn = Mouse.Read(0x0C, 4);
-            uint mhas = (dx != 0 || dy != 0 || btn != 0) ? 1u : 0u;
-            BitConverter.TryWriteBytes(_b32.AsSpan(0),  mhas);
-            BitConverter.TryWriteBytes(_b32.AsSpan(4),  (uint)dx);
-            BitConverter.TryWriteBytes(_b32.AsSpan(8),  (uint)dy);
-            BitConverter.TryWriteBytes(_b32.AsSpan(12), btn);
-            cuda_rv32i_write_mem(CoreId, _b32, MOUSE_BASE, 16);
+            // Mouse: 1-deep mailbox with guest ack (mirror of the keyboard fix). Stage ONLY after the
+            // guest consumed the previous event (it clears the status cell); until then the C# device
+            // keeps ACCUMULATING deltas, so nothing is lost. Unconditional re-staging every launch
+            // replaced unconsumed deltas with just the last ~5 ms slice — the guest polls once per
+            // frame (many launches), so most motion silently vanished.
+            if (R32(MOUSE_BASE) == 0 && Mouse.Read(0x00, 4) != 0)
+            {
+                int  dx  = (int)Mouse.Read(0x04, 4);             // reads clear the accumulator
+                int  dy  = (int)Mouse.Read(0x08, 4);
+                uint btn = Mouse.Read(0x0C, 4);
+                BitConverter.TryWriteBytes(_b32.AsSpan(0),  1u);
+                BitConverter.TryWriteBytes(_b32.AsSpan(4),  (uint)dx);
+                BitConverter.TryWriteBytes(_b32.AsSpan(8),  (uint)dy);
+                BitConverter.TryWriteBytes(_b32.AsSpan(12), btn);
+                cuda_rv32i_write_mem(CoreId, _b32, MOUSE_BASE, 16);
+            }
         }
 
         private void StageTimers()
@@ -318,19 +324,37 @@ namespace RiscVEmulator.Core.Cuda
             // host keeps its own read cursor). The old single-cell drain kept only the LAST message
             // per launch — the guest's tick loop overwrote the cell per message, so chords and
             // note-offs vanished. Guests that never touch the ring fall back to the legacy cell.
+            // Each entry's HIGH BYTE is the guest's 140 Hz sequencer tick: a whole frame's worth of
+            // ticks arrives in ONE launch, so we re-space the burst at musical time by inserting
+            // pace-sleeps (MidiDevice's 0x0C sentinel) between tick groups. Pacing state resets per
+            // drain — wall time already covers the gaps BETWEEN drains; re-sleeping them would lag.
             if (Midi != null || OnMidi != null)
             {
                 uint wr = R32(MIDI_BASE + 0x10);
                 if (wr != 0)
                 {
-                    if (wr - _midiRd > 32) _midiRd = wr - 32;            // ring overrun (32 entries)
+                    if (wr - _midiRd > 256) _midiRd = wr - 256;          // ring overrun (256 entries)
                     if (wr != _midiRd)
                     {
-                        cuda_rv32i_read_mem(CoreId, _midiBuf, MIDI_BASE + 0x20, 128);
+                        cuda_rv32i_read_mem(CoreId, _midiBuf, MIDI_BASE + 0x20, 1024);
+                        bool first = true; byte lastTick = 0; uint paceUs = 0;
                         for (; _midiRd != wr; _midiRd++)
                         {
-                            uint m = BitConverter.ToUInt32(_midiBuf, (int)((_midiRd & 31) * 4)) & 0x00FFFFFFu;
-                            if (m == 0) continue;
+                            uint e = BitConverter.ToUInt32(_midiBuf, (int)((_midiRd & 255) * 4));
+                            if (e == 0) continue;
+                            uint m = e & 0x00FFFFFFu;
+                            byte tick = (byte)(e >> 24);
+                            if (!first)
+                            {
+                                uint dt = (byte)(tick - lastTick);
+                                if (dt > 0 && dt <= 32)                   // re-space within the burst (7143 µs/tick)
+                                {
+                                    paceUs += dt * 7143u;
+                                    uint ms = paceUs / 1000u;
+                                    if (ms > 0) { paceUs -= ms * 1000u; Midi?.Write(0x0C, 4, ms); }
+                                }
+                            }
+                            first = false; lastTick = tick;
                             OnMidi?.Invoke(0x04, m);
                             Midi?.Write(0x04, 4, m);
                         }
