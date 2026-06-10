@@ -38,6 +38,7 @@ namespace RiscVEmulator.Core.Cuda
         [DllImport(Lib)] private static extern int  cuda_rvcud_set_code(byte[] src, uint len, uint baseAddr, uint entry);
         [DllImport(Lib)] private static extern int  cuda_rvcud_step_all(int budget);
         [DllImport(Lib)] private static extern ulong cuda_rvcud_iters();
+        [DllImport(Lib)] private static extern ulong cuda_rvcud_retired();
         // Staged-MMIO mailbox: one pinned page + two on-stream micro-kernels replace the ~12 tiny
         // synchronous memcpys per StepN (each a ~10-20 µs WDDM submit — together they dominated the
         // host gap between launches). Host writes the INBOX / reads the OUTBOX as plain memory.
@@ -124,6 +125,11 @@ namespace RiscVEmulator.Core.Cuda
 
         public bool DeterministicTime { get; set; }
         private ulong _totalSteps;
+        private ulong _actualSteps;
+        /// <summary>Guest instructions ACTUALLY retired (incl. fused-uop / exec-block overshoot past
+        /// each StepN budget). The honest numerator for MIPS — _totalSteps only sums the requested
+        /// budgets. rvcud only; the base kernel retires exactly the budget.</summary>
+        public ulong ActualSteps => _actualSteps;
 
         public Action<char>? OutputHandler { get; set; }
         public Action<uint, uint>? OnMidi { get; set; }
@@ -250,6 +256,7 @@ namespace RiscVEmulator.Core.Cuda
             int rc = UseRvcud ? cuda_rvcud_step_all(n) : cuda_rv32i_step_all(n);
             if (rc != 0)
                 throw new InvalidOperationException($"cuda_{(UseRvcud ? "rvcud" : "rv32i")}_step_all failed (CUDA error {rc})");
+            _actualSteps += UseRvcud ? cuda_rvcud_retired() : (ulong)n;
 
             uint exit;
             if (_box != null) { cuda_rv32i_iodrain(); DrainOutputsBox(); exit = _box[60]; }

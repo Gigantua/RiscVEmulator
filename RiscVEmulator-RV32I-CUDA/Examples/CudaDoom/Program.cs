@@ -191,27 +191,20 @@ if (args.Contains("--ttf"))
     Console.WriteLine($"DOOM time-to-first-{want}-frames (cold boot, branchy/indirection-heavy):");
     const int Batch = 200_000;        // small batches → tight time-to-frame, launch overhead is counted (realistic)
     var sw = Stopwatch.StartNew();
-    long steps = 0; int frames = 0; ulong last = 0;
+    int frames = 0;
     for (int b = 0; b < 20000 && !emu.IsHalted; b++)
     {
-        emu.StepN(Batch); steps += Batch;
-        var px = emu.Framebuffer.PresentedPixels;
-        // Frame-change detection, 8 bytes at a time: the original per-byte FNV cost ~0.4 ms per
-        // 200k batch (~20% of total wall at ~100 MIPS — pure measurement overhead). Any
-        // deterministic digest works (h is only compared against the previous frame's); alpha is
-        // masked out of the non-black count (the guest writes A=255 everywhere).
-        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(px);
-        ulong h = 1469598103934665603UL; int nz = 0;
-        for (int i = 0; i < words.Length; i++)
+        emu.StepN(Batch);
+        // Frames = the guest's own VSYNC presents (DisplayControlDevice.VsyncCount): only COMPLETE
+        // frames count. The old FB-hash detection counted partially-drawn batch snapshots as frames,
+        // so a faster present path (fewer partials visible) read as a ttf REGRESSION. Steps = guest
+        // instructions actually retired (fused uops / exec_block overshoot past each batch budget;
+        // `steps += Batch` undercounted real work, differently per engine).
+        int vf = (int)emu.Display.VsyncCount;
+        if (vf > frames)
         {
-            ulong v = words[i];
-            h = (h ^ v) * 1099511628211UL;
-            if ((v & 0x00FFFFFF00FFFFFFUL) != 0) nz += 2;     // 2 pixels per word
-        }
-        if (nz > 5000 && h != last)
-        {
-            last = h; frames++;
-            double s = sw.Elapsed.TotalSeconds;
+            frames = vf;
+            double s = sw.Elapsed.TotalSeconds, steps = emu.ActualSteps;
             Console.WriteLine($"  frame {frames}: {steps / 1e6:F1}M steps, {s:F2}s, {steps / s / 1e6:F2} MIPS");
             if (frames >= want)
             {
@@ -220,7 +213,7 @@ if (args.Contains("--ttf"))
             }
         }
     }
-    Console.Error.WriteLine($"only reached {frames}/{want} frames after {steps / 1e6:F0}M steps"); return 1;
+    Console.Error.WriteLine($"only reached {frames}/{want} frames after {emu.ActualSteps / 1e6:F0}M steps"); return 1;
 }
 
 if (shotPath != null)
