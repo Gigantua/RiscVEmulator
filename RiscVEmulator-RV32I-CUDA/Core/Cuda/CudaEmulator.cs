@@ -422,9 +422,18 @@ namespace RiscVEmulator.Core.Cuda
             if (vsync != 0) { Display.Write(0x0C, 4, vsync); _box[34] = 1; _box[58] = 0; }
             int fbLen = Math.Min(_fbBytes, Framebuffer.PresentedPixels.Length);
             uint src = (fbAddr != 0 && fbAddr < (uint)RamBytes) ? fbAddr : FB_BASE;
-            // Pipelined fetch: this batch's frame copies under the NEXT kernel; consume the previous
-            // batch's (one-batch display lag ≈ 2 ms). Falls back to the sync read on any failure.
-            if (_fbPipeOk && cuda_rv32i_fb_snap(src, (uint)fbLen, _fbSlot) == 0)
+            if (Display.VsyncEverUsed)
+            {
+                // Present-gated fetch: a guest that signals VSYNC gets the framebuffer refreshed
+                // ONLY at presents — the continuous per-batch fetch showed partially-drawn frames
+                // (and raced the guest's next-frame clear on single-buffered guests). A synchronous
+                // read is fine here: it runs at the guest's present rate, not per batch.
+                if (vsync != 0) cuda_rv32i_read_mem(CoreId, Framebuffer.PresentedPixels, src, (uint)fbLen);
+            }
+            // Pipelined fetch (guests that never vsync): this batch's frame copies under the NEXT
+            // kernel; consume the previous batch's (one-batch display lag ≈ 2 ms). Falls back to
+            // the sync read on any failure.
+            else if (_fbPipeOk && cuda_rv32i_fb_snap(src, (uint)fbLen, _fbSlot) == 0)
             {
                 cuda_rv32i_fb_wait(_fbSlot ^ 1, Framebuffer.PresentedPixels, (uint)fbLen);
                 _fbSlot ^= 1;
