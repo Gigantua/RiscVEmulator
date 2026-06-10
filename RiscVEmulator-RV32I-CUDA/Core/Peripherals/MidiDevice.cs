@@ -27,6 +27,7 @@ namespace RiscVEmulator.Core.Peripherals
         // ShortMsg (lower 24 bits, top byte 0) or a sentinel:
         //   0xFFFFFFFFu = "reset"
         //   0xFFFFFFFEu = "sleep N ms" — N stored in next slot
+        //   0xFFFFFFFDu = "sleep until absolute Stopwatch timestamp" — lo,hi in next two slots
         private const int RingMask = (1 << 12) - 1;
         private readonly uint[] _ring = new uint[RingMask + 1];
         private long _head;   // producer (VEH thread)
@@ -88,6 +89,20 @@ namespace RiscVEmulator.Core.Peripherals
             _ring[(int)(slot & RingMask)] = v;
         }
 
+        /// <summary>
+        /// Defer everything enqueued after this call until the absolute Stopwatch timestamp.
+        /// The CUDA drain uses it to replay frame-sized MIDI bursts at musical time: each event
+        /// gets a wall-clock deadline computed from its sequencer tick (plus a lead buffer), so
+        /// playback spacing is exact regardless of how unevenly the guest's frames emit. NOT
+        /// VEH-safe callers only (plain managed threads) — same lock-free enqueue as Write.
+        /// </summary>
+        public void PaceUntil(long stopwatchTimestamp)
+        {
+            Enqueue(0xFFFFFFFDu);
+            Enqueue((uint)stopwatchTimestamp);
+            Enqueue((uint)((ulong)stopwatchTimestamp >> 32));
+        }
+
         private void DrainLoop()
         {
             // Lazy open on first activity to avoid touching winmm at startup
@@ -110,6 +125,21 @@ namespace RiscVEmulator.Core.Peripherals
                     if (v == 0xFFFFFFFFu)
                     {
                         if (_opened) midiOutReset(_midiHandle);
+                    }
+                    else if (v == 0xFFFFFFFDu)
+                    {
+                        // Absolute deadline: next two slots hold the Stopwatch timestamp.
+                        while (Volatile.Read(ref _head) - _tail < 2) Thread.SpinWait(64);
+                        uint lo = _ring[(int)(_tail & RingMask)]; _tail++;
+                        uint hi = _ring[(int)(_tail & RingMask)]; _tail++;
+                        long due = (long)(((ulong)hi << 32) | lo);
+                        long nowTs = System.Diagnostics.Stopwatch.GetTimestamp();
+                        long waitMs = (due - nowTs) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                        if (waitMs > 0 && waitMs < 10_000)        // bound guards a torn/garbage deadline
+                        {
+                            if (waitMs > 1) Thread.Sleep((int)(waitMs - 1));
+                            while (System.Diagnostics.Stopwatch.GetTimestamp() < due) Thread.SpinWait(64);
+                        }
                     }
                     else if (v == 0xFFFFFFFEu)
                     {

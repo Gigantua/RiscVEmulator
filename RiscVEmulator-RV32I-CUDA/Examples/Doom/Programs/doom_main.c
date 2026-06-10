@@ -188,8 +188,10 @@ static void poll_keyboard(void)
 static void poll_mouse(void)
 {
     if (MOUSE_STATUS & 1) {
-        int dx = MOUSE_DX * 4;
-        int dy = MOUSE_DY * 4;
+        /* Raw deltas: the old ×4 here compensated for the staging bug that dropped ~85% of
+         * motion — with lossless accumulation it made the mouse wildly oversensitive. */
+        int dx = MOUSE_DX;
+        int dy = MOUSE_DY;
         unsigned int btn = MOUSE_BTN;
         /* Consume-ack (mirror of the keyboard fix): the CUDA host stages the next accumulated
          * deltas only after we clear the status cell — without the ack it overwrote unconsumed

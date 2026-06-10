@@ -86,6 +86,15 @@ namespace RiscVEmulator.Core.Cuda
         private byte[] _pcmTmp = new byte[4096];     // PCM slice scratch (grown on demand)
         private uint   _midiRd;                      // host read cursor into the guest MIDI ring
         private readonly byte[] _midiBuf = new byte[1024];   // 256 ring entries × 4 B
+        // Musical-clock → wall-clock mapping for MIDI replay. The guest stamps each ring entry with
+        // its 140 Hz sequencer tick; events are scheduled at _midiWallBase + tick·7143 µs with a lead
+        // buffer, so playback spacing is exact no matter how unevenly the frames emitted the bursts.
+        private bool   _midiClkInit;
+        private ulong  _midiTickExt;                 // unwrapped tick counter (ring carries only 8 bits)
+        private byte   _midiLastTick;
+        private long   _midiWallBase;                // Stopwatch ticks of musical tick 0
+        private long   _midiLastEvtWall;             // last event arrival (silence detection → rebase)
+        private const long MidiLeadMs = 90;          // jitter-absorbing playback latency
         private const ulong TimebaseHz = 60_000_000UL;
 
         // Scratch for cell-level reconcile copies.
@@ -337,24 +346,26 @@ namespace RiscVEmulator.Core.Cuda
                     if (wr != _midiRd)
                     {
                         cuda_rv32i_read_mem(CoreId, _midiBuf, MIDI_BASE + 0x20, 1024);
-                        bool first = true; byte lastTick = 0; uint paceUs = 0;
+                        long swFreq = Stopwatch.Frequency;
                         for (; _midiRd != wr; _midiRd++)
                         {
                             uint e = BitConverter.ToUInt32(_midiBuf, (int)((_midiRd & 255) * 4));
                             if (e == 0) continue;
                             uint m = e & 0x00FFFFFFu;
                             byte tick = (byte)(e >> 24);
-                            if (!first)
+                            long now = Stopwatch.GetTimestamp();
+                            if (!_midiClkInit || now - _midiLastEvtWall > swFreq)
                             {
-                                uint dt = (byte)(tick - lastTick);
-                                if (dt > 0 && dt <= 32)                   // re-space within the burst (7143 µs/tick)
-                                {
-                                    paceUs += dt * 7143u;
-                                    uint ms = paceUs / 1000u;
-                                    if (ms > 0) { paceUs -= ms * 1000u; Midi?.Write(0x0C, 4, ms); }
-                                }
+                                // First event, or >1 s of silence (tick byte would be ambiguous):
+                                // (re)base the musical clock with the full lead buffer.
+                                _midiClkInit = true; _midiTickExt = 0;
+                                _midiWallBase = now + MidiLeadMs * swFreq / 1000;
                             }
-                            first = false; lastTick = tick;
+                            else _midiTickExt += (byte)(tick - _midiLastTick);
+                            _midiLastTick = tick; _midiLastEvtWall = now;
+                            long due = _midiWallBase + (long)(_midiTickExt * 7143UL) * swFreq / 1_000_000;
+                            if (due < now) { _midiWallBase += now - due; due = now; }   // late (frame hitch) → slide, keep spacing
+                            Midi?.PaceUntil(due);
                             OnMidi?.Invoke(0x04, m);
                             Midi?.Write(0x04, 4, m);
                         }
