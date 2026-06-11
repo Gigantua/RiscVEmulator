@@ -159,6 +159,27 @@ if (args.Contains("--bench"))
     return 0;
 }
 
+// ── core-count scaling: 1/4/8/16/32 guests, one thread per guest (nc==1 additionally runs the
+//    whole warp cooperatively on the single guest). Aggregate + per-core MIPS, best of 3.
+if (args.Contains("--scale"))
+{
+    Console.WriteLine("[scale] rvcud aggregate & per-core MIPS vs core count (best of 3)");
+    Console.WriteLine("  cores    compute agg  per-core      data agg  per-core    diverge agg  per-core");
+    Console.WriteLine("  ─────    ───────────  ────────    ──────────  ────────    ───────────  ────────");
+    foreach (int n in new[] { 1, 4, 8, 16, 32 })
+    {
+        var agg = new double[3]; int gi = 0;
+        foreach (var g in new[] { comp, bench, div })
+        {
+            double best = 0;
+            for (int i = 0; i < 3; i++) best = Math.Max(best, Run(g, n, 100_000, 0, true).mips);
+            agg[gi++] = best;
+        }
+        Console.WriteLine($"  {n,5}    {agg[0],11:F1}  {agg[0]/n,8:F1}    {agg[1],10:F1}  {agg[1]/n,8:F1}    {agg[2],11:F1}  {agg[2]/n,8:F1}");
+    }
+    return 0;
+}
+
 // ── rvcud correctness gate ── a fused uop retires several guest instructions, so rvcud
 // overshoots a guest-instruction budget by up to one uop's weight. To compare apples-to-
 // apples we run rvcud for a budget, read its EXACT retired count R, then run rv32i for

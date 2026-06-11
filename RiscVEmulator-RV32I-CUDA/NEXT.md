@@ -62,8 +62,16 @@ w2 landed the follow-up: cooperative xscan/xscpy → **~291 MIPS** (evening
 window, +4.4% over w1, all pairs). Units now 5.99% of kernel cycles — the
 fused-unit lever is EXHAUSTED. f80-capture rule learned: pixel compares need a
 quiet GPU and matched pacing (content is demo-tic-dependent; see w2 row).
+
+**h6 (user-directed): present gate 14000→1000 µs** — post-w2 the engine outran
+the 70 Hz cap (wall pinned at the gate floor; gains showed only as spin steps).
+New compute-bound baseline: **~500–596 MIPS ttf90** (steps bit-stable ~181 M).
+The 310-MIPS goal is exceeded ~1.9×. Core scaling (CudaBench `--scale`):
+compute 419/core @1 → 11.6 G agg @32; data 222→1685 agg; diverge 142→254 agg.
 Left on the table (only if a new goal appears): the Tier-3 MULTIMOD
-register-resident program for the scalar `wait` bucket (~50%).
+register-resident program for the scalar `wait` bucket (~50%), and the
+cross-region direct-call idea (DLOOP round trips; measure with the new
+UNITPROF DLOOP counter first).
 
 Everything below is the COMPLETED plan, kept for the record.
 

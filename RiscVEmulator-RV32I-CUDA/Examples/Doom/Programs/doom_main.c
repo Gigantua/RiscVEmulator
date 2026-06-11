@@ -338,13 +338,15 @@ void _start(void)
         poll_mouse();
         doom_update();
 
-        /* Present at a fixed rate, not once per loop iteration: each call's
+        /* Present at a capped rate, not once per loop iteration: each call's
          * vsync MMIO write triggers a full 256 KB framebuffer copy on the
-         * host CPU thread. ~70 Hz is smooth without taxing the emulated CPU. */
+         * host CPU thread. 1 ms floor = presents track render speed (the old
+         * 14 ms / ~70 Hz cap wall-clock-gated the engine once it outran it)
+         * while still bounding the host copy rate. */
         {
             static unsigned int last_fb_us = 0;
             unsigned int now_fb_us = RTC_US_LO;
-            if ((unsigned int)(now_fb_us - last_fb_us) >= 14000u) {
+            if ((unsigned int)(now_fb_us - last_fb_us) >= 1000u) {
                 last_fb_us = now_fb_us;
                 copy_framebuffer();
             }

@@ -779,8 +779,8 @@ static uint8_t*   g_dirty = nullptr;
 static std::vector<uint8_t> g_dynpage;
 static uint32_t   g_wlo = 0xFFFFFFFFu, g_whi = 0;
 static CUdeviceptr g_xdw = 0;
-static CUdeviceptr g_xup = 0;                // RVX_UNITPROF: device u64[8] cycle counters (7 helper units + xk total)
-static unsigned long long g_xup_host[8];     // host snapshot, refreshed after every exec launch
+static CUdeviceptr g_xup = 0;                // RVX_UNITPROF: device u64 counters (7 unit cycles + xk total + jalr/XDISP counts)
+static unsigned long long g_xup_host[11];    // host snapshot, refreshed after every exec launch
 static int        g_dyncode = 0;             // RVX_DYNCODE / cuda_rvcud_set_dyncode: bake exec SMC checks
 static void rvcud_update_window();
 static bool rvx_dyncode();
@@ -2656,6 +2656,7 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
                 rvx_app(s,"add.s32 %%t0, %%x%u, %d;\nand.b32 %%t0, %%t0, 4294967294;\n",rs1,(int)rv_iimm(instr));
                 if(rd){ rvx_app(s,"mov.b32 %%x%u, %u;\n",rd,pc+4); wr(rd,(int)((pc+4)&3)); }
                 if(rd==1) spush();                                  // indirect CALL: arm the callee's ret
+                if (getenv("RVX_UNITPROF")) s += "mov.u64 %a1, XUP;\nred.global.add.u64 [%a1+64], 1;\n";
                 s += "mov.b32 %pc, %t0;\nbra XDISP;\n"; } break;
     case 0x63:{ uint32_t t=pc+rv_bimm(instr); const char* cc; bool sg=false;
                 switch(f3){case 0:cc="eq";break;case 1:cc="ne";break;case 4:cc="lt";sg=true;break;case 5:cc="ge";sg=true;break;case 6:cc="lt";break;default:cc="ge";}
@@ -3801,7 +3802,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         auto uclk = [](std::string& u, int idx){
             if (u.empty()) return;
             size_t f = u.find(".visible .func");
-            u.insert(f, ".extern .global .align 8 .b8 XUP[64];\n");
+            u.insert(f, ".extern .global .align 8 .b8 XUP[88];\n");
             size_t b = u.find("{\n", f) + 2;
             u.insert(b, ".reg .b32 %ck0,%ck1;\n.reg .b64 %cka,%ckq;\nmov.u32 %ck0, %clock;\n");
             for (size_t p = u.find("ret;", b); p != std::string::npos; p = u.find("ret;", p))
@@ -3829,6 +3830,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx  = hdr;
         ptx += ".extern .shared .align 8 .b8 XS[];\n";   // dynamic shared (168 B × blockDim at launch) — per-CTA, far cheaper than .global per region transition
         ptx += ".extern .global .align 8 .b8 XDW[24];\n";   // SMC watch window {wlo,whi,dirtyPtr,rlo,rhi} (dispatcher-defined)
+        if (getenv("RVX_UNITPROF")) ptx += ".extern .global .align 8 .b8 XUP[88];\n";
         if (ncpy) ptx += ".extern .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn);\n";
         if (nfill) ptx += ".extern .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn);\n";
         if (npal) ptx += ".extern .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa);\n";
@@ -4367,7 +4369,9 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             prev = (int)w;
         }
         ptx += cold;                                    // cold misaligned-store blocks (each ends with bra CJ<pc>)
-        ptx += "XDISP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
+        ptx += "XDISP:\n";
+        if (getenv("RVX_UNITPROF")) ptx += "mov.u64 %a1, XUP;\nred.global.add.u64 [%a1+72], 1;\n";
+        ptx += "setp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
         rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
         rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
         ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n"
@@ -4383,7 +4387,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     ptx  = hdr;
     ptx += ".extern .shared .align 8 .b8 XS[];\n";       // same dynamic-shared segment the region units alias
     ptx += ".visible .global .align 8 .b8 XDW[24];\n";   // SMC watch window {wlo,whi,dirtyPtr,rlo,rhi}; host-poked
-    if (getenv("RVX_UNITPROF")) ptx += ".visible .global .align 8 .b8 XUP[64];\n";
+    if (getenv("RVX_UNITPROF")) ptx += ".visible .global .align 8 .b8 XUP[88];\n";   // [8]=jalr entries, [9]=XDISP entries, [10]=DLOOP iterations
     for (int r=0; r<K; r++) rvx_app(ptx, ".extern .func xr%d;\n", r);
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
     ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad,%xs;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg,%gid,%tx;\n.reg .pred %p0,%pz;\n";
@@ -4412,7 +4416,9 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
            "st.shared.u64 [%xs+144], %M;\nst.shared.u64 [%xs+152], %P2I;\n"
            "st.shared.u32 [%xs+164], %cnt;\n";   // shadow-stack pointer = 0 (cold stack: rets miss to XDISP)
     if (getenv("RVX_UNITPROF")) ptx += "mov.u32 %ck0, %clock;\n";
-    ptx += "DLOOP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
+    ptx += "DLOOP:\n";
+    if (getenv("RVX_UNITPROF")) ptx += "mov.u64 %cka, XUP;\nred.global.add.u64 [%cka+80], 1;\n";
+    ptx += "setp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
     rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
     rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
     ptx += "mul.wide.u32 %ad, %wi, 4;\nadd.u64 %ad, %ad, %P2I;\nld.global.u32 %bidx, [%ad];\n";
@@ -4720,8 +4726,8 @@ static void rvxblk_build() {
     // g_xup_host after every launch (DtoH at atexit would race the context teardown).
     g_xup = 0;
     if (getenv("RVX_UNITPROF")) { CUdeviceptr up = 0; size_t upsz = 0;
-        if (cuModuleGetGlobal(&up, &upsz, mod, "XUP") == CUDA_SUCCESS && upsz >= 64) {
-            g_xup = up; cuMemsetD8(up, 0, 64); memset(g_xup_host, 0, sizeof g_xup_host);
+        if (cuModuleGetGlobal(&up, &upsz, mod, "XUP") == CUDA_SUCCESS && upsz >= 88) {
+            g_xup = up; cuMemsetD8(up, 0, 88); memset(g_xup_host, 0, sizeof g_xup_host);
             static bool reg = false;
             if (!reg) { reg = true; atexit([]{
                 static const char* nm[7] = {"xcopy","xfill","xpal","xscan","xscpy","xtexc","xtexs"};
@@ -4729,7 +4735,7 @@ static void rvxblk_build() {
                 unsigned long long s = 0; for (int i=0;i<7;i++) s += g_xup_host[i];
                 fprintf(stderr, "[uprof] xk %llu cyc; in-unit %llu (%.2f%%):", g_xup_host[7], s, 100.0*s/t);
                 for (int i=0;i<7;i++) fprintf(stderr, " %s %.2f%%", nm[i], 100.0*g_xup_host[i]/t);
-                fprintf(stderr, "\n"); }); }
+                fprintf(stderr, "\n[uprof] jalr-site entries %llu, XDISP entries %llu, DLOOP iters %llu\n", g_xup_host[8], g_xup_host[9], g_xup_host[10]); }); }
         } }
     g_xtab.assign(N, 0);
     for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch-entry words
@@ -4843,7 +4849,7 @@ static long long rvxblk_step_once(long long budget) {
     CUresult r = cuLaunchKernel(g_xfn, grid,1,1, block,1,1, shmem,0, args, nullptr);
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] launch %d\n",(int)r); return -1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr,"[xblk] sync fault\n"); return -1; }
-    if (g_xup) cuMemcpyDtoH(g_xup_host, g_xup, 64);   // RVX_UNITPROF snapshot (64 B, post-sync)
+    if (g_xup) cuMemcpyDtoH(g_xup_host, g_xup, 88);   // RVX_UNITPROF snapshot (post-sync)
     return (long long)*g_ret;
 }
 static long long rvxblk_step(long long budget) {
