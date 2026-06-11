@@ -3568,12 +3568,15 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
         static DWORD s_tmo = 0;
         if (!s_tmo) { const char* e = getenv("RVX_PTXAS_TMO"); int v = e ? atoi(e) : 0;
                       s_tmo = (v > 0) ? (DWORD)v : 360000; }
+        static SIZE_T s_mem = 0;
+        if (!s_mem) { const char* e = getenv("RVX_PTXAS_MEM"); int v = e ? atoi(e) : 0;   // MB
+                      s_mem = ((v > 0) ? (SIZE_T)v : 2560u) * 1024u * 1024u; }
         DWORD waited = 0; bool wkilled = false;
         while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
             waited += 250;
             PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;
             bool over = GetProcessMemoryInfo(pi.hProcess, &pmc, sizeof pmc) &&
-                        pmc.PagefileUsage > (SIZE_T)2560u * 1024u * 1024u;
+                        pmc.PagefileUsage > s_mem;
             if (over || waited > s_tmo) {
                 TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000);
                 wkilled = true;
