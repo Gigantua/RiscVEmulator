@@ -3071,6 +3071,85 @@ static bool rvx_match_wordscan(const uint32_t* img, int Nw, uint32_t base, int w
     return true;
 }
 
+// Strided copy loops (mirrors of rvcud_try_copyloops / rvcud_try_copyloopt — the V_DrawPatch
+// column blits and the melt-wipe column copies; exec runs them 1:1 today):
+//   form S (5 words): lX V,0(S) ; { sX V,0(D) ; addi S,S,Ks ; addi D,D,Kd } any order, store
+//                     before D's bump ; bne CREG,LIM,→top   (CREG ∈ {S,D}, its stride ≠ 0)
+//   form T (6 words): lX V,0(S) ; addi S2,S,Ks ; sX V,0(D) ; addi D,D,Kd ; mv S,S2 ; bne S2,LIM,→top
+// Replaced by a CALL into the knee-isolated `xscpy` unit (load/store/bump — no per-iteration
+// budget or retire work) plus an exact closed form. The iteration count n is derived up front
+// from the counting register: n·|Kc| = distance to LIM (divisibility/wrap guarded at the call
+// site). CR is the register whose HEADER value counts (form T compares S2 = S+i·Ks, so CR = S).
+// Strides must be element-width multiples (with the runtime align guard this keeps every access
+// naturally aligned for the unit's native-width ld/st).
+struct RvxSCpy { uint32_t S,D,V,LIM,S2,CR,lf3; int32_t Ks,Kd,Kc; int nw; };
+static bool rvx_match_scpyloop(const uint32_t* img, int Nw, uint32_t base, int w, RvxSCpy& o) {
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2_=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    const uint32_t* i = img + w;
+    uint32_t lf3 = F3(i[0]);
+    if ((i[0]&0x7F)!=0x03 || !(lf3==0||lf3==1||lf3==2||lf3==4||lf3==5) || rv_iimm(i[0])!=0) return false;
+    uint32_t V=RD(i[0]), S=S1(i[0]);
+    if (V==0 || S==0 || V==S) return false;
+    uint32_t width = 1u << (lf3 & 3);
+    if (w+6 < Nw && (i[1]&0x7F)==0x13 && F3(i[1])==0 && S1(i[1])==S && RD(i[1])!=S) {   // form T
+        uint32_t S2r=RD(i[1]); int32_t Ks=(int32_t)rv_iimm(i[1]);
+        uint32_t sf3=F3(i[2]);
+        bool okw = ((lf3==0||lf3==4)&&sf3==0) || ((lf3==1||lf3==5)&&sf3==1) || (lf3==2&&sf3==2);
+        if (S2r!=0 && S2r!=V && Ks!=0
+            && (i[2]&0x7F)==0x23 && okw && S2_(i[2])==V && rv_simm(i[2])==0) {
+            uint32_t D=S1(i[2]);
+            if (D!=0 && D!=S && D!=S2r && D!=V
+                && (i[3]&0x7F)==0x13 && F3(i[3])==0 && RD(i[3])==D && S1(i[3])==D
+                && (i[4]&0x7F)==0x13 && F3(i[4])==0 && RD(i[4])==S && S1(i[4])==S2r && rv_iimm(i[4])==0
+                && (i[5]&0x7F)==0x63 && F3(i[5])==1) {
+                int32_t Kd=(int32_t)rv_iimm(i[3]);
+                uint32_t b1=S1(i[5]), b2=S2_(i[5]), LIM = b1==S2r ? b2 : b2==S2r ? b1 : 0xFFu;
+                uint32_t bpc=base+(uint32_t)(w+5)*4;
+                if (LIM!=0xFFu && LIM!=V && LIM!=S && LIM!=S2r && LIM!=D
+                    && (int)((bpc+rv_bimm(i[5])-base)>>2)==w
+                    && ((uint32_t)Ks % width)==0 && ((uint32_t)Kd % width)==0) {
+                    o.S=S; o.D=D; o.V=V; o.LIM=LIM; o.S2=S2r; o.CR=S; o.lf3=lf3;
+                    o.Ks=Ks; o.Kd=Kd; o.Kc=Ks; o.nw=6; return true;
+                }
+            }
+        }
+        return false;                                     // a temp-advance head is never form S
+    }
+    if (w+5 >= Nw) return false;                          // form S
+    int stPos=-1, srcPos=-1, dstPos=-1; uint32_t D=0, dreg=0; int32_t Ks=0, Kd=0;
+    for (int j=1; j<=3; j++) {
+        uint32_t in=i[j], op=in&0x7F;
+        if (op==0x23) {
+            uint32_t sf3=F3(in);
+            bool okw = ((lf3==0||lf3==4)&&sf3==0) || ((lf3==1||lf3==5)&&sf3==1) || (lf3==2&&sf3==2);
+            if (stPos>=0 || !okw || S2_(in)!=V || rv_simm(in)!=0) return false;
+            D=S1(in); stPos=j;
+        } else if (op==0x13 && F3(in)==0) {
+            uint32_t rd=RD(in); int32_t k=(int32_t)rv_iimm(in);
+            if (rd!=S1(in) || rd==0) return false;
+            if (rd==S) { if (srcPos>=0) return false; Ks=k; srcPos=j; }
+            else       { if (dstPos>=0) return false; Kd=k; dreg=rd; dstPos=j; }
+        } else return false;
+    }
+    if (stPos<0 || srcPos<0 || dstPos<0 || dreg!=D) return false;
+    if (stPos > dstPos) return false;                     // post-increment (store reads D pre-bump)
+    if (D==0 || D==S || D==V) return false;
+    uint32_t br=i[4];
+    if ((br&0x7F)!=0x63 || F3(br)!=1) return false;       // bne CREG,LIM,→top
+    uint32_t bpc=base+(uint32_t)(w+4)*4;
+    if ((int)((bpc+rv_bimm(br)-base)>>2)!=w) return false;
+    uint32_t b1=S1(br), b2=S2_(br), CR, LIM;
+    if (b1==S||b1==D) { CR=b1; LIM=b2; } else if (b2==S||b2==D) { CR=b2; LIM=b1; } else return false;
+    if (LIM==0 || LIM==S || LIM==D || LIM==V) return false;
+    int32_t Kc = (CR==S) ? Ks : Kd;
+    if (Kc==0) return false;
+    if (((uint32_t)Ks % width)!=0 || ((uint32_t)Kd % width)!=0) return false;
+    o.S=S; o.D=D; o.V=V; o.LIM=LIM; o.S2=0; o.CR=CR; o.lf3=lf3;
+    o.Ks=Ks; o.Kd=Kd; o.Kc=Kc; o.nw=5;
+    return true;
+}
+
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
 // linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
@@ -3184,9 +3263,9 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
     // state than the per-instruction path, so the exits must be reset points.
-    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0), scanhit(N, 0);
-    int ncpy = 0, nfill = 0, npal = 0, nscan = 0;
-    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr; RvxScan sr;
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0), scanhit(N, 0), scpyhit(N, 0);
+    int ncpy = 0, nfill = 0, npal = 0, nscan = 0, nscpy = 0;
+    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr; RvxScan sr; RvxSCpy qr;
       for (int w=0; w+13 < N; w++)
           if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
       for (int w=0; w+7 < N; w++)
@@ -3203,14 +3282,19 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                   && comp[w+5] && regof[w+5]==regof[w]                 // both exits must live in
                   && comp[sr.twx] && regof[sr.twx]==regof[w])          // this region (bra targets)
                   { scanhit[w] = 1; targ[w+5] = 1; targ[sr.twx] = 1; nscan++; }
+          for (int w=0; w+5 < N; w++)                                  // prefer xcopy (word-widened)
+              if (comp[w] && !cpyhit[w] && rvx_match_scpyloop(img, N, base, w, qr)
+                  && comp[w+qr.nw] && regof[w+qr.nw]==regof[w])        // exit bra target in-region
+                  { scpyhit[w] = (uint8_t)qr.nw; targ[w+qr.nw] = 1; nscpy++; }
       } }
     if (getenv("RVX_STATS") && ncpy) fprintf(stderr, "[xblk] copyloop sites: %d\n", ncpy);
     if (getenv("RVX_STATS") && nfill) fprintf(stderr, "[xblk] fillloop sites: %d\n", nfill);
     if (getenv("RVX_STATS") && npal) fprintf(stderr, "[xblk] palexp sites: %d\n", npal);
     if (getenv("RVX_STATS") && nscan) fprintf(stderr, "[xblk] wordscan sites: %d\n", nscan);
+    if (getenv("RVX_STATS") && nscpy) fprintf(stderr, "[xblk] scpyloop sites: %d\n", nscpy);
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0), std::string());
+    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0) + (nscpy ? 1 : 0), std::string());
     // ── xcopy unit (knee-ISOLATED: assembles alone in microseconds). Word-widened forward byte copy:
     //    byte head until DST is 4-aligned, then a funnel-shift body (the +8 B buffer guard covers the
     //    high word of an unaligned source), then a byte tail. Callers guarantee n ≥ 1 and NO forward
@@ -3309,6 +3393,28 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         xs += "SCNT:\nmov.b32 %fl, 0;\nbra SOUT;\nSMATCH:\nmov.b32 %fl, 1;\nbra SOUT;\nSCAP:\nmov.b32 %fl, 2;\n"
               "SOUT:\nst.param.u32 [rv], %j;\nst.param.u32 [rv+4], %fl;\nret;\n}\n";
     }
+    // ── xscpy unit (knee-ISOLATED). Counted strided copy: n elements of width 2^w bytes, source
+    //    stride ks, dest stride kd (both signed; pointers walk 64-bit — the call site guards u32
+    //    wrap). Three width-specialized 7-op loops, dispatched once. Loads and stores replay in
+    //    guest order, so overlapping src/dst propagate exactly like the original loop.
+    if (nscpy) {
+        std::string& xq = units[1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0)];
+        xq  = hdr;
+        xq += ".visible .func xscpy (.param .b64 ps, .param .b64 pd, .param .b32 pks, "
+              ".param .b32 pkd, .param .b32 pn, .param .b32 pw)\n{\n"
+              ".reg .b64 %s,%d,%ks,%kd;\n.reg .b32 %n,%v,%w,%t;\n.reg .pred %q;\n"
+              "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\n"
+              "ld.param.u32 %t,[pks];\ncvt.s64.s32 %ks,%t;\n"
+              "ld.param.u32 %t,[pkd];\ncvt.s64.s32 %kd,%t;\n"
+              "ld.param.u32 %n,[pn];\nld.param.u32 %w,[pw];\n"
+              "setp.eq.u32 %q,%w,0;\n@%q bra Q0;\nsetp.eq.u32 %q,%w,1;\n@%q bra Q1;\n"
+              "Q2:\nld.global.u32 %v,[%s];\nst.global.u32 [%d],%v;\nadd.s64 %s,%s,%ks;\nadd.s64 %d,%d,%kd;\n"
+              "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra Q2;\nret;\n"
+              "Q1:\nld.global.u16 %v,[%s];\nst.global.u16 [%d],%v;\nadd.s64 %s,%s,%ks;\nadd.s64 %d,%d,%kd;\n"
+              "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra Q1;\nret;\n"
+              "Q0:\nld.global.u8 %v,[%s];\nst.global.u8 [%d],%v;\nadd.s64 %s,%s,%ks;\nadd.s64 %d,%d,%kd;\n"
+              "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra Q0;\nret;\n}\n";
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -3323,6 +3429,8 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         if (npal) ptx += ".extern .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa);\n";
         if (nscan) ptx += ".extern .func (.param .align 4 .b8 rv[8]) xscan (.param .b64 pp, .param .b32 pkp, "
                           ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap);\n";
+        if (nscpy) ptx += ".extern .func xscpy (.param .b64 ps, .param .b64 pd, .param .b32 pks, "
+                          ".param .b32 pkd, .param .b32 pn, .param .b32 pw);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
         ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss,%DD;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt,%dwl,%dwh;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
@@ -3572,6 +3680,74 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 rvx_app(ptx, "setp.eq.u32 %%p2, %%t1, 1;\n@%%p2 bra L%u;\n", base+(w+5)*4);   // match
                 rvx_app(ptx, "setp.eq.u32 %%p2, %%t1, 2;\n@%%p2 bra L%u;\n", pc);              // cap → re-enter
                 rvx_app(ptx, "bra L%u;\n", base + S0.twx*4);                                   // counted exit
+                cse.reset();
+            }
+            // Strided copy loop → xscpy call. Guards route to the kept original loop: distance 0
+            // or not stride-divisible (the guest do-while wraps mod 2^32), n > 16M (bound the
+            // atomic retire), S/D misaligned for the element width (the unit uses native-width
+            // accesses; strides are width-multiples by the matcher), and u32 pointer wrap anywhere
+            // in the walk (the unit advances 64-bit pointers; the guest wraps mod 2^32). Overlap
+            // needs NO guard: the unit replays the guest's loads/stores in guest order. Closed
+            // form: retire 5n/6n, S/D advance n strides (the counting reg lands exactly on LIM by
+            // the divisibility guard), form T's temp S2 = final S, V re-read from the last element
+            // (the only store issued after the last load is the last store, whose value IS the
+            // last V — exact under any overlap).
+            else if (scpyhit[w]) {
+                armed = true;
+                RvxSCpy SC; rvx_match_scpyloop(img, N, base, (int)w, SC);
+                uint32_t akc = (uint32_t)(SC.Kc > 0 ? SC.Kc : -SC.Kc);
+                uint32_t width = 1u << (SC.lf3 & 3);
+                rvx_app(ptx, "L%u:\n", pc);
+                if (SC.Kc > 0) rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n", SC.LIM, SC.CR);
+                else           rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n", SC.CR, SC.LIM);
+                ptx += "setp.eq.u32 %p0, %t0, 0;\n";
+                if (akc > 1) {
+                    rvx_app(ptx, "rem.u32 %%t1, %%t0, %u;\nsetp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n", akc);
+                    rvx_app(ptx, "div.u32 %%t0, %%t0, %u;\n", akc);
+                }
+                ptx += "setp.gt.u32 %p1, %t0, 16777216;\nor.pred %p0, %p0, %p1;\n";
+                if (width > 1)
+                    rvx_app(ptx, "or.b32 %%t1, %%x%u, %%x%u;\nand.b32 %%t1, %%t1, %u;\n"
+                                 "setp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                                 SC.S, SC.D, width-1u);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nmul.wide.s32 %%a1, %%t0, %d;\nadd.s64 %%a0, %%a0, %%a1;\n"
+                             "shr.u64 %%a1, %%a0, 32;\nsetp.ne.s64 %%p1, %%a1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             SC.S, SC.Ks);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nmul.wide.s32 %%a1, %%t0, %d;\nadd.s64 %%a0, %%a0, %%a1;\n"
+                             "shr.u64 %%a1, %%a0, 32;\nsetp.ne.s64 %%p1, %%a1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             SC.D, SC.Kd);
+                rvx_app(ptx, "@%%p0 bra SPORIG%u;\n", pc);
+                if (rvx_dyncode()) {
+                    if (SC.Kd > 0) {                                              // SMC: bulk dst range ∩ window
+                        rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.u32 %%t1, %%x%u, %%t1;\n"
+                                     "setp.lt.u32 %%p1, %%x%u, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t1, %%dwl;\n"
+                                     "@%%p1 bra SMR%u;\nSMRJ%u:\n", SC.Kd, SC.D, SC.D, pc, pc);
+                        rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%x%u;\n"
+                                     "red.global.max.u32 [%%a1+20], %%t1;\nbra SMRJ%u;\n", pc, SC.D, pc);
+                    } else {
+                        rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.u32 %%t1, %%x%u, %%t1;\n"
+                                     "add.u32 %%t2, %%x%u, %u;\n"
+                                     "setp.lt.u32 %%p1, %%t1, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t2, %%dwl;\n"
+                                     "@%%p1 bra SMR%u;\nSMRJ%u:\n", SC.Kd, SC.D, SC.D, width, pc, pc);
+                        rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%t1;\n"
+                                     "red.global.max.u32 [%%a1+20], %%t2;\nbra SMRJ%u;\n", pc, pc);
+                    }
+                }
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.s32 %%cnt, %%cnt, %%t1;\n", SC.nw);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "cvt.u64.u32 %%a1, %%x%u;\nadd.u64 %%a1, %%a1, %%M;\n", SC.S, SC.D);
+                rvx_app(ptx, "{ .param .b64 ps; .param .b64 pd; .param .b32 pks; .param .b32 pkd; .param .b32 pn; .param .b32 pw;\n"
+                             "st.param.b64 [ps], %%a0;\nst.param.b64 [pd], %%a1;\nst.param.b32 [pks], %d;\n"
+                             "st.param.b32 [pkd], %d;\nst.param.b32 [pn], %%t0;\nst.param.b32 [pw], %u;\n"
+                             "call.uni xscpy, (ps, pd, pks, pkd, pn, pw);\n}\n", SC.Ks, SC.Kd, SC.lf3 & 3);
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.u32 %%x%u, %%x%u, %%t1;\n", SC.Ks, SC.S, SC.S);
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.u32 %%x%u, %%x%u, %%t1;\n", SC.Kd, SC.D, SC.D);
+                if (SC.nw == 6) rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", SC.S2, SC.S);
+                { const char* lt = SC.lf3==0?"s8":SC.lf3==4?"u8":SC.lf3==1?"s16":SC.lf3==5?"u16":"u32";
+                  rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                               "ld.global.%s %%x%u, [%%a0];\n", SC.S, -SC.Ks, lt, SC.V); }
+                rvx_app(ptx, "bra L%u;\n", base+(w+(uint32_t)SC.nw)*4);
+                rvx_app(ptx, "SPORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();
             }
             else rvx_app(ptx, "L%u:\n", pc);                // retire deferred to the segment flush
