@@ -3560,15 +3560,21 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
     int rc = -1;
     if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
         // WATCHDOG: ptxas sits on a knife edge for large brx-heavy units — pathological inputs have
-        // been observed to spin for minutes at multi-GB commits. Hard limits (2.5 GB private bytes /
-        // 120 s wall) kill the child and report failure; the caller then retries with smaller regions.
+        // been observed to spin for minutes at multi-GB commits. The 2.5 GB private-bytes cap is the
+        // real knee guard (runaway builds blow it quickly); the wall limit (default 360 s,
+        // RVX_PTXAS_TMO overrides the ms) only reaps stuck children. 120 s proved too tight: it
+        // killed the CONVERGENT 30000-word Doom regions (~150 s each), pinning the knee marker at
+        // 15000 and costing ~6% runtime (r23).
+        static DWORD s_tmo = 0;
+        if (!s_tmo) { const char* e = getenv("RVX_PTXAS_TMO"); int v = e ? atoi(e) : 0;
+                      s_tmo = (v > 0) ? (DWORD)v : 360000; }
         DWORD waited = 0; bool wkilled = false;
         while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
             waited += 250;
             PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;
             bool over = GetProcessMemoryInfo(pi.hProcess, &pmc, sizeof pmc) &&
                         pmc.PagefileUsage > (SIZE_T)2560u * 1024u * 1024u;
-            if (over || waited > 120000) {
+            if (over || waited > s_tmo) {
                 TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000);
                 wkilled = true;
                 fprintf(stderr, "[xblk] ptxas watchdog: killed child (%s after %lu ms, %.2f GB)\n",
