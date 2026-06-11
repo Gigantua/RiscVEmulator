@@ -779,6 +779,8 @@ static uint8_t*   g_dirty = nullptr;
 static std::vector<uint8_t> g_dynpage;
 static uint32_t   g_wlo = 0xFFFFFFFFu, g_whi = 0;
 static CUdeviceptr g_xdw = 0;
+static CUdeviceptr g_xup = 0;                // RVX_UNITPROF: device u64[8] cycle counters (7 helper units + xk total)
+static unsigned long long g_xup_host[8];     // host snapshot, refreshed after every exec launch
 static int        g_dyncode = 0;             // RVX_DYNCODE / cuda_rvcud_set_dyncode: bake exec SMC checks
 static void rvcud_update_window();
 static bool rvx_dyncode();
@@ -3482,17 +3484,36 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     if (ncpy) {
         std::string& xc = units[1+K];
         xc  = hdr;
-        xc += ".visible .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn)\n{\n"
-              ".reg .b64 %s,%d,%b,%bo;\n.reg .b32 %n,%v,%w0,%w1,%sh,%t;\n.reg .pred %q;\n"
-              "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u32 %n,[pn];\n"
+        xc += ".visible .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn)\n{\n";
+        xc += (nc == 1)
+            ? ".reg .b64 %s,%d,%b,%bo,%sd,%nn,%bp,%dp,%k4;\n.reg .b32 %n,%v,%w0,%w1,%sh,%t,%nw,%li,%nt,%am;\n.reg .pred %q;\n"
+            : ".reg .b64 %s,%d,%b,%bo;\n.reg .b32 %n,%v,%w0,%w1,%sh,%t;\n.reg .pred %q;\n";
+        xc += "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u32 %n,[pn];\n"
               "CH:\ncvt.u32.u64 %t, %d;\nand.b32 %t, %t, 3;\nsetp.eq.u32 %q, %t, 0;\n@%q bra CB;\n"
               "setp.eq.u32 %q, %n, 0;\n@%q bra CE;\n"
               "ld.global.u8 %v, [%s];\nst.global.u8 [%d], %v;\n"
               "add.u64 %s, %s, 1;\nadd.u64 %d, %d, 1;\nsub.u32 %n, %n, 1;\nbra CH;\n"
               "CB:\nsetp.lt.u32 %q, %n, 4;\n@%q bra CT;\n"
               "cvt.u32.u64 %t, %s;\nand.b32 %t, %t, 3;\nshl.b32 %sh, %t, 3;\n"
-              "cvt.u64.u32 %bo, %t;\nsub.u64 %b, %s, %bo;\n"
-              "CL:\nld.global.u32 %w0, [%b];\nld.global.u32 %w1, [%b+4];\n"
+              "cvt.u64.u32 %bo, %t;\nsub.u64 %b, %s, %bo;\n";
+        if (nc == 1)
+            // w1 warp-cooperative word body: lane %tid.x copies words j, j+%ntid.x, … (word j is
+            // pure in j: funnel of [b+4j],[b+4j+4] — the serial loop's exact values). Parallel only
+            // when src/dst fully disjoint: callers guarantee d-s ≥ n unsigned, which admits
+            // BACKWARD overlap (s-d < n) — that case keeps the order-dependent serial replay.
+            xc += "sub.u64 %sd, %s, %d;\ncvt.u64.u32 %nn, %n;\nsetp.lt.u64 %q, %sd, %nn;\n@%q bra CL;\n"
+                  "shr.u32 %nw, %n, 2;\nmov.u32 %li, %tid.x;\nmov.u32 %nt, %ntid.x;\n"
+                  "setp.ge.u32 %q, %li, %nw;\n@%q bra CPW;\n"
+                  "mul.wide.u32 %bp, %li, 4;\nadd.u64 %dp, %bp, %d;\nadd.u64 %bp, %bp, %b;\n"
+                  "mul.wide.u32 %k4, %nt, 4;\n"
+                  "CP:\nld.global.u32 %w0, [%bp];\nld.global.u32 %w1, [%bp+4];\n"
+                  "shf.r.wrap.b32 %v, %w0, %w1, %sh;\nst.global.u32 [%dp], %v;\n"
+                  "add.u64 %bp, %bp, %k4;\nadd.u64 %dp, %dp, %k4;\nadd.u32 %li, %li, %nt;\n"
+                  "setp.lt.u32 %q, %li, %nw;\n@%q bra CP;\n"
+                  "CPW:\nmov.u32 %am, 1;\nshl.b32 %am, %am, %nt;\nsub.u32 %am, %am, 1;\nbar.warp.sync %am;\n"
+                  "shl.b32 %t, %nw, 2;\ncvt.u64.u32 %bo, %t;\n"
+                  "add.u64 %s, %s, %bo;\nadd.u64 %d, %d, %bo;\nsub.u32 %n, %n, %t;\nbra CT;\n";
+        xc += "CL:\nld.global.u32 %w0, [%b];\nld.global.u32 %w1, [%b+4];\n"
               "shf.r.wrap.b32 %v, %w0, %w1, %sh;\nst.global.u32 [%d], %v;\n"
               "add.u64 %b, %b, 4;\nadd.u64 %d, %d, 4;\nadd.u64 %s, %s, 4;\nsub.u32 %n, %n, 4;\n"
               "setp.ge.u32 %q, %n, 4;\n@%q bra CL;\n"
@@ -3531,17 +3552,42 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     if (npal) {
         std::string& xp = units[1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0)];
         xp  = hdr;
-        xp += ".visible .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa)\n{\n"
-              ".reg .b64 %s,%d,%pl,%pe;\n.reg .b32 %n,%i,%r,%g,%b,%w,%va;\n.reg .pred %q;\n"
-              "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u64 %pl,[pp];\n"
-              "ld.param.u32 %n,[pn];\nld.param.u32 %va,[pa];\n"
-              "PX:\nld.global.u8 %i, [%s];\nadd.u64 %s, %s, 1;\n"
-              "mul.lo.u32 %i, %i, 3;\ncvt.u64.u32 %pe, %i;\nadd.u64 %pe, %pe, %pl;\n"
-              "ld.global.u8 %r, [%pe];\nld.global.u8 %g, [%pe+1];\nld.global.u8 %b, [%pe+2];\n"
-              "shl.b32 %g, %g, 8;\nshl.b32 %b, %b, 16;\nor.b32 %w, %r, %g;\n"
-              "or.b32 %w, %w, %b;\nor.b32 %w, %w, %va;\nst.global.u32 [%d], %w;\n"
-              "add.u64 %d, %d, 4;\nsub.u32 %n, %n, 1;\nsetp.ne.u32 %q, %n, 0;\n@%q bra PX;\n"
-              "ret;\n}\n";
+        if (nc == 1) {
+            // w1 warp-cooperative form: lane %tid.x handles pixels i, i+%ntid.x, … (stride from
+            // %ntid.x so single-thread launches stay correct). Pixel i is pure in i and the call
+            // site guarantees dst disjoint from src and palette, so lane order is free; per-warp
+            // iteration the 32 dst words are one coalesced 128 B store.
+            xp += ".visible .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa)\n{\n"
+                  ".reg .b64 %s,%d,%pl,%pe,%sp,%dp,%k1,%k4;\n.reg .b32 %n,%i,%r,%g,%b,%w,%va,%li,%nt,%am;\n.reg .pred %q;\n"
+                  "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u64 %pl,[pp];\n"
+                  "ld.param.u32 %n,[pn];\nld.param.u32 %va,[pa];\n"
+                  "mov.u32 %li, %tid.x;\nmov.u32 %nt, %ntid.x;\n"
+                  "setp.ge.u32 %q, %li, %n;\n@%q bra PW;\n"
+                  "cvt.u64.u32 %sp, %li;\nadd.u64 %sp, %sp, %s;\n"
+                  "mul.wide.u32 %dp, %li, 4;\nadd.u64 %dp, %dp, %d;\n"
+                  "cvt.u64.u32 %k1, %nt;\nmul.wide.u32 %k4, %nt, 4;\n"
+                  "PX:\nld.global.u8 %i, [%sp];\n"
+                  "mul.lo.u32 %i, %i, 3;\ncvt.u64.u32 %pe, %i;\nadd.u64 %pe, %pe, %pl;\n"
+                  "ld.global.u8 %r, [%pe];\nld.global.u8 %g, [%pe+1];\nld.global.u8 %b, [%pe+2];\n"
+                  "shl.b32 %g, %g, 8;\nshl.b32 %b, %b, 16;\nor.b32 %w, %r, %g;\n"
+                  "or.b32 %w, %w, %b;\nor.b32 %w, %w, %va;\nst.global.u32 [%dp], %w;\n"
+                  "add.u64 %sp, %sp, %k1;\nadd.u64 %dp, %dp, %k4;\nadd.u32 %li, %li, %nt;\n"
+                  "setp.lt.u32 %q, %li, %n;\n@%q bra PX;\n"
+                  "PW:\nmov.u32 %am, 1;\nshl.b32 %am, %am, %nt;\nsub.u32 %am, %am, 1;\nbar.warp.sync %am;\n"
+                  "ret;\n}\n";
+        } else {
+            xp += ".visible .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa)\n{\n"
+                  ".reg .b64 %s,%d,%pl,%pe;\n.reg .b32 %n,%i,%r,%g,%b,%w,%va;\n.reg .pred %q;\n"
+                  "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\nld.param.u64 %pl,[pp];\n"
+                  "ld.param.u32 %n,[pn];\nld.param.u32 %va,[pa];\n"
+                  "PX:\nld.global.u8 %i, [%s];\nadd.u64 %s, %s, 1;\n"
+                  "mul.lo.u32 %i, %i, 3;\ncvt.u64.u32 %pe, %i;\nadd.u64 %pe, %pe, %pl;\n"
+                  "ld.global.u8 %r, [%pe];\nld.global.u8 %g, [%pe+1];\nld.global.u8 %b, [%pe+2];\n"
+                  "shl.b32 %g, %g, 8;\nshl.b32 %b, %b, 16;\nor.b32 %w, %r, %g;\n"
+                  "or.b32 %w, %w, %b;\nor.b32 %w, %w, %va;\nst.global.u32 [%d], %w;\n"
+                  "add.u64 %d, %d, 4;\nsub.u32 %n, %n, 1;\nsetp.ne.u32 %q, %n, 0;\n@%q bra PX;\n"
+                  "ret;\n}\n";
+        }
     }
     // ── xscan unit (knee-ISOLATED). Counted record-search loop: six cc-specialized 6-op loops
     //    (dispatched once on cf3); returns {iterations entered, exit flag 0=counted/1=match/2=cap}.
@@ -3650,6 +3696,34 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               "st.param.u32 [rv+16],%tex;\nst.param.u32 [rv+20],%cm;\nst.param.u32 [rv+24],%pi;\nst.param.u32 [rv+28],%px;\n"
               "ret;\n}\n";
     }
+    // ── RVX_UNITPROF: %clock cycle accounting per helper unit (env-gated — PTX is byte-identical
+    //    when unset, and region-unit PTX never changes, so their cubins still cache-hit). Each unit
+    //    stamps %clock at entry and funnels every ret through one epilogue that red.global.adds the
+    //    delta into XUP[idx]; xk accounts total in-kernel cycles into XUP[7]. Share = XUP[i]/XUP[7],
+    //    immune to clock drift — the ceiling for any warp-cooperative unit rework.
+    if (getenv("RVX_UNITPROF")) {
+        auto uclk = [](std::string& u, int idx){
+            if (u.empty()) return;
+            size_t f = u.find(".visible .func");
+            u.insert(f, ".extern .global .align 8 .b8 XUP[64];\n");
+            size_t b = u.find("{\n", f) + 2;
+            u.insert(b, ".reg .b32 %ck0,%ck1;\n.reg .b64 %cka,%ckq;\nmov.u32 %ck0, %clock;\n");
+            for (size_t p = u.find("ret;", b); p != std::string::npos; p = u.find("ret;", p))
+                u.replace(p, 4, "bra UPX;");
+            char ep[192];
+            snprintf(ep, sizeof ep, "UPX:\nmov.u32 %%ck1, %%clock;\nsub.u32 %%ck1, %%ck1, %%ck0;\n"
+                "cvt.u64.u32 %%ckq, %%ck1;\nmov.u64 %%cka, XUP;\nred.global.add.u64 [%%cka+%d], %%ckq;\nret;\n", idx*8);
+            u.insert(u.rfind('}'), ep);
+        };
+        int ui = 1+K;
+        if (ncpy)  uclk(units[ui++], 0);
+        if (nfill) uclk(units[ui++], 1);
+        if (npal)  uclk(units[ui++], 2);
+        if (nscan) uclk(units[ui++], 3);
+        if (nscpy) uclk(units[ui++], 4);
+        if (ntexc) uclk(units[ui++], 5);
+        if (ntexs) uclk(units[ui++], 6);
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -3677,10 +3751,17 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss,%DD;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt,%dwl,%dwh;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
         ptx += "mov.u64 %DD, XDW;\nld.global.u32 %dwl, [%DD];\nld.global.u32 %dwh, [%DD+4];\nld.global.u64 %DD, [%DD+8];\n";
-        ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
-        // Shadow return stack base: after all XS slots — %ss = XS + 168*ntid + 128*tid (16 × 8 B / thread).
-        ptx += "mov.u64 %ss, XS;\nmov.u32 %wi, %ntid.x;\nmul.wide.u32 %ad, %wi, 168;\nadd.u64 %ss, %ss, %ad;\n"
-               "mul.wide.u32 %ad, %tx, 128;\nadd.u64 %ss, %ss, %ad;\n";
+        if (nc == 1) {
+            // w1 lockstep: the whole warp IS core 0 — every lane reads/writes XS slot 0 and one
+            // shadow stack (same-address loads broadcast; same-value stores collapse to one).
+            ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\n";
+            ptx += "mov.u64 %ss, XS;\nadd.u64 %ss, %ss, 168;\n";
+        } else {
+            ptx += "mov.u64 %xs, XS;\nmov.u32 %tx, %tid.x;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
+            // Shadow return stack base: after all XS slots — %ss = XS + 168*ntid + 128*tid (16 × 8 B / thread).
+            ptx += "mov.u64 %ss, XS;\nmov.u32 %wi, %ntid.x;\nmul.wide.u32 %ad, %wi, 168;\nadd.u64 %ss, %ss, %ad;\n"
+                   "mul.wide.u32 %ad, %tx, 128;\nadd.u64 %ss, %ss, %ad;\n";
+        }
         ptx += "mov.b32 %x0, 0;\n";
         for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%x%u, [%%xs+%d];\n", g, g*4);
         ptx += "ld.shared.u32 %cnt, [%xs+132];\nld.shared.u32 %budget, [%xs+136];\n"
@@ -4201,25 +4282,35 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     ptx  = hdr;
     ptx += ".extern .shared .align 8 .b8 XS[];\n";       // same dynamic-shared segment the region units alias
     ptx += ".visible .global .align 8 .b8 XDW[24];\n";   // SMC watch window {wlo,whi,dirtyPtr,rlo,rhi}; host-poked
+    if (getenv("RVX_UNITPROF")) ptx += ".visible .global .align 8 .b8 XUP[64];\n";
     for (int r=0; r<K; r++) rvx_app(ptx, ".extern .func xr%d;\n", r);
     ptx += ".visible .entry xk(.param .u64 pM,.param .u64 pS,.param .u32 pBud,.param .u64 pP2I,.param .u64 pRet){\n";
     ptx += ".reg .b64 %M,%S,%P2I,%RET,%ad,%xs;\n.reg .b32 %t0,%pc,%budget,%cnt;\n.reg .u32 %wi,%bidx,%rg,%gid,%tx;\n.reg .pred %p0,%pz;\n";
+    if (getenv("RVX_UNITPROF")) ptx += ".reg .b32 %ck0,%ck1;\n.reg .b64 %cka,%ckq;\n";
     ptx += "ld.param.u64 %M,[pM];\nld.param.u64 %S,[pS];\nld.param.u32 %budget,[pBud];\n"
            "ld.param.u64 %P2I,[pP2I];\nld.param.u64 %RET,[pRet];\n";
     // One thread per guest core: gid-guard, per-thread XS slot (168 B), per-core CoreState (%S +=
     // gid*132) and interleave lane base (%M += 4*gid — the regions' address math then only needs
     // the (a&~3)*nc word term). Core 0 alone reports the retired count.
-    ptx += "mov.u32 %tx, %tid.x;\nmov.u32 %rg, %ctaid.x;\nmov.u32 %wi, %ntid.x;\nmad.lo.u32 %gid, %rg, %wi, %tx;\n";
-    rvx_app(ptx, "setp.ge.u32 %%pz, %%gid, %d;\n@%%pz ret;\n", nc);
-    ptx += "mov.u64 %xs, XS;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
-    ptx += "mul.wide.u32 %ad, %gid, 132;\nadd.u64 %S, %S, %ad;\n";
-    if (nc > 1) ptx += "mul.wide.u32 %ad, %gid, 4;\nadd.u64 %M, %M, %ad;\n";
+    if (nc == 1) {
+        // w1 lockstep: every lane of the warp is core 0 (no gid guard — lanes 1..31 must live);
+        // all lanes share XS slot 0; %pz true on all lanes (the RET store collapses, same value).
+        ptx += "mov.u32 %tx, %tid.x;\nmov.u32 %gid, 0;\n";
+        ptx += "mov.u64 %xs, XS;\n";
+    } else {
+        ptx += "mov.u32 %tx, %tid.x;\nmov.u32 %rg, %ctaid.x;\nmov.u32 %wi, %ntid.x;\nmad.lo.u32 %gid, %rg, %wi, %tx;\n";
+        rvx_app(ptx, "setp.ge.u32 %%pz, %%gid, %d;\n@%%pz ret;\n", nc);
+        ptx += "mov.u64 %xs, XS;\nmul.wide.u32 %ad, %tx, 168;\nadd.u64 %xs, %xs, %ad;\n";
+        ptx += "mul.wide.u32 %ad, %gid, 132;\nadd.u64 %S, %S, %ad;\n";
+        ptx += "mul.wide.u32 %ad, %gid, 4;\nadd.u64 %M, %M, %ad;\n";
+    }
     ptx += "setp.eq.u32 %pz, %gid, 0;\n";
     for (int g=1; g<32; g++) rvx_app(ptx, "ld.global.u32 %%t0, [%%S+%d];\nst.shared.u32 [%%xs+%d], %%t0;\n", g*4, g*4);
     rvx_app(ptx, "ld.global.u32 %%pc, [%%S+%d];\nmov.b32 %%cnt, 0;\n", 32*4);
     ptx += "st.shared.u32 [%xs+132], %cnt;\nst.shared.u32 [%xs+136], %budget;\n"
            "st.shared.u64 [%xs+144], %M;\nst.shared.u64 [%xs+152], %P2I;\n"
            "st.shared.u32 [%xs+164], %cnt;\n";   // shadow-stack pointer = 0 (cold stack: rets miss to XDISP)
+    if (getenv("RVX_UNITPROF")) ptx += "mov.u32 %ck0, %clock;\n";
     ptx += "DLOOP:\nsetp.ge.s32 %p0, %cnt, %budget;\n@%p0 bra XSAVE;\n";
     rvx_app(ptx, "sub.u32 %%wi, %%pc, %u;\nshr.u32 %%wi, %%wi, 2;\n", base);
     rvx_app(ptx, "setp.ge.u32 %%p0, %%wi, %u;\n@%%p0 bra XSAVE;\n", (uint32_t)N);
@@ -4231,7 +4322,10 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     // save architectural state; core 0 alone returns the retired count
     ptx += "XSAVE:\n";
     for (int g=1; g<32; g++) rvx_app(ptx, "ld.shared.u32 %%t0, [%%xs+%d];\nst.global.u32 [%%S+%d], %%t0;\n", g*4, g*4);
-    rvx_app(ptx,"st.global.u32 [%%S+%d], %%pc;\n@%%pz st.global.u32 [%%RET], %%cnt;\nret;\n}\n", 32*4);
+    rvx_app(ptx,"st.global.u32 [%%S+%d], %%pc;\n@%%pz st.global.u32 [%%RET], %%cnt;\n", 32*4);
+    if (getenv("RVX_UNITPROF")) ptx += "mov.u32 %ck1, %clock;\nsub.u32 %ck1, %ck1, %ck0;\n"
+        "cvt.u64.u32 %ckq, %ck1;\nmov.u64 %cka, XUP;\nred.global.add.u64 [%cka+56], %ckq;\n";
+    ptx += "ret;\n}\n";
 }
 
 // Compile each PTX unit OUT-OF-PROCESS with the toolkit's ptxas (-c --disable-optimizer-constants),
@@ -4521,6 +4615,21 @@ static void rvxblk_build() {
         uint32_t init2[2] = { 0xFFFFFFFFu, 0 };
         cuMemcpyHtoD(g_xdw + 16, init2, 8);
     } else g_xdw = 0;
+    // RVX_UNITPROF: capture + zero the cycle-counter global; rvxblk_step snapshots it into
+    // g_xup_host after every launch (DtoH at atexit would race the context teardown).
+    g_xup = 0;
+    if (getenv("RVX_UNITPROF")) { CUdeviceptr up = 0; size_t upsz = 0;
+        if (cuModuleGetGlobal(&up, &upsz, mod, "XUP") == CUDA_SUCCESS && upsz >= 64) {
+            g_xup = up; cuMemsetD8(up, 0, 64); memset(g_xup_host, 0, sizeof g_xup_host);
+            static bool reg = false;
+            if (!reg) { reg = true; atexit([]{
+                static const char* nm[7] = {"xcopy","xfill","xpal","xscan","xscpy","xtexc","xtexs"};
+                double t = g_xup_host[7] ? (double)g_xup_host[7] : 1.0;
+                unsigned long long s = 0; for (int i=0;i<7;i++) s += g_xup_host[i];
+                fprintf(stderr, "[uprof] xk %llu cyc; in-unit %llu (%.2f%%):", g_xup_host[7], s, 100.0*s/t);
+                for (int i=0;i<7;i++) fprintf(stderr, " %s %.2f%%", nm[i], 100.0*g_xup_host[i]/t);
+                fprintf(stderr, "\n"); }); }
+        } }
     g_xtab.assign(N, 0);
     for (int w=0; w<N; w++) g_xtab[w] = disp[w];   // hybrid enters exec_block only at dispatch-entry words
     // Stamp uw bit7 on the uops at entry pcs (the interpreter's self-stop sites). Skip if-converted
@@ -4628,9 +4737,12 @@ static long long rvxblk_step_once(long long budget) {
     void* args[] = { &g_mem, &g_state, &bud, &g_x_pc2idx, &g_ret };
     int block = g_ncores < 64 ? g_ncores : 64;                                // one thread per guest core (2-warp blocks)
     int grid  = (g_ncores + block - 1) / block;
-    CUresult r = cuLaunchKernel(g_xfn, grid,1,1, block,1,1, 296*block,0, args, nullptr);   // per thread: 168 B XS spill slot + 128 B shadow return stack
+    unsigned shmem = 296u * block;                                            // per thread: 168 B XS spill slot + 128 B shadow return stack
+    if (g_ncores == 1) { block = 32; grid = 1; shmem = 296; }                 // w1 lockstep: full warp runs core 0, ONE shared XS slot + stack
+    CUresult r = cuLaunchKernel(g_xfn, grid,1,1, block,1,1, shmem,0, args, nullptr);
     if (r != CUDA_SUCCESS) { fprintf(stderr,"[xblk] launch %d\n",(int)r); return -1; }
     if (cudaDeviceSynchronize() != cudaSuccess) { fprintf(stderr,"[xblk] sync fault\n"); return -1; }
+    if (g_xup) cuMemcpyDtoH(g_xup_host, g_xup, 64);   // RVX_UNITPROF snapshot (64 B, post-sync)
     return (long long)*g_ret;
 }
 static long long rvxblk_step(long long budget) {

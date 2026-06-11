@@ -44,21 +44,23 @@ First Doom run after any PTX-affecting change pays ~150 s/unit assembly once
 
 ---
 
-## CURRENT PLAN (post-Step-3, 2026-06-11 late)
+## ✅ GOAL MET — w1 warp-cooperative units (2026-06-11 late)
 
-Step 3's ncu re-profile says the 1-warp architecture is at its local optimum:
-`wait` (fixed-latency ALU dependency) is **49%** of the 6.18 cyc/issued —
-intrinsic to single-warp in-order issue, untouchable by per-instr golf
-(r7/r8/r34/i4 all confirmed). `no_instruction` did NOT drop after r33 (0.44 vs
-0.42); `branch_resolving` rose to 0.88. XDISP bounded < ~0.5% wall — skip forever.
+**284 MIPS, measured in a LOADED evening window** (base r33 printed 217 in the
+same minutes) — the 250 goal is exceeded with margin; a quiet morning window
+will read higher. See the `w1` row in `Native/IDEA_NextStructural.md`.
 
-1. **Quiet-window verification** (next morning, ≲5% GPU util): 3 consecutive warm
-   `--ttf 90` runs on the current build (hash-verify `5F6D6C6C` or rebuild from
-   HEAD). NEXT-arithmetic projects ~240+; if ≥250, the goal is met as-is.
-2. If short of 250: commit to the **Tier-3 structural program** (IDEA file #6–#8)
-   — MULTIMOD register-resident execution + cheap handoffs, and/or WARPSPAN
-   warp-cooperative render. Multi-session; attacks `wait` directly, the only
-   bucket big enough to carry +15%.
+The path there: Step 3's ncu re-profile showed `wait` (single-warp ALU latency)
+at 49% — the scalar core can't be parallelized. But the new `RVX_UNITPROF`
+%clock accounting (env-gated, kept as tooling) showed **38.3% of all kernel
+cycles run inside the fused helper units** (xpal 22.1%, xcopy 10.4%). w1:
+ncores==1 launches xk with 32 lockstep-redundant threads (SIMT makes the 31
+extra lanes free) and xpal/xcopy split iterations across lanes. +31% all pairs,
+frame-80 byte-identical, all gates green, nc>1 PTX unchanged.
+
+Left on the table (only if a new goal appears): cooperative xscan/xscpy
+(5.6% of pre-w1 cycles ≈ +4%), xtexc/xtexs (~0.2%), and the Tier-3 MULTIMOD
+register-resident program for the scalar 49%.
 
 Everything below is the COMPLETED plan, kept for the record.
 
