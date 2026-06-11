@@ -2556,9 +2556,15 @@ static void rvx_emit(std::string& s, uint32_t pc, uint32_t instr,
         const char* pg = cond ? "@%p0 " : "";
         if(goable(t) && t>pc)      rvx_app(s,"%sbra L%u;\n",pg,t);
         else if(goable(t)) {                                                                          // backward (loop)
-            if(cond) rvx_app(s,"setp.lt.and.s32 %%p1, %%cnt, %%budget, %%p0;\nsetp.ge.and.s32 %%p2, %%cnt, %%budget, %%p0;\n"
-                               "@%%p2 mov.u32 %%pc, %u;\n@%%p2 bra XSAVE;\n@%%p1 bra L%u;\n",t,t);
-            else     rvx_app(s,"setp.ge.s32 %%p0, %%cnt, %%budget;\n@%%p0 mov.u32 %%pc, %u;\n@%%p0 bra XSAVE;\nbra L%u;\n",t,t);
+            // Budget check shaped for the HOT path (r32): the taken back-edge pays ONE fused
+            // setp + ONE taken bra. The rare budget-exceeded exit lives in a cold stub (cond)
+            // or behind the always-taken bra (uncond) — the old form charged 2 setp + 2
+            // predicated-off slots on EVERY execution (squashed issues still cost; r6 lesson).
+            if(cond) { rvx_app(s,"setp.lt.and.s32 %%p1, %%cnt, %%budget, %%p0;\n@%%p1 bra L%u;\n"
+                                 "@%%p0 bra XB%u;\n",t,pc);
+                       rvx_app(cold,"XB%u:\nmov.u32 %%pc, %u;\nbra XSAVE;\n",pc,t); }
+            else     rvx_app(s,"setp.lt.s32 %%p1, %%cnt, %%budget;\n@%%p1 bra L%u;\n"
+                               "mov.u32 %%pc, %u;\nbra XSAVE;\n",t,t);
         }
         else                       rvx_app(s,"%smov.u32 %%pc, %u;\n%sbra XSAVE;\n",pg,t,pg);          // leaves region/compiled set
     };
