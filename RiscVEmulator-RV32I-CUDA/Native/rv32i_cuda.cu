@@ -3150,6 +3150,124 @@ static bool rvx_match_scpyloop(const uint32_t* img, int Nw, uint32_t base, int w
     return true;
 }
 
+// Textured-column loop (mirror of rvcud_try_texcol — R_DrawColumn's 12-instr inner loop):
+//   lw TEX,oT(BASE); lw CMAP,oC(BASE); slli C,FRAC,sa; srli C,C,sb; add TA,TEX,C; lbu PIDX,0(TA);
+//   add CA,CMAP,PIDX; lbu PIX,0(CA); sb PIX,0(DST); addi DST,DST,STR; add FRAC,FRAC,STEP; bne DST,END,→top
+// Replaced by a CALL into the knee-isolated `xtexc` unit, which replays the guest's memory ops in
+// guest order per iteration (the invariants TEX/CMAP are re-loaded per iteration exactly like the
+// guest, so store aliasing needs no analysis) and returns the LAST iteration's {TEX,CMAP,PIDX,PIX}.
+// The exit is register-only (DST walks to END by STR), so n is derived up front like xscpy. STRICTER
+// than the interpreter matcher: all 12 registers pairwise distinct and nonzero, so the call-site
+// closed form (FRAC+=n·STEP, DST=END, C/TA/CA re-derived arithmetically) is exact with no aliasing.
+struct RvxTexC { uint32_t TEX,CMAP,C,TA,PIDX,CA,PIX,FRAC,DST,END,BASE,STEP,sa,sb; int32_t STR,oT,oC; };
+static bool rvx_match_texcol(const uint32_t* img, int Nw, uint32_t base, int w, RvxTexC& o) {
+    if (w+12 >= Nw) return false;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;}; auto SH=[](uint32_t x){return (x>>20)&0x1F;};
+    const uint32_t* a = img + w;
+    if ((a[0]&0x7F)!=0x03||F3(a[0])!=2) return false;  uint32_t TEX=RD(a[0]),BASE=S1(a[0]); int32_t oT=(int32_t)rv_iimm(a[0]);
+    if ((a[1]&0x7F)!=0x03||F3(a[1])!=2||S1(a[1])!=BASE) return false;  uint32_t CMAP=RD(a[1]); int32_t oC=(int32_t)rv_iimm(a[1]);
+    if ((a[2]&0x7F)!=0x13||F3(a[2])!=1) return false;  uint32_t C=RD(a[2]),FRAC=S1(a[2]),sa=SH(a[2]);
+    if ((a[3]&0x7F)!=0x13||F3(a[3])!=5||F7(a[3])!=0||RD(a[3])!=C||S1(a[3])!=C) return false;  uint32_t sb=SH(a[3]);
+    if ((a[4]&0x7F)!=0x33||F3(a[4])!=0||F7(a[4])!=0) return false;  uint32_t TA=RD(a[4]);
+    if (!((S1(a[4])==TEX&&S2(a[4])==C)||(S1(a[4])==C&&S2(a[4])==TEX))) return false;
+    if ((a[5]&0x7F)!=0x03||F3(a[5])!=4||S1(a[5])!=TA||rv_iimm(a[5])!=0) return false;  uint32_t PIDX=RD(a[5]);
+    if ((a[6]&0x7F)!=0x33||F3(a[6])!=0||F7(a[6])!=0) return false;  uint32_t CA=RD(a[6]);
+    if (!((S1(a[6])==CMAP&&S2(a[6])==PIDX)||(S1(a[6])==PIDX&&S2(a[6])==CMAP))) return false;
+    if ((a[7]&0x7F)!=0x03||F3(a[7])!=4||S1(a[7])!=CA||rv_iimm(a[7])!=0) return false;  uint32_t PIX=RD(a[7]);
+    if ((a[8]&0x7F)!=0x23||F3(a[8])!=0||S2(a[8])!=PIX||rv_simm(a[8])!=0) return false;  uint32_t DST=S1(a[8]);
+    if ((a[9]&0x7F)!=0x13||F3(a[9])!=0||RD(a[9])!=DST||S1(a[9])!=DST) return false;  int32_t STR=(int32_t)rv_iimm(a[9]);
+    if ((a[10]&0x7F)!=0x33||F3(a[10])!=0||F7(a[10])!=0||RD(a[10])!=FRAC) return false;
+    uint32_t STEP; if (S1(a[10])==FRAC) STEP=S2(a[10]); else if (S2(a[10])==FRAC) STEP=S1(a[10]); else return false;
+    if ((a[11]&0x7F)!=0x63||F3(a[11])!=1) return false;
+    uint32_t END; if (S1(a[11])==DST) END=S2(a[11]); else if (S2(a[11])==DST) END=S1(a[11]); else return false;
+    uint32_t bpc=base+(uint32_t)(w+11)*4;
+    if ((int)((bpc+rv_bimm(a[11])-base)>>2) != w) return false;       // back-edge to the loop header
+    if (STR==0) return false;
+    // Lives pairwise distinct; temps not aliasing lives (the unit reads them once up front).
+    // Temp-temp aliases are ALLOWED — clang chains one reg through TEX→TA→PIDX→CA→PIX here —
+    // except those breaking a read-after-write within one iteration: TEX is read at the TA add
+    // (after CMAP/C writes), CMAP at the CA add (after C/TA/PIDX writes). The call-site write-back
+    // re-derives temps in guest write order from the unit's returned VALUES, so write order is
+    // preserved for any allowed alias.
+    uint32_t lv[5]={FRAC,DST,END,BASE,STEP};
+    for (int p=0;p<5;p++){ if(lv[p]==0) return false; for(int q=p+1;q<5;q++) if(lv[p]==lv[q]) return false; }
+    uint32_t tp[7]={TEX,CMAP,C,TA,PIDX,CA,PIX};
+    for (int p=0;p<7;p++){ if(tp[p]==0) return false; for(int q=0;q<5;q++) if(tp[p]==lv[q]) return false; }
+    if (TEX==CMAP || TEX==C) return false;
+    if (CMAP==C || CMAP==TA || CMAP==PIDX) return false;
+    o.TEX=TEX; o.CMAP=CMAP; o.C=C; o.TA=TA; o.PIDX=PIDX; o.CA=CA; o.PIX=PIX;
+    o.FRAC=FRAC; o.DST=DST; o.END=END; o.BASE=BASE; o.STEP=STEP;
+    o.sa=sa; o.sb=sb; o.STR=STR; o.oT=oT; o.oC=oC;
+    return true;
+}
+
+// Texture-mapped span loop (mirror of rvcud_try_texspan — R_DrawSpan's 19-instr inner loop):
+//   srli Yt,YPOS,shY; slli Xt,XPOS,shX1; lw CMAP,oC(BASE); lw TEX,oT(BASE); and Yt,Yt,MASK;
+//   srli Xt,Xt,shX2; add OFF,Yt,Xt; add TA,TEX,OFF; lbu PIDX,0(TA); add CA,CMAP,PIDX; lbu PIX,0(CA);
+//   sb PIX,0(DST); lw XS,oX(BASE); lw YS,oY(BASE); addi nD,DST,1; add XPOS,XS,XPOS; add YPOS,YS,YPOS;
+//   mv DST,nD; bne nD,END,→top
+// Same treatment via the `xtexs` unit (per-iteration re-loads of CMAP/TEX/XS/YS in guest memory
+// order; returns the last iteration's {XPOS,YPOS,XS,YS,TEX,CMAP,PIDX,PIX}). DST advances by 1, so
+// n = END−DST up front. All 18 registers pairwise distinct and nonzero (stricter than the
+// interpreter, whose native arm needs no aliasing proof).
+struct RvxTexS { uint32_t Yt,Xt,CMAP,TEX,OFF,TA,PIDX,CA,PIX,XS,YS,nD,XPOS,YPOS,DST,END,MASK,BASE;
+                 uint32_t shY,shX1,shX2; int32_t oC,oT,oX,oY; };
+static bool rvx_match_texspan(const uint32_t* img, int Nw, uint32_t base, int w, RvxTexS& o) {
+    if (w+19 >= Nw) return false;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    auto F7=[](uint32_t x){return (x>>25)&0x7F;}; auto SH=[](uint32_t x){return (x>>20)&0x1F;};
+    const uint32_t* a = img + w;
+    if ((a[0]&0x7F)!=0x13||F3(a[0])!=5||F7(a[0])!=0) return false;  uint32_t Yt=RD(a[0]),YPOS=S1(a[0]),shY=SH(a[0]);
+    if ((a[1]&0x7F)!=0x13||F3(a[1])!=1) return false;               uint32_t Xt=RD(a[1]),XPOS=S1(a[1]),shX1=SH(a[1]);
+    if ((a[2]&0x7F)!=0x03||F3(a[2])!=2) return false;  uint32_t CMAP=RD(a[2]),BASE=S1(a[2]); int32_t oC=(int32_t)rv_iimm(a[2]);
+    if ((a[3]&0x7F)!=0x03||F3(a[3])!=2||S1(a[3])!=BASE) return false;  uint32_t TEX=RD(a[3]); int32_t oT=(int32_t)rv_iimm(a[3]);
+    if ((a[4]&0x7F)!=0x33||F3(a[4])!=7||F7(a[4])!=0||RD(a[4])!=Yt) return false;
+    uint32_t MASK; if (S1(a[4])==Yt) MASK=S2(a[4]); else if (S2(a[4])==Yt) MASK=S1(a[4]); else return false;
+    if ((a[5]&0x7F)!=0x13||F3(a[5])!=5||F7(a[5])!=0||RD(a[5])!=Xt||S1(a[5])!=Xt) return false;  uint32_t shX2=SH(a[5]);
+    if ((a[6]&0x7F)!=0x33||F3(a[6])!=0||F7(a[6])!=0) return false;  uint32_t OFF=RD(a[6]);
+    if (!((S1(a[6])==Yt&&S2(a[6])==Xt)||(S1(a[6])==Xt&&S2(a[6])==Yt))) return false;
+    if ((a[7]&0x7F)!=0x33||F3(a[7])!=0||F7(a[7])!=0) return false;  uint32_t TA=RD(a[7]);
+    if (!((S1(a[7])==TEX&&S2(a[7])==OFF)||(S1(a[7])==OFF&&S2(a[7])==TEX))) return false;
+    if ((a[8]&0x7F)!=0x03||F3(a[8])!=4||S1(a[8])!=TA||rv_iimm(a[8])!=0) return false;  uint32_t PIDX=RD(a[8]);
+    if ((a[9]&0x7F)!=0x33||F3(a[9])!=0||F7(a[9])!=0) return false;  uint32_t CA=RD(a[9]);
+    if (!((S1(a[9])==CMAP&&S2(a[9])==PIDX)||(S1(a[9])==PIDX&&S2(a[9])==CMAP))) return false;
+    if ((a[10]&0x7F)!=0x03||F3(a[10])!=4||S1(a[10])!=CA||rv_iimm(a[10])!=0) return false;  uint32_t PIX=RD(a[10]);
+    if ((a[11]&0x7F)!=0x23||F3(a[11])!=0||S2(a[11])!=PIX||rv_simm(a[11])!=0) return false;  uint32_t DST=S1(a[11]);
+    if ((a[12]&0x7F)!=0x03||F3(a[12])!=2||S1(a[12])!=BASE) return false;  uint32_t XS=RD(a[12]); int32_t oX=(int32_t)rv_iimm(a[12]);
+    if ((a[13]&0x7F)!=0x03||F3(a[13])!=2||S1(a[13])!=BASE) return false;  uint32_t YS=RD(a[13]); int32_t oY=(int32_t)rv_iimm(a[13]);
+    if ((a[14]&0x7F)!=0x13||F3(a[14])!=0||S1(a[14])!=DST||rv_iimm(a[14])!=1) return false;  uint32_t nD=RD(a[14]);
+    if ((a[15]&0x7F)!=0x33||F3(a[15])!=0||F7(a[15])!=0||RD(a[15])!=XPOS) return false;
+    if (!((S1(a[15])==XS&&S2(a[15])==XPOS)||(S1(a[15])==XPOS&&S2(a[15])==XS))) return false;
+    if ((a[16]&0x7F)!=0x33||F3(a[16])!=0||F7(a[16])!=0||RD(a[16])!=YPOS) return false;
+    if (!((S1(a[16])==YS&&S2(a[16])==YPOS)||(S1(a[16])==YPOS&&S2(a[16])==YS))) return false;
+    if ((a[17]&0x7F)!=0x13||F3(a[17])!=0||RD(a[17])!=DST||S1(a[17])!=nD||rv_iimm(a[17])!=0) return false;
+    if ((a[18]&0x7F)!=0x63||F3(a[18])!=1) return false;
+    uint32_t END; if (S1(a[18])==nD) END=S2(a[18]); else if (S2(a[18])==nD) END=S1(a[18]); else return false;
+    uint32_t bpc=base+(uint32_t)(w+18)*4;
+    if ((int)((bpc+rv_bimm(a[18])-base)>>2) != w) return false;       // back-edge to the loop header
+    // Same alias discipline as texcol: lives pairwise distinct, temps off the lives, temp-temp
+    // aliases allowed except the read-after-write breakers (Yt is read at the OFF add after
+    // Xt/CMAP/TEX writes and modified by the AND after them; Xt likewise; CMAP is read at the CA
+    // add after TEX/OFF/TA/PIDX writes; TEX at the TA add after the OFF write; XS/YS are read by
+    // the XPOS/YPOS updates after the nD write).
+    uint32_t lv[6]={XPOS,YPOS,DST,END,MASK,BASE};
+    for (int p=0;p<6;p++){ if(lv[p]==0) return false; for(int q=p+1;q<6;q++) if(lv[p]==lv[q]) return false; }
+    uint32_t tp[12]={Yt,Xt,CMAP,TEX,OFF,TA,PIDX,CA,PIX,XS,YS,nD};
+    for (int p=0;p<12;p++){ if(tp[p]==0) return false; for(int q=0;q<6;q++) if(tp[p]==lv[q]) return false; }
+    if (Yt==Xt || Yt==CMAP || Yt==TEX) return false;
+    if (Xt==CMAP || Xt==TEX) return false;
+    if (CMAP==TEX || CMAP==OFF || CMAP==TA || CMAP==PIDX) return false;
+    if (TEX==OFF) return false;
+    if (XS==YS || XS==nD || YS==nD) return false;
+    o.Yt=Yt; o.Xt=Xt; o.CMAP=CMAP; o.TEX=TEX; o.OFF=OFF; o.TA=TA; o.PIDX=PIDX; o.CA=CA; o.PIX=PIX;
+    o.XS=XS; o.YS=YS; o.nD=nD; o.XPOS=XPOS; o.YPOS=YPOS; o.DST=DST; o.END=END; o.MASK=MASK; o.BASE=BASE;
+    o.shY=shY; o.shX1=shX1; o.shX2=shX2; o.oC=oC; o.oT=oT; o.oX=oX; o.oY=oY;
+    return true;
+}
+
 // MULTIMOD exec_block codegen: K region `.func xr<r>`s + ONE `.entry xk` dispatcher, each its own PTX
 // unit (units[0]=dispatcher, units[1+r]=region r), SEPARATELY compiled by the driver JIT and device-
 // linked into one module. Why (all measured on this machine, CUDA 13.2 ptxas, a 24000-word guest image):
@@ -3263,9 +3381,10 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
     // state than the per-instruction path, so the exits must be reset points.
-    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0), scanhit(N, 0), scpyhit(N, 0);
-    int ncpy = 0, nfill = 0, npal = 0, nscan = 0, nscpy = 0;
-    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr; RvxScan sr; RvxSCpy qr;
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0), scanhit(N, 0), scpyhit(N, 0),
+                         texchit(N, 0), texshit(N, 0);
+    int ncpy = 0, nfill = 0, npal = 0, nscan = 0, nscpy = 0, ntexc = 0, ntexs = 0;
+    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr; RvxScan sr; RvxSCpy qr; RvxTexC tc; RvxTexS ts;
       for (int w=0; w+13 < N; w++)
           if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
       for (int w=0; w+7 < N; w++)
@@ -3286,15 +3405,26 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               if (comp[w] && !cpyhit[w] && rvx_match_scpyloop(img, N, base, w, qr)
                   && comp[w+qr.nw] && regof[w+qr.nw]==regof[w])        // exit bra target in-region
                   { scpyhit[w] = (uint8_t)qr.nw; targ[w+qr.nw] = 1; nscpy++; }
+          for (int w=0; w+12 < N; w++)
+              if (comp[w] && rvx_match_texcol(img, N, base, w, tc)
+                  && comp[w+12] && regof[w+12]==regof[w])
+                  { texchit[w] = 1; targ[w+12] = 1; ntexc++; }
+          for (int w=0; w+19 < N; w++)
+              if (comp[w] && rvx_match_texspan(img, N, base, w, ts)
+                  && comp[w+19] && regof[w+19]==regof[w])
+                  { texshit[w] = 1; targ[w+19] = 1; ntexs++; }
       } }
     if (getenv("RVX_STATS") && ncpy) fprintf(stderr, "[xblk] copyloop sites: %d\n", ncpy);
     if (getenv("RVX_STATS") && nfill) fprintf(stderr, "[xblk] fillloop sites: %d\n", nfill);
     if (getenv("RVX_STATS") && npal) fprintf(stderr, "[xblk] palexp sites: %d\n", npal);
     if (getenv("RVX_STATS") && nscan) fprintf(stderr, "[xblk] wordscan sites: %d\n", nscan);
     if (getenv("RVX_STATS") && nscpy) fprintf(stderr, "[xblk] scpyloop sites: %d\n", nscpy);
+    if (getenv("RVX_STATS") && ntexc) fprintf(stderr, "[xblk] texcol sites: %d\n", ntexc);
+    if (getenv("RVX_STATS") && ntexs) fprintf(stderr, "[xblk] texspan sites: %d\n", ntexs);
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0) + (nscpy ? 1 : 0), std::string());
+    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0) + (nscpy ? 1 : 0)
+                     + (ntexc ? 1 : 0) + (ntexs ? 1 : 0), std::string());
     // ── xcopy unit (knee-ISOLATED: assembles alone in microseconds). Word-widened forward byte copy:
     //    byte head until DST is 4-aligned, then a funnel-shift body (the +8 B buffer guard covers the
     //    high word of an unaligned source), then a byte tail. Callers guarantee n ≥ 1 and NO forward
@@ -3415,6 +3545,61 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               "Q0:\nld.global.u8 %v,[%s];\nst.global.u8 [%d],%v;\nadd.s64 %s,%s,%ks;\nadd.s64 %d,%d,%kd;\n"
               "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra Q0;\nret;\n}\n";
     }
+    // ── xtexc unit (knee-ISOLATED). Textured-column loop: per iteration it REPLAYS the guest's
+    //    memory ops in guest order (TEX/CMAP re-loaded from the invariant-address struct fields —
+    //    store aliasing needs no analysis), texel/colormap loads are u32-computed per access (wrap-
+    //    exact); dst walks 64-bit (call site guards wrap). Returns the LAST iteration's
+    //    {TEX,CMAP,PIDX,PIX} for the exact temp write-back.
+    if (ntexc) {
+        std::string& xt = units[1+K + (ncpy?1:0) + (nfill?1:0) + (npal?1:0) + (nscan?1:0) + (nscpy?1:0)];
+        xt  = hdr;
+        xt += ".visible .func (.param .align 4 .b8 rv[16]) xtexc (.param .b64 pbt, .param .b64 pbc, "
+              ".param .b64 pm, .param .b64 pd, .param .b32 pstr, .param .b32 pfr, .param .b32 pst, "
+              ".param .b32 psa, .param .b32 psb, .param .b32 pn)\n{\n"
+              ".reg .b64 %bt,%bc,%m,%d,%str,%a;\n.reg .b32 %fr,%st,%sa,%sb,%n,%tex,%cm,%c,%pi,%px,%t;\n.reg .pred %q;\n"
+              "ld.param.u64 %bt,[pbt];\nld.param.u64 %bc,[pbc];\nld.param.u64 %m,[pm];\nld.param.u64 %d,[pd];\n"
+              "ld.param.u32 %t,[pstr];\ncvt.s64.s32 %str,%t;\n"
+              "ld.param.u32 %fr,[pfr];\nld.param.u32 %st,[pst];\nld.param.u32 %sa,[psa];\n"
+              "ld.param.u32 %sb,[psb];\nld.param.u32 %n,[pn];\n"
+              "TC:\nld.global.u32 %tex,[%bt];\nld.global.u32 %cm,[%bc];\n"
+              "shl.b32 %c,%fr,%sa;\nshr.u32 %c,%c,%sb;\n"
+              "add.u32 %t,%tex,%c;\ncvt.u64.u32 %a,%t;\nadd.u64 %a,%a,%m;\nld.global.u8 %pi,[%a];\n"
+              "add.u32 %t,%cm,%pi;\ncvt.u64.u32 %a,%t;\nadd.u64 %a,%a,%m;\nld.global.u8 %px,[%a];\n"
+              "st.global.u8 [%d],%px;\nadd.s64 %d,%d,%str;\nadd.u32 %fr,%fr,%st;\n"
+              "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra TC;\n"
+              "st.param.u32 [rv],%tex;\nst.param.u32 [rv+4],%cm;\nst.param.u32 [rv+8],%pi;\n"
+              "st.param.u32 [rv+12],%px;\nret;\n}\n";
+    }
+    // ── xtexs unit (knee-ISOLATED). Texture-mapped span loop: same replay discipline (CMAP/TEX/
+    //    XS/YS re-loaded per iteration in guest memory order), XPOS/YPOS accumulate natively (the
+    //    steps are memory-resident and may change mid-loop — no closed form assumed). dst is
+    //    unit-stride. Returns the last iteration's {XPOS,YPOS,XS,YS,TEX,CMAP,PIDX,PIX}.
+    if (ntexs) {
+        std::string& xv = units[1+K + (ncpy?1:0) + (nfill?1:0) + (npal?1:0) + (nscan?1:0) + (nscpy?1:0) + (ntexc?1:0)];
+        xv  = hdr;
+        xv += ".visible .func (.param .align 4 .b8 rv[32]) xtexs (.param .b64 pbc, .param .b64 pbt, "
+              ".param .b64 pbx, .param .b64 pby, .param .b64 pm, .param .b64 pd, .param .b32 pxp, "
+              ".param .b32 pyp, .param .b32 pmask, .param .b32 pshy, .param .b32 pshx1, .param .b32 pshx2, "
+              ".param .b32 pn)\n{\n"
+              ".reg .b64 %bc,%bt,%bx,%by,%m,%d,%a;\n"
+              ".reg .b32 %xp,%yp,%mk,%shy,%sx1,%sx2,%n,%yt,%xt,%cm,%tex,%pi,%px,%xs,%ys,%t;\n.reg .pred %q;\n"
+              "ld.param.u64 %bc,[pbc];\nld.param.u64 %bt,[pbt];\nld.param.u64 %bx,[pbx];\nld.param.u64 %by,[pby];\n"
+              "ld.param.u64 %m,[pm];\nld.param.u64 %d,[pd];\n"
+              "ld.param.u32 %xp,[pxp];\nld.param.u32 %yp,[pyp];\nld.param.u32 %mk,[pmask];\n"
+              "ld.param.u32 %shy,[pshy];\nld.param.u32 %sx1,[pshx1];\nld.param.u32 %sx2,[pshx2];\nld.param.u32 %n,[pn];\n"
+              "TS:\nshr.u32 %yt,%yp,%shy;\nand.b32 %yt,%yt,%mk;\n"
+              "shl.b32 %xt,%xp,%sx1;\nshr.u32 %xt,%xt,%sx2;\n"
+              "ld.global.u32 %cm,[%bc];\nld.global.u32 %tex,[%bt];\n"
+              "add.u32 %t,%yt,%xt;\nadd.u32 %t,%tex,%t;\ncvt.u64.u32 %a,%t;\nadd.u64 %a,%a,%m;\nld.global.u8 %pi,[%a];\n"
+              "add.u32 %t,%cm,%pi;\ncvt.u64.u32 %a,%t;\nadd.u64 %a,%a,%m;\nld.global.u8 %px,[%a];\n"
+              "st.global.u8 [%d],%px;\n"
+              "ld.global.u32 %xs,[%bx];\nld.global.u32 %ys,[%by];\n"
+              "add.u32 %xp,%xp,%xs;\nadd.u32 %yp,%yp,%ys;\nadd.u64 %d,%d,1;\n"
+              "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra TS;\n"
+              "st.param.u32 [rv],%xp;\nst.param.u32 [rv+4],%yp;\nst.param.u32 [rv+8],%xs;\nst.param.u32 [rv+12],%ys;\n"
+              "st.param.u32 [rv+16],%tex;\nst.param.u32 [rv+20],%cm;\nst.param.u32 [rv+24],%pi;\nst.param.u32 [rv+28],%px;\n"
+              "ret;\n}\n";
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -3431,6 +3616,13 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                           ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap);\n";
         if (nscpy) ptx += ".extern .func xscpy (.param .b64 ps, .param .b64 pd, .param .b32 pks, "
                           ".param .b32 pkd, .param .b32 pn, .param .b32 pw);\n";
+        if (ntexc) ptx += ".extern .func (.param .align 4 .b8 rv[16]) xtexc (.param .b64 pbt, .param .b64 pbc, "
+                          ".param .b64 pm, .param .b64 pd, .param .b32 pstr, .param .b32 pfr, .param .b32 pst, "
+                          ".param .b32 psa, .param .b32 psb, .param .b32 pn);\n";
+        if (ntexs) ptx += ".extern .func (.param .align 4 .b8 rv[32]) xtexs (.param .b64 pbc, .param .b64 pbt, "
+                          ".param .b64 pbx, .param .b64 pby, .param .b64 pm, .param .b64 pd, .param .b32 pxp, "
+                          ".param .b32 pyp, .param .b32 pmask, .param .b32 pshy, .param .b32 pshx1, "
+                          ".param .b32 pshx2, .param .b32 pn);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
         ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss,%DD;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt,%dwl,%dwh;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
@@ -3748,6 +3940,155 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                                "ld.global.%s %%x%u, [%%a0];\n", SC.S, -SC.Ks, lt, SC.V); }
                 rvx_app(ptx, "bra L%u;\n", base+(w+(uint32_t)SC.nw)*4);
                 rvx_app(ptx, "SPORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
+            }
+            // Textured-column loop → xtexc call. n derived up front from DST's walk to END (same
+            // guard set as xscpy: distance 0 / not divisible by |STR| / n>16M / dst u32 wrap), plus
+            // the two struct-field lw addresses must be 4-aligned (invariant address — BASE is
+            // loop-invariant — so one entry check covers all iterations). The unit replays the
+            // guest's memory ops in guest order, so store aliasing (even onto the TEX/CMAP fields)
+            // is exact with no analysis. Closed form: retire 12n, DST=END, FRAC+=n·STEP (STEP is a
+            // register, invariant by the matcher's all-distinct rule), TEX/CMAP/PIDX/PIX returned
+            // by the unit from the last iteration, C/TA/CA re-derived arithmetically.
+            else if (texchit[w]) {
+                armed = true;
+                RvxTexC T0; rvx_match_texcol(img, N, base, (int)w, T0);
+                uint32_t astr = (uint32_t)(T0.STR > 0 ? T0.STR : -T0.STR);
+                rvx_app(ptx, "L%u:\n", pc);
+                if (T0.STR > 0) rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n", T0.END, T0.DST);
+                else            rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n", T0.DST, T0.END);
+                ptx += "setp.eq.u32 %p0, %t0, 0;\n";
+                if (astr > 1) {
+                    rvx_app(ptx, "rem.u32 %%t1, %%t0, %u;\nsetp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n", astr);
+                    rvx_app(ptx, "div.u32 %%t0, %%t0, %u;\n", astr);
+                }
+                ptx += "setp.gt.u32 %p1, %t0, 16777216;\nor.pred %p0, %p0, %p1;\n";
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\nadd.s32 %%t2, %%x%u, %d;\n"
+                             "or.b32 %%t1, %%t1, %%t2;\nand.b32 %%t1, %%t1, 3;\n"
+                             "setp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             T0.BASE, T0.oT, T0.BASE, T0.oC);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nmul.wide.s32 %%a1, %%t0, %d;\nadd.s64 %%a0, %%a0, %%a1;\n"
+                             "shr.u64 %%a1, %%a0, 32;\nsetp.ne.s64 %%p1, %%a1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             T0.DST, T0.STR);
+                rvx_app(ptx, "@%%p0 bra TXORIG%u;\n", pc);
+                if (rvx_dyncode()) {
+                    if (T0.STR > 0) {
+                        rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.u32 %%t1, %%x%u, %%t1;\n"
+                                     "setp.lt.u32 %%p1, %%x%u, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t1, %%dwl;\n"
+                                     "@%%p1 bra SMR%u;\nSMRJ%u:\n", T0.STR, T0.DST, T0.DST, pc, pc);
+                        rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%x%u;\n"
+                                     "red.global.max.u32 [%%a1+20], %%t1;\nbra SMRJ%u;\n", pc, T0.DST, pc);
+                    } else {
+                        rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %d;\nadd.u32 %%t1, %%x%u, %%t1;\n"
+                                     "add.u32 %%t2, %%x%u, 1;\n"
+                                     "setp.lt.u32 %%p1, %%t1, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t2, %%dwl;\n"
+                                     "@%%p1 bra SMR%u;\nSMRJ%u:\n", T0.STR, T0.DST, T0.DST, pc, pc);
+                        rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%t1;\n"
+                                     "red.global.max.u32 [%%a1+20], %%t2;\nbra SMRJ%u;\n", pc, pc);
+                    }
+                }
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, 12;\nadd.s32 %%cnt, %%cnt, %%t1;\n");
+                rvx_app(ptx, "{ .param .align 4 .b8 rv[16]; .param .b64 pbt; .param .b64 pbc; .param .b64 pm;\n"
+                             ".param .b64 pd; .param .b32 pstr; .param .b32 pfr; .param .b32 pst;\n"
+                             ".param .b32 psa; .param .b32 psb; .param .b32 pn;\n");
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "st.param.b64 [pbt], %%a0;\n", T0.BASE, T0.oT);
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "st.param.b64 [pbc], %%a0;\n", T0.BASE, T0.oC);
+                rvx_app(ptx, "st.param.b64 [pm], %%M;\n"
+                             "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\nst.param.b64 [pd], %%a0;\n", T0.DST);
+                rvx_app(ptx, "st.param.b32 [pstr], %d;\nst.param.b32 [pfr], %%x%u;\nst.param.b32 [pst], %%x%u;\n"
+                             "st.param.b32 [psa], %u;\nst.param.b32 [psb], %u;\nst.param.b32 [pn], %%t0;\n",
+                             T0.STR, T0.FRAC, T0.STEP, T0.sa, T0.sb);
+                ptx += "call.uni (rv), xtexc, (pbt, pbc, pm, pd, pstr, pfr, pst, psa, psb, pn);\n";
+                // Write-back in GUEST WRITE ORDER (lives first — disjoint from temps — then
+                // TEX,CMAP,C,TA,PIDX,CA,PIX), so any allowed temp alias lands on the guest's
+                // final value. Sources: rv values and lives only (never a possibly-clobbered temp,
+                // except where the matcher proves it unclobbered).
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, %%x%u;\nadd.u32 %%x%u, %%x%u, %%t1;\n",
+                             T0.STEP, T0.FRAC, T0.FRAC);
+                rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", T0.DST, T0.END);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv];\nld.param.u32 %%x%u, [rv+4];\n", T0.TEX, T0.CMAP);
+                rvx_app(ptx, "sub.u32 %%t1, %%x%u, %%x%u;\nshl.b32 %%t1, %%t1, %u;\nshr.u32 %%t1, %%t1, %u;\n"
+                             "mov.b32 %%x%u, %%t1;\n",
+                             T0.FRAC, T0.STEP, T0.sa, T0.sb, T0.C);
+                rvx_app(ptx, "add.u32 %%x%u, %%x%u, %%x%u;\n", T0.TA, T0.TEX, T0.C);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv+8];\n", T0.PIDX);
+                rvx_app(ptx, "add.u32 %%x%u, %%x%u, %%x%u;\n", T0.CA, T0.CMAP, T0.PIDX);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv+12];\n}\n", T0.PIX);
+                rvx_app(ptx, "bra L%u;\n", base+(w+12)*4);
+                rvx_app(ptx, "TXORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
+            }
+            // Texture-mapped span loop → xtexs call. DST advances by 1, so n = END−DST directly
+            // (n==0 → original: the guest do-while wraps 2^32). XPOS/YPOS accumulate INSIDE the
+            // unit (the steps are memory-resident and re-loaded per iteration — no closed form
+            // assumed); the unit returns the last iteration's live/temp sources and the rest are
+            // re-derived arithmetically. Retire 19n.
+            else if (texshit[w]) {
+                armed = true;
+                RvxTexS T1; rvx_match_texspan(img, N, base, (int)w, T1);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"
+                             "setp.eq.u32 %%p0, %%t0, 0;\n"
+                             "setp.gt.u32 %%p1, %%t0, 16777216;\nor.pred %%p0, %%p0, %%p1;\n",
+                             T1.END, T1.DST);
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\nadd.s32 %%t2, %%x%u, %d;\nor.b32 %%t1, %%t1, %%t2;\n"
+                             "add.s32 %%t2, %%x%u, %d;\nor.b32 %%t1, %%t1, %%t2;\n"
+                             "add.s32 %%t2, %%x%u, %d;\nor.b32 %%t1, %%t1, %%t2;\n"
+                             "and.b32 %%t1, %%t1, 3;\nsetp.ne.u32 %%p1, %%t1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             T1.BASE, T1.oC, T1.BASE, T1.oT, T1.BASE, T1.oX, T1.BASE, T1.oY);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\ncvt.u64.u32 %%a1, %%t0;\nadd.u64 %%a0, %%a0, %%a1;\n"
+                             "shr.u64 %%a1, %%a0, 32;\nsetp.ne.s64 %%p1, %%a1, 0;\nor.pred %%p0, %%p0, %%p1;\n",
+                             T1.DST);
+                rvx_app(ptx, "@%%p0 bra TSORIG%u;\n", pc);
+                if (rvx_dyncode()) {
+                    rvx_app(ptx, "add.u32 %%t1, %%x%u, %%t0;\n"
+                                 "setp.lt.u32 %%p1, %%x%u, %%dwh;\n@%%p1 setp.gt.u32 %%p1, %%t1, %%dwl;\n"
+                                 "@%%p1 bra SMR%u;\nSMRJ%u:\n", T1.DST, T1.DST, pc, pc);
+                    rvx_app(cold,"SMR%u:\nmov.u64 %%a1, XDW;\nred.global.min.u32 [%%a1+16], %%x%u;\n"
+                                 "red.global.max.u32 [%%a1+20], %%t1;\nbra SMRJ%u;\n", pc, T1.DST, pc);
+                }
+                rvx_app(ptx, "mul.lo.u32 %%t1, %%t0, 19;\nadd.s32 %%cnt, %%cnt, %%t1;\n");
+                rvx_app(ptx, "{ .param .align 4 .b8 rv[32]; .param .b64 pbc; .param .b64 pbt; .param .b64 pbx;\n"
+                             ".param .b64 pby; .param .b64 pm; .param .b64 pd; .param .b32 pxp; .param .b32 pyp;\n"
+                             ".param .b32 pmask; .param .b32 pshy; .param .b32 pshx1; .param .b32 pshx2; .param .b32 pn;\n");
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "st.param.b64 [pbc], %%a0;\n", T1.BASE, T1.oC);
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "st.param.b64 [pbt], %%a0;\n", T1.BASE, T1.oT);
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "st.param.b64 [pbx], %%a0;\n", T1.BASE, T1.oX);
+                rvx_app(ptx, "add.s32 %%t1, %%x%u, %d;\ncvt.u64.u32 %%a0, %%t1;\nadd.u64 %%a0, %%a0, %%M;\n"
+                             "st.param.b64 [pby], %%a0;\n", T1.BASE, T1.oY);
+                rvx_app(ptx, "st.param.b64 [pm], %%M;\n"
+                             "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\nst.param.b64 [pd], %%a0;\n", T1.DST);
+                rvx_app(ptx, "st.param.b32 [pxp], %%x%u;\nst.param.b32 [pyp], %%x%u;\nst.param.b32 [pmask], %%x%u;\n"
+                             "st.param.b32 [pshy], %u;\nst.param.b32 [pshx1], %u;\nst.param.b32 [pshx2], %u;\n"
+                             "st.param.b32 [pn], %%t0;\n",
+                             T1.XPOS, T1.YPOS, T1.MASK, T1.shY, T1.shX1, T1.shX2);
+                ptx += "call.uni (rv), xtexs, (pbc, pbt, pbx, pby, pm, pd, pxp, pyp, pmask, pshy, pshx1, pshx2, pn);\n";
+                // Write-back in GUEST WRITE ORDER (Yt,Xt,CMAP,TEX,OFF,TA,PIDX,CA,PIX,XS,YS,nD,
+                // XPOS,YPOS,DST) so any allowed temp alias lands on the guest's final value. The
+                // Yt/Xt re-derivations read rv values into scratch (never possibly-clobbered regs).
+                rvx_app(ptx, "ld.param.u32 %%t1, [rv+4];\nld.param.u32 %%t2, [rv+12];\nsub.u32 %%t1, %%t1, %%t2;\n"
+                             "shr.u32 %%t1, %%t1, %u;\nand.b32 %%t1, %%t1, %%x%u;\nmov.b32 %%x%u, %%t1;\n",
+                             T1.shY, T1.MASK, T1.Yt);
+                rvx_app(ptx, "ld.param.u32 %%t1, [rv];\nld.param.u32 %%t2, [rv+8];\nsub.u32 %%t1, %%t1, %%t2;\n"
+                             "shl.b32 %%t1, %%t1, %u;\nshr.u32 %%t1, %%t1, %u;\nmov.b32 %%x%u, %%t1;\n",
+                             T1.shX1, T1.shX2, T1.Xt);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv+20];\nld.param.u32 %%x%u, [rv+16];\n", T1.CMAP, T1.TEX);
+                rvx_app(ptx, "add.u32 %%x%u, %%x%u, %%x%u;\nadd.u32 %%x%u, %%x%u, %%x%u;\n",
+                             T1.OFF, T1.Yt, T1.Xt, T1.TA, T1.TEX, T1.OFF);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv+24];\n", T1.PIDX);
+                rvx_app(ptx, "add.u32 %%x%u, %%x%u, %%x%u;\n", T1.CA, T1.CMAP, T1.PIDX);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv+28];\nld.param.u32 %%x%u, [rv+8];\nld.param.u32 %%x%u, [rv+12];\n",
+                             T1.PIX, T1.XS, T1.YS);
+                rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", T1.nD, T1.END);
+                rvx_app(ptx, "ld.param.u32 %%x%u, [rv];\nld.param.u32 %%x%u, [rv+4];\n}\n", T1.XPOS, T1.YPOS);
+                rvx_app(ptx, "mov.b32 %%x%u, %%x%u;\n", T1.DST, T1.END);
+                rvx_app(ptx, "bra L%u;\n", base+(w+19)*4);
+                rvx_app(ptx, "TSORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();
             }
             else rvx_app(ptx, "L%u:\n", pc);                // retire deferred to the segment flush
