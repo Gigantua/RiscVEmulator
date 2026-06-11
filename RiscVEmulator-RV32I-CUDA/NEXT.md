@@ -1,8 +1,10 @@
 # NEXT — push CudaDoom ttf90 from ~226 to 250 MIPS (engine-side only)
 
-State as of 2026-06-11, HEAD = `f562284` ("restore the r27 state").
-Reference good state: **r27 = `076732c`** — prints 226–231 MIPS in a quiet clock
-window, 2.5 GB ptxas child cap, guest untouched.
+State as of 2026-06-11 (late): Steps 1–3 below are DONE. r32 re-landed (`8d5e685`,
++2.7%), r33 PGO layout landed (`64707ed`, +1.2%), r34 reverted (−1.7%), r35
+diagnostics closed Step 3 (see `Native/IDEA_NextStructural.md` r35 row).
+Reference good state: **r33 = HEAD** — fresh build `5F6D6C6C` deployed to all 6
+bins, all gates green. Evening window prints 196–210; morning projection ~240+.
 
 ## Ground rules (violations got reverted — do not relitigate)
 
@@ -42,7 +44,27 @@ First Doom run after any PTX-affecting change pays ~150 s/unit assembly once
 
 ---
 
-## Step 1 — re-land r32: hot-path backward-branch budget checks  (~+2.7 %, proven)
+## CURRENT PLAN (post-Step-3, 2026-06-11 late)
+
+Step 3's ncu re-profile says the 1-warp architecture is at its local optimum:
+`wait` (fixed-latency ALU dependency) is **49%** of the 6.18 cyc/issued —
+intrinsic to single-warp in-order issue, untouchable by per-instr golf
+(r7/r8/r34/i4 all confirmed). `no_instruction` did NOT drop after r33 (0.44 vs
+0.42); `branch_resolving` rose to 0.88. XDISP bounded < ~0.5% wall — skip forever.
+
+1. **Quiet-window verification** (next morning, ≲5% GPU util): 3 consecutive warm
+   `--ttf 90` runs on the current build (hash-verify `5F6D6C6C` or rebuild from
+   HEAD). NEXT-arithmetic projects ~240+; if ≥250, the goal is met as-is.
+2. If short of 250: commit to the **Tier-3 structural program** (IDEA file #6–#8)
+   — MULTIMOD register-resident execution + cheap handoffs, and/or WARPSPAN
+   warp-cooperative render. Multi-session; attacks `wait` directly, the only
+   bucket big enough to carry +15%.
+
+Everything below is the COMPLETED plan, kept for the record.
+
+---
+
+## Step 1 — re-land r32: hot-path backward-branch budget checks  (~+2.7 %, proven) — DONE `8d5e685`
 
 DLL-only, measured 232.1/231.0/231.4 vs 220.7/227.9/227.3 (all 3 pairs, gates green),
 then reverted only as part of the blanket rollback. The exact change is commit
@@ -63,7 +85,7 @@ stop paying `2× setp + 2 predicated-off slots + bra` per execution. New shape:
 Then: full gates, warm-up run, 3 interleaved pairs vs an r27-built baseline DLL
 (keep a copy `rv32i_cuda_base_r27.dll` in the CudaDoom bin before deploying).
 
-## Step 2 — r33: PGO hot/cold segment layout  (est. +2–4 %, design ready)
+## Step 2 — r33: PGO hot/cold segment layout  (est. +2–4 %, design ready) — DONE `64707ed` (+1.2%)
 
 Attacks the ncu-measured fetch stalls (`no_instruction` 0.42 of 5.93 cyc/issued;
 `branch_resolving` 0.73): hot code is scattered through ~11 MB of SASS. Emit
@@ -108,16 +130,15 @@ region tail. Design (was half-implemented, then discarded in the rollback — re
    that's an automatic verdict against the idea. Stale profiles are keyed by image
    hash, so a guest rebuild orphans them (harmless: identity layout).
 
-## Step 3 — smaller engine candidates, in order
+## Step 3 — smaller engine candidates, in order — DONE (r34/r35)
 
-- **xscan header gate** (~line 3853): same hot-path reshape as r32
-  (`@%p0 bra XBS<pc>` + cold stub). Only 10 sites — bundle with another round.
-- **XDISP/jalr cost**: per indirect call = budget gate + bounds + global
-  `pc2idx` load + region compare + `brx`. Estimated ≲1 % of wall (most returns
-  already hit the r1 shadow stack) — measure before building anything.
-- **ncu re-profile after Steps 1–2**:
-  `ncu --kernel-name xk --launch-skip 200 --launch-count 1 <CudaDoom> --prof`
-  → if `no_instruction` dropped, layout worked; next stall bucket decides what's next.
+- **xscan header gate** (~line 3853): tried in r34, sub-noise, reverted with the
+  bundle (lean-code rule). Dead.
+- **XDISP/jalr cost**: bounded from the r35 stall table without instrumentation —
+  < ~0.5 % of wall (inside long_scoreboard 4%, dominated by guest loads). Dead.
+- **ncu re-profile after Steps 1–2** (r35): `no_instruction` did NOT drop (0.44
+  vs 0.42) — r33's wall win stands but fetch stalls didn't move. Top bucket =
+  `wait` 3.04/6.18 (49%) → only the Tier-3 structural program reaches it.
 
 ## Dead ends — never retry (full reasons in Native/IDEA_NextStructural.md)
 
