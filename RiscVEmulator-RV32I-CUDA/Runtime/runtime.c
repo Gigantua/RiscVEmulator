@@ -110,13 +110,16 @@ u64 __muldi3(u64 a, u64 b)
  * Needed when C code uses uint64_t / uint64_t on a 32-bit target.
  * ═══════════════════════════════════════════════════════════════════ */
 
-#ifdef __riscv_mul
-/* ── M-extension fast path: 64/32 division via hardware 32-bit divides ─ *
+/* ── 64/32 division via 32-bit divides (chunked) ────────────────────── *
  * k-bit chunking: each step divides (r << k) | next_chunk by d, which     *
  * fits 32 bits as long as d <= 2^(32-k) (r < d invariant). The softfloat  *
- * library's f32 divide/sqrt put a <2^24 mantissa in the divisor, so the   *
- * 8-bit-chunk path turns the old 64-iteration bit loop (~1000 instrs per  *
- * pixel via 1.0f/iw) into ~6 hardware divides.                            */
+ * library's f64/f32 divide/sqrt put a small mantissa in the divisor, so   *
+ * the chunk paths turn the old 64-iteration bit loop into ~6 32-bit       *
+ * divides. With the M extension those are single instructions; on plain   *
+ * rv32i they become __udivsi3/__umodsi3 calls — MORE instructions than    *
+ * the bit loop on real hardware, but this emulator's DBT replaces each    *
+ * soft-divide loop with one hardware divide, so the chunked form wins     *
+ * there too (and every guest here runs on the emulator).                  */
 static u64 udiv64_32(u64 n, u32 d, u32* rem)              /* d != 0 */
 {
     u32 hi = (u32)(n >> 32), lo = (u32)n;
@@ -144,14 +147,11 @@ static u64 udiv64_32(u64 n, u32 d, u32* rem)              /* d != 0 */
     if (rem) *rem = r;
     return ((u64)q1 << 32) | q0;
 }
-#endif
 
 u64 __udivdi3(u64 a, u64 b)
 {
     if (!b) return 0;
-#ifdef __riscv_mul
     if ((u32)(b >> 32) == 0) { return udiv64_32(a, (u32)b, 0); }
-#endif
     u64 q = 0, r = 0;
     for (int i = 63; i >= 0; i--) {
         r = (r << 1) | ((a >> i) & 1);
@@ -163,9 +163,7 @@ u64 __udivdi3(u64 a, u64 b)
 u64 __umoddi3(u64 a, u64 b)
 {
     if (!b) return 0;
-#ifdef __riscv_mul
     if ((u32)(b >> 32) == 0) { u32 r32; udiv64_32(a, (u32)b, &r32); return r32; }
-#endif
     u64 r = 0;
     for (int i = 63; i >= 0; i--) {
         r = (r << 1) | ((a >> i) & 1);
