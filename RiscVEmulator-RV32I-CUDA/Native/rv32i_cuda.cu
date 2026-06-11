@@ -4758,14 +4758,16 @@ static void rvxblk_build() {
     cuFuncGetAttribute(&xnreg, CU_FUNC_ATTRIBUTE_NUM_REGS, fn);
     cuFuncGetAttribute(&xlmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fn);
     g_x_sptrust = sptrust ? 1 : 0;
-    fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s), %d regs, %d B local, sp-proof %s\n",
-            cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF", xnreg, xlmem, sptrust?"OK":"none");
+    if (getenv("RVX_STATS")) {                              // build summary is diagnostic — keep bench output clean
+        fprintf(stderr,"[xblk] built: %d compiled words, %d dispatch entries, %zu units, ~%zu KB PTX (exec %s), %d regs, %d B local, sp-proof %s\n",
+                cnt, ndisp, ptx.size(), psz/1024, g_xblk_ok?"ON":"OFF", xnreg, xlmem, sptrust?"OK":"none");
 #ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;     // ptxas memory-knee watch: peak build commit
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
-        fprintf(stderr,"[xblk] build peak: %.2f GB commit, %.2f GB working set\n",
-                pmc.PeakPagefileUsage/1073741824.0, pmc.PeakWorkingSetSize/1073741824.0);
+        PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc; // ptxas memory-knee watch: peak build commit
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
+            fprintf(stderr,"[xblk] build peak: %.2f GB commit, %.2f GB working set\n",
+                    pmc.PeakPagefileUsage/1073741824.0, pmc.PeakWorkingSetSize/1073741824.0);
 #endif
+    }
 }
 
 // Run the exec_block from g_state[0].pc for up to `budget` guest instructions. Updates g_state[0]
