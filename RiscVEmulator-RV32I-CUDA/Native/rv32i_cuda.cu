@@ -3091,14 +3091,16 @@ static bool rvx_match_wordscan(const uint32_t* img, int Nw, uint32_t base, int w
 // boundary branches enterable. Within a region, labels / fall-through / direct bra / inline-budget
 // backward branches work exactly like the old monolith; jalr probes its own region via the local XDISP.
 // Region size: BIG regions win — every cross-region transition costs a 31-reg spill/reload through
-// shared + a dispatcher round trip, and the measured ttf30 climbs monotonically with region size
-// (6000→12000→20000→40000→60000: 121.5→126→129→133→139.6 MIPS, all interleaved pairs). The limit is
-// the ptxas brx knee, which scales with the per-region BRANCHTARGET COUNT, not words: one region
-// holding all ~15k Doom entries blew a ptxas child past 3 GB (watchdog-killed), while 2 regions of
-// ~7.5k targets build at 1.38 GB. So the default is large, and rvx_codegen separately floors the
-// region COUNT so no region ever exceeds ~8k brx targets.
+// shared + a dispatcher round trip, and the measured ttf climbs monotonically with region size
+// (6000→12000→20000→40000: 121.5→126→129→133 MIPS, all interleaved pairs; 15000→30000 re-measured
+// at +5-6%, r23). The limit is the ptxas brx knee, which scales with the per-region BRANCHTARGET
+// COUNT, not words. 60000 was the old default but is PROVEN unassemblable for full-coverage images
+// (the children run 15 minutes at 4.75 GB without converging — r23 probe), so every fresh discovery
+// just burned ~45 s building a doomed attempt; the default is now 30000 — the largest size that
+// reliably assembles under the 2 GB child cap (~150 s/unit, cubin-cached). The halving retry below
+// still covers images where even 30000 overruns (e.g. RVX_DYNCODE builds with per-store SMC checks).
 #ifndef RVX_REGW
-#define RVX_REGW 60000
+#define RVX_REGW 30000
 #endif
 static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& pc2idx,
                         const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
@@ -3674,9 +3676,9 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
     int rc = -1;
     if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
         // WATCHDOG: ptxas sits on a knife edge for large brx-heavy units — pathological inputs have
-        // been observed to spin for minutes at multi-GB commits. The 2 GB private-bytes cap
+        // been observed to spin for minutes at multi-GB commits. The 2.5 GB private-bytes cap
         // (RVX_PTXAS_MEM overrides, in MB) is the real knee guard — runaway builds blow it quickly,
-        // and convergent 30000-word regions stay under it; the wall limit (default 360 s,
+        // and convergent 30000-word regions peak under 2 GB; the wall limit (default 360 s,
         // RVX_PTXAS_TMO overrides the ms) only reaps stuck children. 120 s proved too tight: it
         // killed the CONVERGENT 30000-word Doom regions (~150 s each), pinning the knee marker at
         // 15000 and costing ~6% runtime (r23).
@@ -3685,7 +3687,7 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
                       s_tmo = (v > 0) ? (DWORD)v : 360000; }
         static SIZE_T s_mem = 0;
         if (!s_mem) { const char* e = getenv("RVX_PTXAS_MEM"); int v = e ? atoi(e) : 0;   // MB
-                      s_mem = ((v > 0) ? (SIZE_T)v : 2048u) * 1024u * 1024u; }            // 2 GB hard cap
+                      s_mem = ((v > 0) ? (SIZE_T)v : 2560u) * 1024u * 1024u; }            // 2.5 GB cap
         DWORD waited = 0; bool wkilled = false;
         while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
             waited += 250;
