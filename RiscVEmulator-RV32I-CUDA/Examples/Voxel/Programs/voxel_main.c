@@ -406,7 +406,7 @@ static uint8_t world_get(int x, int y, int z)
     return s_world[x][y][z];
 }
 /* ═══════════════════════════════ Framebuffer + depth ════════════════════════ */
-static float   s_zbuf[FB_PIXELS];       /* per-pixel 1/w depth (larger = closer) */
+static int32_t s_zbuf[FB_PIXELS];       /* per-pixel 1/w depth, Q20 fixed point (larger = closer) */
 /* Double-buffered render target: draw into s_draw while the OTHER buffer is presented via
  * DISP_FB_ADDR. The CUDA host reads the presented buffer asynchronously (batch-end drain),
  * so single-buffering showed partially-drawn frames and raced the next frame's clear. */
@@ -429,7 +429,7 @@ static void init_sky(void)
 }
 static void clear_screen(void)
 {
-    memset(s_zbuf, 0, sizeof(s_zbuf));   /* 0.0f = infinitely far (1/w == 0) */
+    memset(s_zbuf, 0, sizeof(s_zbuf));   /* 0 = infinitely far (1/w == 0) */
     memcpy(s_draw, s_sky, sizeof(s_sky));
 }
 /* ═══════════════════════════════ FLOAT PERSPECTIVE-CORRECT RASTERIZER ═══════ */
@@ -555,6 +555,24 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
     float v_w_row  = v2->v_w   + (E0_row * dv0 + E1_row * dv1) * inv_area;
     float iw_row   = v2->inv_w + (E0_row * dw0 + E1_row * dw1) * inv_area;
 
+    /* ── Q20 fixed-point attribute steppers. The per-pixel float chain (mul+add interp,
+       float z-compare, and above all `w = 1.0f / iw` = a full soft-float divide through
+       __udivdi3 — ~77% of all retired steps profiled) becomes integer adds, an integer
+       z-test, and ONE hardware idiv per texel axis (rv32im DIV is a single instruction
+       on this core). u/v only feed 4-bit texel coords and 1/w stays ≥ 0.02 (near-clip),
+       so Q20 leaves ~4 decimal digits of headroom. The float gradient SETUP above stays:
+       it runs once per triangle, not per pixel. */
+    const float FXS = 1048576.0f;                       /* 2^20 */
+    int32_t du_w_dx_fx = (int32_t)(du_w_dx * FXS);
+    int32_t dv_w_dx_fx = (int32_t)(dv_w_dx * FXS);
+    int32_t diw_dx_fx  = (int32_t)(diw_dx  * FXS);
+    int32_t du_w_dy_fx = (int32_t)(du_w_dy * FXS);
+    int32_t dv_w_dy_fx = (int32_t)(dv_w_dy * FXS);
+    int32_t diw_dy_fx  = (int32_t)(diw_dy  * FXS);
+    int32_t u_w_row_fx = (int32_t)(u_w_row * FXS);
+    int32_t v_w_row_fx = (int32_t)(v_w_row * FXS);
+    int32_t iw_row_fx  = (int32_t)(iw_row  * FXS);
+
     /* Integer coverage steppers (28.4 pixel centers) */
     int dE0xi = (y2i - y1i) << 4, dE0yi = -((x2i - x1i) << 4);
     int dE1xi = (y0i - y2i) << 4, dE1yi = -((x0i - x2i) << 4);
@@ -573,27 +591,23 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
     {
         long long E0l = E0l_row;
         long long E1l = E1l_row;
+        int32_t u_w_fx = u_w_row_fx;
+        int32_t v_w_fx = v_w_row_fx;
+        int32_t iw_fx  = iw_row_fx;
         int idx = py * FB_WIDTH + minx;
 
         for (int px = minx; px <= maxx; px++, idx++)
         {
             if (E0l <= 0 && E1l <= 0 && E0l + E1l >= areal)
             {
-                float fdx = (float)(px - minx);
-                float iw  = iw_row + fdx * diw_dx;
-                if (iw > s_zbuf[idx])
+                if (iw_fx > s_zbuf[idx])
                 {
-                    s_zbuf[idx] = iw;
+                    s_zbuf[idx] = iw_fx;
 
-                    /* Perspective divide → recover true u, v at this pixel */
-                    float u_w = u_w_row + fdx * du_w_dx;
-                    float v_w = v_w_row + fdx * dv_w_dx;
-                    float w = 1.0f / iw;
-                    float u = u_w * w;
-                    float v = v_w * w;
-
-                    int px_tex = (int)(u * 16.0f) & 15;
-                    int py_tex = (int)(v * 16.0f) & 15;
+                    /* Perspective divide → true u, v at this pixel: u*16 = (u_w*16)/iw,
+                       one hardware 32-bit divide each (iw_fx > 0 by the z-test). */
+                    int px_tex = (int)((u_w_fx * 16) / iw_fx) & 15;
+                    int py_tex = (int)((v_w_fx * 16) / iw_fx) & 15;
 
                     s_draw[idx] = frag_shader_inline(tx, ty, px_tex, py_tex,
                         ao_i, nfog, fog_r, fog_g, fog_b);
@@ -601,12 +615,15 @@ static void draw_triangle(const PVert* v0, const PVert* v1, const PVert* v2,
             }
             E0l += dE0xi;
             E1l += dE1xi;
+            u_w_fx += du_w_dx_fx;
+            v_w_fx += dv_w_dx_fx;
+            iw_fx  += diw_dx_fx;
         }
         E0l_row += dE0yi;
         E1l_row += dE1yi;
-        u_w_row += du_w_dy;
-        v_w_row += dv_w_dy;
-        iw_row  += diw_dy;
+        u_w_row_fx += du_w_dy_fx;
+        v_w_row_fx += dv_w_dy_fx;
+        iw_row_fx  += diw_dy_fx;
     }
 }
 /* ═══════════════════════════════ Block face rendering + backface culling ════════════════════════ */
