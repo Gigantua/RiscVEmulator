@@ -3011,6 +3011,7 @@ static bool rvx_match_palexp(const uint32_t* img, int Nw, uint32_t base, int w, 
     if (S1(i[13])==SRC) END=S2(i[13]); else if (S2(i[13])==SRC) END=S1(i[13]); else return false;
     uint32_t bpc=base+(uint32_t)(w+13)*4;
     if ((int)((bpc+rv_bimm(i[13])-base)>>2) != w) return false;
+    // (palexp aliasing rules continue below)
     // Aliasing rules. The five live regs follow the interpreter matcher (PAL/END/ALPHA may alias
     // each other — all invariant). Temps must not alias any live reg (they'd break an invariant or
     // the loop-carried SRC/DST), and only the temp-temp aliases that violate a read-after-write
@@ -3026,6 +3027,47 @@ static bool rvx_match_palexp(const uint32_t* img, int Nw, uint32_t base, int w, 
     if (T==IDX || P==T || C0==P || C1==P) return false;
     o.SRC=SRC; o.DST=DST; o.PAL=PAL; o.END=END; o.ALPHA=ALPHA;
     o.IDX=IDX; o.T=T; o.P=P; o.C0=C0; o.C1=C1; o.C2=C2;
+    return true;
+}
+
+// Counted search loop (mirror of rvcud_try_wordscan — the WAD record-table scans, 5 instrs/record):
+//   addi C,C,Kc ; addi P,P,Kp ; b<cc> C,Z,→EXIT(fwd) ; lw V,off(P) ; bne V,KEY,→top
+// Replaced by a CALL into the knee-isolated `xscan` unit (six cc-specialized 6-op loops) plus an
+// exact closed form: C/P advance j steps, V re-read from invariant memory (the loop never stores),
+// retire 5j (match / cap) or 5j−2 (counted exit retires 3 on its last iteration). Three-way exit:
+// match → fall-through past the loop; counted → the forward EXIT target; iteration cap → re-enter
+// the header (budget-checked) and call again.
+struct RvxScan { uint32_t C,P,V,KEY,Z,cf3,twx; int32_t Kc,Kp,off; };
+static bool rvx_match_wordscan(const uint32_t* img, int Nw, uint32_t base, int w, RvxScan& o) {
+    if (w+5 >= Nw) return false;
+    auto RD=[](uint32_t x){return (x>>7)&0x1F;}; auto S1=[](uint32_t x){return (x>>15)&0x1F;};
+    auto S2=[](uint32_t x){return (x>>20)&0x1F;}; auto F3=[](uint32_t x){return (x>>12)&7;};
+    const uint32_t* i = img + w;
+    if ((i[0]&0x7F)!=0x13 || F3(i[0])!=0) return false;              // addi C,C,Kc
+    uint32_t C=RD(i[0]); if (C==0 || S1(i[0])!=C) return false;
+    int32_t Kc=(int32_t)rv_iimm(i[0]); if (Kc<-128||Kc>127) return false;
+    if ((i[1]&0x7F)!=0x13 || F3(i[1])!=0) return false;              // addi P,P,Kp
+    uint32_t P=RD(i[1]); if (P==0 || P==C || S1(i[1])!=P) return false;
+    int32_t Kp=(int32_t)rv_iimm(i[1]); if (Kp<-128||Kp>127) return false;
+    if ((i[2]&0x7F)!=0x63) return false;                             // b<cc> C,Z,→EXIT (forward)
+    uint32_t cf3=F3(i[2]); if (cf3==2||cf3==3) return false;
+    if (S1(i[2])!=C) return false;                                   // C must be the FIRST operand
+    uint32_t Z=S2(i[2]); if (Z==C || Z==P) return false;             // Z loop-invariant (x0 allowed)
+    int32_t bofs=(int32_t)rv_bimm(i[2]); if (bofs<=0) return false;  // forward exit only
+    uint32_t twx=(uint32_t)((base+(uint32_t)(w+2)*4 + (uint32_t)bofs - base)>>2);
+    if ((int)twx >= Nw) return false;
+    if ((i[3]&0x7F)!=0x03 || F3(i[3])!=2 || S1(i[3])!=P) return false;   // lw V,off(P)
+    uint32_t V=RD(i[3]); int32_t off=(int32_t)rv_iimm(i[3]);
+    if (V==0 || V==C || V==P || V==Z) return false;
+    if ((i[4]&0x7F)!=0x63 || F3(i[4])!=1) return false;              // bne V,KEY,→top
+    uint32_t KEY;
+    if      (S1(i[4])==V) KEY=S2(i[4]);
+    else if (S2(i[4])==V) KEY=S1(i[4]);
+    else return false;
+    if (KEY==C || KEY==P || KEY==V) return false;                    // KEY loop-invariant (x0 allowed)
+    uint32_t bpc=base+(uint32_t)(w+4)*4;
+    if ((int)((bpc+rv_bimm(i[4])-base)>>2) != w) return false;       // back-edge to the loop header
+    o.C=C; o.P=P; o.V=V; o.KEY=KEY; o.Z=Z; o.cf3=cf3; o.twx=twx; o.Kc=Kc; o.Kp=Kp; o.off=off;
     return true;
 }
 
@@ -3140,9 +3182,9 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
     }
     // DIVLOOP/COPYLOOP pre-scan: the replacements jump to the loop exit with different scratch/cache
     // state than the per-instruction path, so the exits must be reset points.
-    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0);
-    int ncpy = 0, nfill = 0, npal = 0;
-    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr;
+    std::vector<uint8_t> divhit(N, 0), cpyhit(N, 0), mulhit(N, 0), fillhit(N, 0), palhit(N, 0), scanhit(N, 0);
+    int ncpy = 0, nfill = 0, npal = 0, nscan = 0;
+    { RvxDiv dr; RvxCpy cr; RvxMul mr; RvxFill fr; RvxPal pr; RvxScan sr;
       for (int w=0; w+13 < N; w++)
           if (comp[w] && rvx_match_divloop(img, N, base, w, dr)) { divhit[w] = 1; targ[w+13] = 1; }
       for (int w=0; w+7 < N; w++)
@@ -3154,13 +3196,19 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               if (comp[w] && rvx_match_fillloop(img, N, base, w, fr)) { fillhit[w] = (uint8_t)fr.nw; targ[w+fr.nw] = 1; nfill++; }
           for (int w=0; w+14 < N; w++)
               if (comp[w] && rvx_match_palexp(img, N, base, w, pr)) { palhit[w] = 1; targ[w+14] = 1; npal++; }
+          for (int w=0; w+5 < N; w++)
+              if (comp[w] && !cpyhit[w] && rvx_match_wordscan(img, N, base, w, sr)
+                  && comp[w+5] && regof[w+5]==regof[w]                 // both exits must live in
+                  && comp[sr.twx] && regof[sr.twx]==regof[w])          // this region (bra targets)
+                  { scanhit[w] = 1; targ[w+5] = 1; targ[sr.twx] = 1; nscan++; }
       } }
     if (getenv("RVX_STATS") && ncpy) fprintf(stderr, "[xblk] copyloop sites: %d\n", ncpy);
     if (getenv("RVX_STATS") && nfill) fprintf(stderr, "[xblk] fillloop sites: %d\n", nfill);
     if (getenv("RVX_STATS") && npal) fprintf(stderr, "[xblk] palexp sites: %d\n", npal);
+    if (getenv("RVX_STATS") && nscan) fprintf(stderr, "[xblk] wordscan sites: %d\n", nscan);
 
     const char* hdr = ".version 7.8\n.target sm_86\n.address_size 64\n";
-    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0), std::string());
+    units.assign(1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0), std::string());
     // ── xcopy unit (knee-ISOLATED: assembles alone in microseconds). Word-widened forward byte copy:
     //    byte head until DST is 4-aligned, then a funnel-shift body (the +8 B buffer guard covers the
     //    high word of an unaligned source), then a byte tail. Callers guarantee n ≥ 1 and NO forward
@@ -3229,6 +3277,36 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
               "add.u64 %d, %d, 4;\nsub.u32 %n, %n, 1;\nsetp.ne.u32 %q, %n, 0;\n@%q bra PX;\n"
               "ret;\n}\n";
     }
+    // ── xscan unit (knee-ISOLATED). Counted record-search loop: six cc-specialized 6-op loops
+    //    (dispatched once on cf3); returns {iterations entered, exit flag 0=counted/1=match/2=cap}.
+    //    The call site derives the exact closed form from j alone (C/P strides, V re-read).
+    if (nscan) {
+        std::string& xs = units[1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0)];
+        xs  = hdr;
+        xs += ".visible .func (.param .align 4 .b8 rv[8]) xscan (.param .b64 pp, .param .b32 pkp, "
+              ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap)\n{\n"
+              ".reg .b64 %p,%kp;\n.reg .b32 %j,%c,%v,%key,%z,%kc,%cf,%cap,%fl,%t;\n.reg .pred %q;\n"
+              "ld.param.u64 %p,[pp];\nld.param.u32 %t,[pkp];\ncvt.s64.s32 %kp,%t;\n"
+              "ld.param.u32 %key,[pkey];\nld.param.u32 %c,[pc0];\nld.param.u32 %z,[pz];\n"
+              "ld.param.u32 %kc,[pkc];\nld.param.u32 %cf,[pcf];\nld.param.u32 %cap,[pcap];\n"
+              "mov.b32 %j, 0;\n"
+              "setp.eq.u32 %q,%cf,0;\n@%q bra SEQ;\nsetp.eq.u32 %q,%cf,1;\n@%q bra SNE;\n"
+              "setp.eq.u32 %q,%cf,4;\n@%q bra SLT;\nsetp.eq.u32 %q,%cf,5;\n@%q bra SGE;\n"
+              "setp.eq.u32 %q,%cf,6;\n@%q bra SLTU;\nbra SGEU;\n";
+        auto scanloop = [&](const char* lbl, const char* cc){
+            char buf[512];
+            snprintf(buf, sizeof buf,
+              "%s:\nadd.u32 %%j, %%j, 1;\nadd.s32 %%c, %%c, %%kc;\nadd.s64 %%p, %%p, %%kp;\n"
+              "setp.%s %%q, %%c, %%z;\n@%%q bra SCNT;\n"
+              "ld.global.u32 %%v, [%%p];\nsetp.eq.u32 %%q, %%v, %%key;\n@%%q bra SMATCH;\n"
+              "setp.lt.u32 %%q, %%j, %%cap;\n@%%q bra %s;\nbra SCAP;\n", lbl, cc, lbl);
+            xs += buf;
+        };
+        scanloop("SEQ","eq.u32"); scanloop("SNE","ne.u32"); scanloop("SLT","lt.s32");
+        scanloop("SGE","ge.s32"); scanloop("SLTU","lt.u32"); scanloop("SGEU","ge.u32");
+        xs += "SCNT:\nmov.b32 %fl, 0;\nbra SOUT;\nSMATCH:\nmov.b32 %fl, 1;\nbra SOUT;\nSCAP:\nmov.b32 %fl, 2;\n"
+              "SOUT:\nst.param.u32 [rv], %j;\nst.param.u32 [rv+4], %fl;\nret;\n}\n";
+    }
     // ── region units. Prologue: load regs/cnt/budget/M/P2I + the entry ordinal from XS, brx to it.
     //    XDISP: jalr lands here — budget gate → bounds → pc2idx → same region ⇒ re-brx, else XSAVE.
     //    XSAVE: spill regs/pc/cnt to XS, ret (the dispatcher decides re-enter vs exit).
@@ -3241,6 +3319,8 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         if (ncpy) ptx += ".extern .func xcopy (.param .b64 ps, .param .b64 pd, .param .b32 pn);\n";
         if (nfill) ptx += ".extern .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn);\n";
         if (npal) ptx += ".extern .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa);\n";
+        if (nscan) ptx += ".extern .func (.param .align 4 .b8 rv[8]) xscan (.param .b64 pp, .param .b32 pkp, "
+                          ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap);\n";
         rvx_app(ptx, ".visible .func xr%d\n{\n", r);
         ptx += ".reg .b64 %M,%P2I,%a0,%a1,%ab,%ad,%xs,%ss,%DD;\n.reg .b32 %x<32>,%t0,%t1,%t2,%t3,%pc,%budget,%cnt,%dwl,%dwh;\n"
                ".reg .u32 %wi,%bidx,%rg,%tx,%rsp;\n.reg .pred %p0,%p1,%p2;\n";
@@ -3456,6 +3536,40 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                              "mov.b32 %%x%u, %%x%u;\n", P0.DST, P0.DST, P0.DST, P0.SRC, P0.END);
                 rvx_app(ptx, "bra L%u;\n", base+(w+14)*4);
                 rvx_app(ptx, "PXORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+                cse.reset();
+            }
+            // Counted search loop → xscan call. No guards (valid from ANY header state — the closed
+            // form is a pure function of the iteration count j). Exact: C += j·Kc, P += j·Kp, V
+            // re-read from invariant memory (the loop never stores; skipped when no load happened),
+            // retire 5j (match/cap) or 5j−2 (the counted-exit iteration retires 3). Cap (1M iters)
+            // re-enters the header — which carries its own budget gate, since the original
+            // back-edge's inline check is gone with the loop.
+            else if (scanhit[w]) {
+                armed = true;
+                RvxScan S0; rvx_match_wordscan(img, N, base, (int)w, S0);
+                rvx_app(ptx, "L%u:\n", pc);
+                rvx_app(ptx, "setp.ge.s32 %%p0, %%cnt, %%budget;\n@%%p0 mov.u32 %%pc, %u;\n@%%p0 bra XSAVE;\n", pc);
+                rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\nadd.s64 %%a0, %%a0, %d;\n",
+                             S0.P, S0.off);
+                ptx += "{ .param .align 4 .b8 rv[8]; .param .b64 pp; .param .b32 pkp; .param .b32 pkey;\n"
+                       ".param .b32 pc0; .param .b32 pz; .param .b32 pkc; .param .b32 pcf; .param .b32 pcap;\n";
+                rvx_app(ptx, "st.param.b64 [pp], %%a0;\nst.param.b32 [pkp], %d;\nst.param.b32 [pkey], %%x%u;\n"
+                             "st.param.b32 [pc0], %%x%u;\nst.param.b32 [pz], %%x%u;\nst.param.b32 [pkc], %d;\n"
+                             "st.param.b32 [pcf], %u;\nst.param.b32 [pcap], 1048576;\n",
+                             S0.Kp, S0.KEY, S0.C, S0.Z, S0.Kc, S0.cf3);
+                ptx += "call.uni (rv), xscan, (pp, pkp, pkey, pc0, pz, pkc, pcf, pcap);\n"
+                       "ld.param.u32 %t0, [rv];\nld.param.u32 %t1, [rv+4];\n}\n";
+                ptx += "mul.lo.u32 %t2, %t0, 5;\nsetp.eq.u32 %p0, %t1, 0;\nselp.b32 %t3, 2, 0, %p0;\n"
+                       "sub.u32 %t2, %t2, %t3;\nadd.s32 %cnt, %cnt, %t2;\n";
+                rvx_app(ptx, "mul.lo.u32 %%t2, %%t0, %d;\nadd.u32 %%x%u, %%x%u, %%t2;\n", S0.Kc, S0.C, S0.C);
+                rvx_app(ptx, "mul.lo.u32 %%t2, %%t0, %d;\nadd.u32 %%x%u, %%x%u, %%t2;\n", S0.Kp, S0.P, S0.P);
+                rvx_app(ptx, "setp.eq.u32 %%p1, %%t0, 1;\nand.pred %%p1, %%p1, %%p0;\n"   // counted && j==1 → no load ran
+                             "selp.b32 %%t2, %d, 0, %%p0;\nsub.u32 %%t3, %%x%u, %%t2;\n"
+                             "cvt.u64.u32 %%a0, %%t3;\nadd.u64 %%a0, %%a0, %%M;\nadd.s64 %%a0, %%a0, %d;\n"
+                             "@!%%p1 ld.global.u32 %%x%u, [%%a0];\n", S0.Kp, S0.P, S0.off, S0.V);
+                rvx_app(ptx, "setp.eq.u32 %%p2, %%t1, 1;\n@%%p2 bra L%u;\n", base+(w+5)*4);   // match
+                rvx_app(ptx, "setp.eq.u32 %%p2, %%t1, 2;\n@%%p2 bra L%u;\n", pc);              // cap → re-enter
+                rvx_app(ptx, "bra L%u;\n", base + S0.twx*4);                                   // counted exit
                 cse.reset();
             }
             else rvx_app(ptx, "L%u:\n", pc);                // retire deferred to the segment flush
