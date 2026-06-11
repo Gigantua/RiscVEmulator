@@ -3260,9 +3260,18 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         RvxCse cse; cse.spInit = sptrust ? 0 : 0xFF; cse.reset();
         std::string cold;                               // misaligned-store fallbacks, emitted after the body
         int prev = -2;
+        // SEGMENT-BATCHED retire counter: instead of one `add %cnt,1` per guest instruction (~1 of
+        // the ~3.7 SASS each costs), straight-line segments accumulate statically and flush ONE add
+        // at each boundary. Segments are delimited by targ labels (the only sideways-enterable
+        // words) and control transfers, so the count at every budget check / exit is EXACT: a
+        // segment has no interior entries or exits by construction.
+        int pend = 0;
+        auto flushcnt = [&](int extra){ int t = pend + extra;
+            if (t) rvx_app(ptx, "add.s32 %%cnt, %%cnt, %d;\n", t); pend = 0; };
         for (; bi<nb && regof[body[bi]]==r; bi++) {
             uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
-            if ((int)w != prev+1 || targ[w]) cse.reset();   // run start or sideways-enterable
+            bool armed = false;                              // a replacement arm fired (self-counted)
+            if ((int)w != prev+1 || targ[w]) { flushcnt(0); cse.reset(); }   // segment boundary
             // Software-divide loop → ONE hardware div+rem. The precondition test (canonical entry
             // state R==0, Q==0, i==31 — what the function prologue establishes) routes mid-loop
             // sideways re-entries to the original code below; entering the header IN that state is
@@ -3272,6 +3281,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             // temps T1/T2 keep their pre-loop values — same treatment as the interpreter's
             // RC_DIVLOOP arm (they are dead clang temps; the bit-identical gate covers it).
             if (divhit[w] && (int)w+13 < N && regof[w+13]==r && comp[w+13]) {
+                armed = true;
                 RvxDiv D0; rvx_match_divloop(img, N, base, (int)w, D0);
                 rvx_app(ptx, "L%u:\n", pc);
                 rvx_app(ptx, "or.b32 %%t0, %%x%u, %%x%u;\nxor.b32 %%t1, %%x%u, 31;\nor.b32 %%t0, %%t0, %%t1;\n"
@@ -3289,6 +3299,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             // loop's effect from the header is ACC += B·M over current values). Exact final state
             // and exact data-dependent retire: 7/iter, it = M ? 32-clz(M) : 1 (do-while ≥1).
             else if (mulhit[w] && (int)w+7 < N && regof[w+7]==r && comp[w+7]) {
+                armed = true;
                 RvxMul M0; rvx_match_mulloop(img, N, base, (int)w, M0);
                 rvx_app(ptx, "L%u:\n", pc);
                 rvx_app(ptx, "clz.b32 %%t0, %%x%u;\nsub.u32 %%t0, 32, %%t0;\n"
@@ -3311,6 +3322,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             // 5·len, RT = last byte (re-read from src — the no-overlap guard makes it unclobbered),
             // S += len, D = END.
             else if (cpyhit[w] && (int)w+5 < N && regof[w+5]==r && comp[w+5]) {
+                armed = true;
                 RvxCpy C0; rvx_match_copyloop(img, N, base, (int)w, C0);
                 rvx_app(ptx, "L%u:\n", pc);
                 rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"                      // len = END - D
@@ -3350,6 +3362,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             // 4·len (form A) or 3·(len>>f3) (form B), D = END (form A also nD = END); VAL/END are
             // loop-invariant.
             else if (fillhit[w] && (int)w+fillhit[w] < N && regof[w+fillhit[w]]==r && comp[w+fillhit[w]]) {
+                armed = true;
                 RvxFill F0; rvx_match_fillloop(img, N, base, (int)w, F0);
                 rvx_app(ptx, "L%u:\n", pc);
                 rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"                      // len = END - D
@@ -3393,6 +3406,7 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
             // IDX/T/P/C0/C1/C2 re-derived from the last pixel in guest write order (all 11 regs
             // pairwise distinct per the matcher, so no aliasing).
             else if (palhit[w] && (int)w+14 < N && regof[w+14]==r && comp[w+14]) {
+                armed = true;
                 RvxPal P0; rvx_match_palexp(img, N, base, (int)w, P0);
                 rvx_app(ptx, "L%u:\n", pc);
                 rvx_app(ptx, "sub.u32 %%t0, %%x%u, %%x%u;\n"                      // n = END - SRC
@@ -3444,12 +3458,20 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 rvx_app(ptx, "PXORIG%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
                 cse.reset();
             }
-            else rvx_app(ptx, "L%u:\nadd.s32 %%cnt, %%cnt, 1;\n", pc);
+            else rvx_app(ptx, "L%u:\n", pc);                // retire deferred to the segment flush
+            // Count this word: transfers flush (incl. themselves — they retire whether taken or
+            // not, and the budget check inside rvx_emit needs %cnt current); replacement-armed
+            // words are self-counted by their arm; everything else just accumulates.
+            if (!armed) {
+                if (op==0x63 || op==0x6F || op==0x67) flushcnt(1);
+                else pend++;
+            }
             rvx_emit(ptx, pc, img[w], comp, comp, N, base, regof, r, cse, nc, pc2idx, cold);
             bool terminates = (op==0x6F || op==0x67 || !rvx_compilable(op));   // jal/jalr/system already transfer
             if (!terminates) {                              // fall-through: redirect if w+1 leaves the region
                 int nw = (int)w + 1;
-                if (nw>=N || !comp[nw] || regof[nw]!=r) rvx_app(ptx,"mov.u32 %%pc, %u;\nbra XSAVE;\n", base+(uint32_t)nw*4);
+                if (nw>=N || !comp[nw] || regof[nw]!=r) { flushcnt(0);
+                    rvx_app(ptx,"mov.u32 %%pc, %u;\nbra XSAVE;\n", base+(uint32_t)nw*4); }
             }
             else cse.reset();                               // nothing falls through a terminator
             prev = (int)w;
