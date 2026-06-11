@@ -3305,11 +3305,55 @@ static bool rvx_match_texspan(const uint32_t* img, int Nw, uint32_t base, int w,
 #ifndef RVX_REGW
 #define RVX_REGW 30000
 #endif
+// FNV-1a — image-content key shared by the knee marker and the PGO profile file (r33).
+static unsigned long long rvx_fnv(const void* data, size_t bytes) {
+    unsigned long long h = 1469598103934665603ULL;
+    const uint8_t* p = (const uint8_t*)data;
+    for (size_t i = 0; i < bytes; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+// Image hash of the LAST codegen'd image, captured at build time: the profiler's atexit dump
+// runs after emulator teardown may have cleared g_img, so it must not rehash at exit.
+static unsigned long long g_pgo_imghash = 0;
 static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& pc2idx,
                         const uint32_t* img, int N, uint32_t base, const std::vector<uint8_t>& comp,
                         const std::vector<uint8_t>& disp, int nc, bool sptrust) {
     std::vector<uint32_t> body;
     for (int w=0; w<N; w++) if (comp[w]) body.push_back((uint32_t)w);
+    // r33 PGO layout: per-word hot bits from a prior RVX_PROF run of the SAME image
+    // (%TEMP%\rvcud_prof_<imghash>.txt, 256-B buckets). Within each region, sampled-hot segments
+    // emit first and never-sampled segments sink to the region tail (displaced fall-throughs get
+    // a bra) — the hot working set compacts to a fraction of the ~11 MB SASS image, cutting
+    // instruction-fetch stalls (ncu: no_instruction 0.42 of 5.93 cyc/issued). Identity layout
+    // when no profile file exists (gate guests, fresh images).
+    std::vector<uint8_t> hotw(N, 0);
+    bool havepgo = false;
+#ifdef _WIN32
+    g_pgo_imghash = rvx_fnv(img, (size_t)N*4);
+    {   char dir[MAX_PATH], ppath[300];
+        if (GetTempPathA(sizeof dir, dir)) {
+            snprintf(ppath, sizeof ppath, "%srvcud_prof_%016llx.txt", dir, g_pgo_imghash);
+            if (FILE* pf = fopen(ppath, "rb")) {
+                unsigned long long pbase = 0, nbk = 0;
+                if (fscanf(pf, "%llu %llu", &pbase, &nbk) == 2) {
+                    unsigned long long bidx, bcnt;
+                    while (fscanf(pf, "%llu %llu", &bidx, &bcnt) == 2) {
+                        if (!bcnt) continue;
+                        long long w0 = ((long long)(pbase + bidx*256) - (long long)base) / 4;
+                        for (long long w2 = w0; w2 < w0 + 64; w2++)
+                            if (w2 >= 0 && w2 < N) hotw[(size_t)w2] = 1;
+                    }
+                    havepgo = true;
+                }
+                fclose(pf);
+            }
+        }
+    }
+    if (getenv("RVX_STATS") && havepgo) {
+        int nh = 0; for (int w2 = 0; w2 < N; w2++) nh += hotw[w2];
+        fprintf(stderr, "[xblk] pgo layout: %d hot words\n", nh);
+    }
+#endif
     const int nb = (int)body.size();
     int regw = RVX_REGW; if (const char* e=getenv("RVX_REGW")) { int v=atoi(e); if (v>0) regw=v; }
     if (g_rvx_regw_force > 0) regw = g_rvx_regw_force;      // assemble-failure retry (rvxblk_build halves it)
@@ -3656,8 +3700,31 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         int pend = 0;
         auto flushcnt = [&](int extra){ int t = pend + extra;
             if (t) rvx_app(ptx, "add.s32 %%cnt, %%cnt, %d;\n", t); pend = 0; };
-        for (; bi<nb && regof[body[bi]]==r; bi++) {
-            uint32_t w = body[bi], pc = base + w*4, op = img[w]&0x7F;
+        // r33 PGO emission order: collect this region's words, split into segments (delimited by
+        // address gaps and targ labels — the same boundaries the cse/flushcnt logic keys on), and
+        // emit sampled-hot segments first, never-sampled ones last. Fall-throughs displaced by the
+        // reorder get an explicit bra below. Identity order without a profile.
+        int rb0 = bi;
+        while (bi<nb && regof[body[bi]]==r) bi++;
+        std::vector<uint32_t> emitw(body.begin()+rb0, body.begin()+bi);
+        if (havepgo && emitw.size() > 2) {
+            std::vector<std::pair<int,int>> segs;            // [start,end) index ranges into emitw
+            for (int i2=0; i2<(int)emitw.size(); i2++)
+                if (segs.empty() || emitw[i2] != emitw[i2-1]+1 || targ[emitw[i2]])
+                    segs.push_back({i2, i2+1});
+                else segs.back().second = i2+1;
+            std::vector<uint32_t> ord; ord.reserve(emitw.size());
+            for (int pass=0; pass<2; pass++)
+                for (auto& sg : segs) {
+                    bool hot = false;
+                    for (int i2=sg.first; i2<sg.second && !hot; i2++) hot = hotw[emitw[i2]] != 0;
+                    if ((pass==0) == hot)
+                        for (int i2=sg.first; i2<sg.second; i2++) ord.push_back(emitw[i2]);
+                }
+            emitw.swap(ord);
+        }
+        for (size_t ei=0; ei<emitw.size(); ei++) {
+            uint32_t w = emitw[ei]; uint32_t pc = base + w*4, op = img[w]&0x7F;
             bool armed = false;                              // a replacement arm fired (self-counted)
             if ((int)w != prev+1 || targ[w]) { flushcnt(0); cse.reset(); }   // segment boundary
             // Software-divide loop → ONE hardware div+rem. The precondition test (canonical entry
@@ -4111,6 +4178,8 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 int nw = (int)w + 1;
                 if (nw>=N || !comp[nw] || regof[nw]!=r) { flushcnt(0);
                     rvx_app(ptx,"mov.u32 %%pc, %u;\nbra XSAVE;\n", base+(uint32_t)nw*4); }
+                else if (ei+1 >= emitw.size() || emitw[ei+1] != (uint32_t)nw) { flushcnt(0);
+                    rvx_app(ptx,"bra L%u;\n", base+(uint32_t)nw*4); }   // successor displaced by the PGO reorder (r33)
             }
             else cse.reset();                               // nothing falls through a terminator
             prev = (int)w;
@@ -4500,6 +4569,26 @@ static int rvx_prof() {
             for (size_t b = 0; b < g_prof_hist.size(); b++)
                 if (g_prof_hist[b]) top.push_back({g_prof_hist[b], b});
             std::sort(top.rbegin(), top.rend());
+#ifdef _WIN32
+            // PGO dump (r33): persist the histogram keyed on the image content (hash captured at
+            // build time — g_img may already be torn down here). rvx_codegen of the SAME image
+            // picks it up and emits sampled-hot segments first within each region.
+            if (!top.empty() && g_pgo_imghash) {
+                char dir[MAX_PATH], ppath[300];
+                if (GetTempPathA(sizeof dir, dir)) {
+                    snprintf(ppath, sizeof ppath, "%srvcud_prof_%016llx.txt", dir, g_pgo_imghash);
+                    if (FILE* pf = fopen(ppath, "wb")) {
+                        fprintf(pf, "%llu %llu\n", (unsigned long long)g_prof_base,
+                                (unsigned long long)g_prof_hist.size());
+                        for (size_t b = 0; b < g_prof_hist.size(); b++)
+                            if (g_prof_hist[b]) fprintf(pf, "%llu %llu\n",
+                                (unsigned long long)b, g_prof_hist[b]);
+                        fclose(pf);
+                        fprintf(stderr, "[prof] pgo layout file written: %s\n", ppath);
+                    }
+                }
+            }
+#endif
             unsigned long long tot = 0; for (auto& t : top) tot += t.first;
             fprintf(stderr, "[prof] %llu samples, top buckets (256 B):\n", tot);
             for (size_t i = 0; i < top.size() && i < 24; i++)
