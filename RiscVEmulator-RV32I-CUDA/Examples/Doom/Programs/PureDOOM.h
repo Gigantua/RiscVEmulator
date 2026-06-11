@@ -21233,13 +21233,12 @@ fixed_t FixedDiv(fixed_t a, fixed_t b)
 
 fixed_t FixedDiv2(fixed_t a, fixed_t b)
 {
-    double c;
-
-    c = ((double)a) / ((double)b) * FRACUNIT;
-
-    if (c >= 2147483648.0 || c < -2147483648.0)
-        I_Error("Error: FixedDiv: divide by zero");
-    return (fixed_t)c;
+    /* Canonical integer form (chocolate-doom). The double version cost ~10
+       soft-float libcalls per divide on rv32i (__floatsidf x2, __divdf3,
+       __muldf3, __fixdfsi, compares). FixedDiv's overflow guard already
+       excludes b == 0 and any quotient outside fixed_t range, so the
+       64/32 divide is exact and the range check is unreachable. */
+    return (fixed_t)(((long long)a << FRACBITS) / b);
 }
 #define SAVESTRINGSIZE 24
 #define SKULLXOFF -32
