@@ -338,17 +338,13 @@ void _start(void)
         poll_mouse();
         doom_update();
 
-        /* Present pacing. The old 14000 us (~70 Hz) gate became the ttf
-         * bottleneck once the emulator outran it: frames arrived at exactly
-         * 14.5 ms regardless of engine speed and the guest spent ~35% of all
-         * retired instructions spinning this loop against the launch-staged
-         * RTC (h5, 2026-06-11). 1000 us keeps the vsync write from firing
-         * multiple times within one launch window while letting presents
-         * track render speed. */
+        /* Present at a fixed rate, not once per loop iteration: each call's
+         * vsync MMIO write triggers a full 256 KB framebuffer copy on the
+         * host CPU thread. ~70 Hz is smooth without taxing the emulated CPU. */
         {
             static unsigned int last_fb_us = 0;
             unsigned int now_fb_us = RTC_US_LO;
-            if ((unsigned int)(now_fb_us - last_fb_us) >= 1000u) {
+            if ((unsigned int)(now_fb_us - last_fb_us) >= 14000u) {
                 last_fb_us = now_fb_us;
                 copy_framebuffer();
             }

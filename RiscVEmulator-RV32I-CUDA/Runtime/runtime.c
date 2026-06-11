@@ -135,33 +135,14 @@ static u64 udiv64_32(u64 n, u32 d, u32* rem)              /* d != 0 */
         t     = (r << 8) | (lo & 0xFFu);         u32 qd = t / d; r = t % d;
         q0 = (qa << 24) | (qb << 16) | (qc << 8) | qd;
     } else {
-        /* d >= 2^24: Knuth base-2^16 long division (Hacker's Delight divlu2),
-         * 32-bit ops only. Replaces the carry-guarded bit-at-a-time loop
-         * (32 iterations, ~350 retired instrs) with two digit estimates around
-         * 32-bit divides — single hardware ops under the emulator's DBT.
-         * The quotient (r:lo)/d fits 32 bits because r < d (so un32 < dn after
-         * normalization, the divlu precondition). s <= 7 since d has a bit in
-         * [24,31]; the mod-2^32 wraps in un21/rem are exact per HD 9-4.
-         * Host-verified against native u64/u32: 200M random + edges, 0 fails. */
-        u32 s = 0, dn = d;
-        while (!(dn & 0x80000000u)) { dn <<= 1; s++; }
-        u32 un32 = s ? (r << s) | (lo >> (32 - s)) : r;
-        u32 un10 = lo << s;
-        u32 dn1 = dn >> 16, dn0 = dn & 0xFFFFu;
-        u32 un1 = un10 >> 16, un0 = un10 & 0xFFFFu;
-        u32 qh = un32 / dn1, rh = un32 % dn1;
-        while (qh >= 0x10000u || qh*dn0 > ((rh << 16) | un1)) {
-            qh--; rh += dn1;
-            if (rh >= 0x10000u) break;
+        /* d >= 2^24: bit-at-a-time over the low word, with a carry guard
+         * (r < d can still make r<<1 overflow 32 bits). */
+        q0 = 0;
+        for (int i = 31; i >= 0; i--) {
+            u32 carry = r >> 31;
+            r = (r << 1) | ((lo >> i) & 1u);
+            if (carry || r >= d) { r -= d; q0 |= (1u << i); }
         }
-        u32 un21 = (un32 << 16) + un1 - qh*dn;
-        u32 ql = un21 / dn1, rl = un21 % dn1;
-        while (ql >= 0x10000u || ql*dn0 > ((rl << 16) | un0)) {
-            ql--; rl += dn1;
-            if (rl >= 0x10000u) break;
-        }
-        q0 = (qh << 16) | ql;
-        r = ((un21 << 16) + un0 - ql*dn) >> s;
     }
     if (rem) *rem = r;
     return ((u64)q1 << 32) | q0;

@@ -21233,12 +21233,13 @@ fixed_t FixedDiv(fixed_t a, fixed_t b)
 
 fixed_t FixedDiv2(fixed_t a, fixed_t b)
 {
-    /* Canonical integer form (chocolate-doom). The double version cost ~10
-       soft-float libcalls per divide on rv32i (__floatsidf x2, __divdf3,
-       __muldf3, __fixdfsi, compares). FixedDiv's overflow guard already
-       excludes b == 0 and any quotient outside fixed_t range, so the
-       64/32 divide is exact and the range check is unreachable. */
-    return (fixed_t)(((long long)a << FRACBITS) / b);
+    double c;
+
+    c = ((double)a) / ((double)b) * FRACUNIT;
+
+    if (c >= 2147483648.0 || c < -2147483648.0)
+        I_Error("Error: FixedDiv: divide by zero");
+    return (fixed_t)c;
 }
 #define SAVESTRINGSIZE 24
 #define SKULLXOFF -32
@@ -37043,8 +37044,6 @@ byte* R_GetColumn(int tex, int col)
 // Initializes the texture list
 //  with the textures from the world map.
 //
-static void R_HashTextures(void);
-
 void R_InitTextures(void)
 {
     maptexture_t* mtexture;
@@ -37213,8 +37212,6 @@ void R_InitTextures(void)
         texturetranslation[i] = i;
 
     doom_free(patchlookup);
-
-    R_HashTextures();
 }
 
 
@@ -37336,45 +37333,6 @@ int R_FlatNumForName(char* name)
 // Check whether texture is available.
 // Filter out NoTexture indicator.
 //
-// Texture-name hash (boot cost: the strncasecmp scan ran ~3x per sidedef on
-// every level load — ~4.2% of retired instructions at ttf90). Keys hash the
-// UPPERCASED 8-byte name; chain hits still verify with doom_strncasecmp, so
-// behavior is identical for any input case. Chains are prepend-inserted in
-// REVERSE index order so each chain's head is the LOWEST matching index —
-// identical to the original forward scan on duplicate names.
-static int* r_thash_head;  /* [r_thash_mask+1], -1 = empty */
-static int* r_thash_next;  /* [numtextures] chain links, -1 = end */
-static unsigned int r_thash_mask;
-
-static unsigned int R_HashTexName(const char* name)
-{
-    unsigned char up[8];
-    int k;
-    unsigned int h;
-    for (k = 0; k < 8 && name[k]; k++) up[k] = (unsigned char)doom_toupper((unsigned char)name[k]);
-    for (; k < 8; k++) up[k] = 0;
-    h = (unsigned int)(up[0] | (up[1] << 8) | (up[2] << 16) | (up[3] << 24)) * 2654435761u
-      ^ (unsigned int)(up[4] | (up[5] << 8) | (up[6] << 16) | (up[7] << 24)) * 2246822519u;
-    return (h ^ (h >> 16)) & r_thash_mask;
-}
-
-static void R_HashTextures(void)
-{
-    unsigned int size = 1;
-    int i;
-    while (size < (unsigned int)numtextures * 2) size <<= 1;
-    r_thash_mask = size - 1;
-    r_thash_head = doom_malloc(size * sizeof(int));
-    r_thash_next = doom_malloc(numtextures * sizeof(int));
-    for (i = 0; i < (int)size; i++) r_thash_head[i] = -1;
-    for (i = numtextures - 1; i >= 0; i--)
-    {
-        unsigned int h = R_HashTexName(textures[i]->name);
-        r_thash_next[i] = r_thash_head[h];
-        r_thash_head[h] = i;
-    }
-}
-
 int R_CheckTextureNumForName(char* name)
 {
     int i;
@@ -37382,14 +37340,6 @@ int R_CheckTextureNumForName(char* name)
     // "NoTexture" marker.
     if (name[0] == '-')
         return 0;
-
-    if (r_thash_head)
-    {
-        for (i = r_thash_head[R_HashTexName(name)]; i != -1; i = r_thash_next[i])
-            if (!doom_strncasecmp(textures[i]->name, name, 8))
-                return i;
-        return -1;
-    }
 
     for (i = 0; i < numtextures; i++)
         if (!doom_strncasecmp(textures[i]->name, name, 8))
@@ -46165,8 +46115,6 @@ void W_Reload(void)
 // The name searcher looks backwards, so a later file
 //  does override all earlier ones.
 //
-static void W_HashLumps(void);
-
 void W_InitMultipleFiles(char** filenames)
 {
     int                size;
@@ -46191,8 +46139,6 @@ void W_InitMultipleFiles(char** filenames)
         I_Error("Error: Couldn't allocate lumpcache");
 
     doom_memset(lumpcache, 0, size);
-
-    W_HashLumps();
 }
 
 
@@ -46223,38 +46169,6 @@ int W_NumLumps(void)
 // W_CheckNumForName
 // Returns -1 if name not found.
 //
-// Lump-name hash (boot cost: the linear scan over all lumps ran for every
-// W_GetNumForName during init — ~1.2% of retired instructions at ttf90).
-// Chains are PREPEND-inserted in index order, so each chain's head is the
-// HIGHEST matching index — identical to the original backward scan's
-// "patch lump files take precedence" rule.
-static int* w_hash_head;   /* [w_hash_mask+1], -1 = empty */
-static int* w_hash_next;   /* [numlumps] chain links, -1 = end */
-static unsigned int w_hash_mask;
-
-static unsigned int W_HashName8(int v1, int v2)
-{
-    unsigned int h = (unsigned int)v1 * 2654435761u ^ (unsigned int)v2 * 2246822519u;
-    return (h ^ (h >> 16)) & w_hash_mask;
-}
-
-static void W_HashLumps(void)
-{
-    unsigned int size = 1;
-    int i;
-    while (size < (unsigned int)numlumps * 2) size <<= 1;
-    w_hash_mask = size - 1;
-    w_hash_head = doom_malloc(size * sizeof(int));
-    w_hash_next = doom_malloc(numlumps * sizeof(int));
-    for (i = 0; i < (int)size; i++) w_hash_head[i] = -1;
-    for (i = 0; i < numlumps; i++)
-    {
-        unsigned int h = W_HashName8(*(int*)lumpinfo[i].name, *(int*)&lumpinfo[i].name[4]);
-        w_hash_next[i] = w_hash_head[h];
-        w_hash_head[h] = i;
-    }
-}
-
 int W_CheckNumForName(char* name)
 {
     union
@@ -46279,15 +46193,6 @@ int W_CheckNumForName(char* name)
     v1 = name8.x[0];
     v2 = name8.x[1];
 
-    if (w_hash_head)
-    {
-        int i;
-        for (i = w_hash_head[W_HashName8(v1, v2)]; i != -1; i = w_hash_next[i])
-            if (*(int*)lumpinfo[i].name == v1
-                && *(int*)&lumpinfo[i].name[4] == v2)
-                return i;
-        return -1;
-    }
 
     // scan backwards so patch lump files take precedence
     lump_p = lumpinfo + numlumps;
