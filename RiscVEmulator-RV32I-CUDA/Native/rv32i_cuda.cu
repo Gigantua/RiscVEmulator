@@ -3596,28 +3596,83 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         std::string& xs = units[1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0)];
         xs  = hdr;
         xs += ".visible .func (.param .align 4 .b8 rv[8]) xscan (.param .b64 pp, .param .b32 pkp, "
-              ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap)\n{\n"
-              ".reg .b64 %p,%kp;\n.reg .b32 %j,%c,%v,%key,%z,%kc,%cf,%cap,%fl,%t;\n.reg .pred %q;\n"
-              "ld.param.u64 %p,[pp];\nld.param.u32 %t,[pkp];\ncvt.s64.s32 %kp,%t;\n"
-              "ld.param.u32 %key,[pkey];\nld.param.u32 %c,[pc0];\nld.param.u32 %z,[pz];\n"
-              "ld.param.u32 %kc,[pkc];\nld.param.u32 %cf,[pcf];\nld.param.u32 %cap,[pcap];\n"
-              "mov.b32 %j, 0;\n"
-              "setp.eq.u32 %q,%cf,0;\n@%q bra SEQ;\nsetp.eq.u32 %q,%cf,1;\n@%q bra SNE;\n"
-              "setp.eq.u32 %q,%cf,4;\n@%q bra SLT;\nsetp.eq.u32 %q,%cf,5;\n@%q bra SGE;\n"
-              "setp.eq.u32 %q,%cf,6;\n@%q bra SLTU;\nbra SGEU;\n";
-        auto scanloop = [&](const char* lbl, const char* cc){
-            char buf[512];
-            snprintf(buf, sizeof buf,
-              "%s:\nadd.u32 %%j, %%j, 1;\nadd.s32 %%c, %%c, %%kc;\nadd.s64 %%p, %%p, %%kp;\n"
-              "setp.%s %%q, %%c, %%z;\n@%%q bra SCNT;\n"
-              "ld.global.u32 %%v, [%%p];\nsetp.eq.u32 %%q, %%v, %%key;\n@%%q bra SMATCH;\n"
-              "setp.lt.u32 %%q, %%j, %%cap;\n@%%q bra %s;\nbra SCAP;\n", lbl, cc, lbl);
-            xs += buf;
-        };
-        scanloop("SEQ","eq.u32"); scanloop("SNE","ne.u32"); scanloop("SLT","lt.s32");
-        scanloop("SGE","ge.s32"); scanloop("SLTU","lt.u32"); scanloop("SGEU","ge.u32");
-        xs += "SCNT:\nmov.b32 %fl, 0;\nbra SOUT;\nSMATCH:\nmov.b32 %fl, 1;\nbra SOUT;\nSCAP:\nmov.b32 %fl, 2;\n"
-              "SOUT:\nst.param.u32 [rv], %j;\nst.param.u32 [rv+4], %fl;\nret;\n}\n";
+              ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap, "
+              ".param .b64 plo, .param .b64 phi)\n{\n";
+        if (nc == 1) {
+            // w2 warp-cooperative form. Lane li probes record j = tb+li+1 each trip (tb = completed
+            // iterations, uniform). EXACT serial order via two ballots: counted-exit is checked
+            // BEFORE the load at the same j, so lanes at/after the first counted lane suppress
+            // their load+match; first exiting lane wins (match strictly below counted by
+            // construction). Speculative loads run ≤31 records past the serial stop — addresses
+            // are CLAMPED to [plo,phi] (guest RAM): a clamped lane can never win (it would have to
+            // be at/before the first exit, where serial itself loads in-bounds), so the clamp is
+            // fault-safe and semantics-free. The trip loop is uniform — no divergence, no bar.
+            xs += ".reg .b64 %p,%kp,%pp,%kpn,%lo,%hi,%pe;\n"
+                  ".reg .b32 %j,%c,%v,%key,%z,%kc,%cf,%cap,%fl,%t,%li,%nt,%am,%cl,%ml,%win,%bc,%bm,%kcn,%tb;\n"
+                  ".reg .pred %q,%qc,%qm,%qa;\n"
+                  "ld.param.u64 %p,[pp];\nld.param.u32 %t,[pkp];\ncvt.s64.s32 %kp,%t;\n"
+                  "ld.param.u32 %key,[pkey];\nld.param.u32 %c,[pc0];\nld.param.u32 %z,[pz];\n"
+                  "ld.param.u32 %kc,[pkc];\nld.param.u32 %cf,[pcf];\nld.param.u32 %cap,[pcap];\n"
+                  "ld.param.u64 %lo,[plo];\nld.param.u64 %hi,[phi];\n"
+                  "mov.u32 %li, %tid.x;\nmov.u32 %nt, %ntid.x;\n"
+                  "mov.u32 %am, 1;\nshl.b32 %am, %am, %nt;\nsub.u32 %am, %am, 1;\n"
+                  "mov.u32 %v, 0;\nmov.u32 %tb, 0;\n"
+                  "add.u32 %t, %li, 1;\nmad.lo.s32 %c, %t, %kc, %c;\n"
+                  "cvt.s64.s32 %pe, %t;\nmul.lo.s64 %pe, %pe, %kp;\nadd.s64 %pp, %p, %pe;\n"
+                  "mul.lo.s32 %kcn, %kc, %nt;\n"
+                  "cvt.s64.s32 %kpn, %nt;\nmul.lo.s64 %kpn, %kpn, %kp;\n"
+                  "setp.eq.u32 %q,%cf,0;\n@%q bra SEQ;\nsetp.eq.u32 %q,%cf,1;\n@%q bra SNE;\n"
+                  "setp.eq.u32 %q,%cf,4;\n@%q bra SLT;\nsetp.eq.u32 %q,%cf,5;\n@%q bra SGE;\n"
+                  "setp.eq.u32 %q,%cf,6;\n@%q bra SLTU;\nbra SGEU;\n";
+            auto scanloop = [&](const char* lbl, const char* cc){
+                char buf[1024];
+                snprintf(buf, sizeof buf,
+                  "%s:\nsetp.%s %%qc, %%c, %%z;\n"
+                  "vote.sync.ballot.b32 %%bc, %%qc, %%am;\n"
+                  "brev.b32 %%t, %%bc;\nclz.b32 %%cl, %%t;\n"
+                  "setp.lt.u32 %%qa, %%li, %%cl;\n"
+                  "max.s64 %%pe, %%pp, %%lo;\nmin.s64 %%pe, %%pe, %%hi;\n"
+                  "@%%qa ld.global.u32 %%v, [%%pe];\n"
+                  "setp.eq.and.u32 %%qm, %%v, %%key, %%qa;\n"
+                  "vote.sync.ballot.b32 %%bm, %%qm, %%am;\n"
+                  "brev.b32 %%t, %%bm;\nclz.b32 %%ml, %%t;\n"
+                  "min.u32 %%win, %%cl, %%ml;\n"
+                  "setp.lt.u32 %%q, %%win, 32;\n@%%q bra SHIT;\n"
+                  "add.u32 %%tb, %%tb, %%nt;\n"
+                  "setp.ge.u32 %%q, %%tb, %%cap;\n@%%q bra SCAP;\n"
+                  "add.s32 %%c, %%c, %%kcn;\nadd.s64 %%pp, %%pp, %%kpn;\nbra %s;\n", lbl, cc, lbl);
+                xs += buf;
+            };
+            scanloop("SEQ","eq.u32"); scanloop("SNE","ne.u32"); scanloop("SLT","lt.s32");
+            scanloop("SGE","ge.s32"); scanloop("SLTU","lt.u32"); scanloop("SGEU","ge.u32");
+            xs += "SHIT:\nadd.u32 %j, %tb, %win;\nadd.u32 %j, %j, 1;\n"
+                  "setp.gt.u32 %q, %j, %cap;\n@%q bra SCAP;\n"
+                  "setp.eq.u32 %q, %win, %ml;\nselp.b32 %fl, 1, 0, %q;\nbra SOUT;\n"
+                  "SCAP:\nmov.u32 %j, %cap;\nmov.u32 %fl, 2;\n"
+                  "SOUT:\nst.param.u32 [rv], %j;\nst.param.u32 [rv+4], %fl;\nret;\n}\n";
+        } else {
+            xs += ".reg .b64 %p,%kp;\n.reg .b32 %j,%c,%v,%key,%z,%kc,%cf,%cap,%fl,%t;\n.reg .pred %q;\n"
+                  "ld.param.u64 %p,[pp];\nld.param.u32 %t,[pkp];\ncvt.s64.s32 %kp,%t;\n"
+                  "ld.param.u32 %key,[pkey];\nld.param.u32 %c,[pc0];\nld.param.u32 %z,[pz];\n"
+                  "ld.param.u32 %kc,[pkc];\nld.param.u32 %cf,[pcf];\nld.param.u32 %cap,[pcap];\n"
+                  "mov.b32 %j, 0;\n"
+                  "setp.eq.u32 %q,%cf,0;\n@%q bra SEQ;\nsetp.eq.u32 %q,%cf,1;\n@%q bra SNE;\n"
+                  "setp.eq.u32 %q,%cf,4;\n@%q bra SLT;\nsetp.eq.u32 %q,%cf,5;\n@%q bra SGE;\n"
+                  "setp.eq.u32 %q,%cf,6;\n@%q bra SLTU;\nbra SGEU;\n";
+            auto scanloop = [&](const char* lbl, const char* cc){
+                char buf[512];
+                snprintf(buf, sizeof buf,
+                  "%s:\nadd.u32 %%j, %%j, 1;\nadd.s32 %%c, %%c, %%kc;\nadd.s64 %%p, %%p, %%kp;\n"
+                  "setp.%s %%q, %%c, %%z;\n@%%q bra SCNT;\n"
+                  "ld.global.u32 %%v, [%%p];\nsetp.eq.u32 %%q, %%v, %%key;\n@%%q bra SMATCH;\n"
+                  "setp.lt.u32 %%q, %%j, %%cap;\n@%%q bra %s;\nbra SCAP;\n", lbl, cc, lbl);
+                xs += buf;
+            };
+            scanloop("SEQ","eq.u32"); scanloop("SNE","ne.u32"); scanloop("SLT","lt.s32");
+            scanloop("SGE","ge.s32"); scanloop("SLTU","lt.u32"); scanloop("SGEU","ge.u32");
+            xs += "SCNT:\nmov.b32 %fl, 0;\nbra SOUT;\nSMATCH:\nmov.b32 %fl, 1;\nbra SOUT;\nSCAP:\nmov.b32 %fl, 2;\n"
+                  "SOUT:\nst.param.u32 [rv], %j;\nst.param.u32 [rv+4], %fl;\nret;\n}\n";
+        }
     }
     // ── xscpy unit (knee-ISOLATED). Counted strided copy: n elements of width 2^w bytes, source
     //    stride ks, dest stride kd (both signed; pointers walk 64-bit — the call site guards u32
@@ -3627,13 +3682,54 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         std::string& xq = units[1+K + (ncpy ? 1 : 0) + (nfill ? 1 : 0) + (npal ? 1 : 0) + (nscan ? 1 : 0)];
         xq  = hdr;
         xq += ".visible .func xscpy (.param .b64 ps, .param .b64 pd, .param .b32 pks, "
-              ".param .b32 pkd, .param .b32 pn, .param .b32 pw)\n{\n"
-              ".reg .b64 %s,%d,%ks,%kd;\n.reg .b32 %n,%v,%w,%t;\n.reg .pred %q;\n"
-              "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\n"
-              "ld.param.u32 %t,[pks];\ncvt.s64.s32 %ks,%t;\n"
-              "ld.param.u32 %t,[pkd];\ncvt.s64.s32 %kd,%t;\n"
-              "ld.param.u32 %n,[pn];\nld.param.u32 %w,[pw];\n"
-              "setp.eq.u32 %q,%w,0;\n@%q bra Q0;\nsetp.eq.u32 %q,%w,1;\n@%q bra Q1;\n"
+              ".param .b32 pkd, .param .b32 pn, .param .b32 pw)\n{\n";
+        if (nc == 1) {
+            // w2 warp-cooperative form: element j is pure in j (addresses s+j·ks / d+j·kd), so
+            // lanes split j when lane order is provably free — src/dst RANGES fully disjoint
+            // (min/max over the monotonic walks, computed once) AND kd ≠ 0 (kd==0 funnels every
+            // store to ONE address: the last writer must be element n−1 — order-dependent).
+            // Anything else (overlap = the guest-order byte/word propagation cases) takes the
+            // serial replay below, which is lockstep-safe on a converged warp.
+            xq += ".reg .b64 %s,%d,%ks,%kd,%slo,%shi,%dlo,%dhi,%e,%sp,%dp,%ksn,%kdn;\n"
+                  ".reg .b32 %n,%v,%w,%t,%li,%nt,%am,%jl;\n.reg .pred %q,%q2;\n"
+                  "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\n"
+                  "ld.param.u32 %t,[pks];\ncvt.s64.s32 %ks,%t;\n"
+                  "ld.param.u32 %t,[pkd];\ncvt.s64.s32 %kd,%t;\n"
+                  "ld.param.u32 %n,[pn];\nld.param.u32 %w,[pw];\n"
+                  // span ends: e = (n-1)·stride; lo = min(base, base+e); hi = max(...) + width
+                  "sub.u32 %t, %n, 1;\ncvt.s64.s32 %e, %t;\n"
+                  "mul.lo.s64 %sp, %e, %ks;\nadd.s64 %sp, %s, %sp;\n"
+                  "min.s64 %slo, %s, %sp;\nmax.s64 %shi, %s, %sp;\n"
+                  "mul.lo.s64 %dp, %e, %kd;\nadd.s64 %dp, %d, %dp;\n"
+                  "min.s64 %dlo, %d, %dp;\nmax.s64 %dhi, %d, %dp;\n"
+                  "mov.u32 %t, 1;\nshl.b32 %t, %t, %w;\ncvt.s64.s32 %e, %t;\n"
+                  "add.s64 %shi, %shi, %e;\nadd.s64 %dhi, %dhi, %e;\n"
+                  "setp.le.s64 %q, %shi, %dlo;\nsetp.le.s64 %q2, %dhi, %slo;\nor.pred %q, %q, %q2;\n"
+                  "setp.ne.and.s64 %q, %kd, 0, %q;\n@!%q bra QSER;\n"
+                  // parallel: lane li does j = li, li+nt, …
+                  "mov.u32 %li, %tid.x;\nmov.u32 %nt, %ntid.x;\nmov.u32 %jl, %li;\n"
+                  "setp.ge.u32 %q, %jl, %n;\n@%q bra QW;\n"
+                  "cvt.s64.s32 %e, %li;\n"
+                  "mul.lo.s64 %sp, %e, %ks;\nadd.s64 %sp, %s, %sp;\n"
+                  "mul.lo.s64 %dp, %e, %kd;\nadd.s64 %dp, %d, %dp;\n"
+                  "cvt.s64.s32 %e, %nt;\nmul.lo.s64 %ksn, %e, %ks;\nmul.lo.s64 %kdn, %e, %kd;\n"
+                  "setp.eq.u32 %q,%w,0;\n@%q bra P0;\nsetp.eq.u32 %q,%w,1;\n@%q bra P1;\n"
+                  "P2:\nld.global.u32 %v,[%sp];\nst.global.u32 [%dp],%v;\nadd.s64 %sp,%sp,%ksn;\nadd.s64 %dp,%dp,%kdn;\n"
+                  "add.u32 %jl,%jl,%nt;\nsetp.lt.u32 %q,%jl,%n;\n@%q bra P2;\nbra QW;\n"
+                  "P1:\nld.global.u16 %v,[%sp];\nst.global.u16 [%dp],%v;\nadd.s64 %sp,%sp,%ksn;\nadd.s64 %dp,%dp,%kdn;\n"
+                  "add.u32 %jl,%jl,%nt;\nsetp.lt.u32 %q,%jl,%n;\n@%q bra P1;\nbra QW;\n"
+                  "P0:\nld.global.u8 %v,[%sp];\nst.global.u8 [%dp],%v;\nadd.s64 %sp,%sp,%ksn;\nadd.s64 %dp,%dp,%kdn;\n"
+                  "add.u32 %jl,%jl,%nt;\nsetp.lt.u32 %q,%jl,%n;\n@%q bra P0;\n"
+                  "QW:\nmov.u32 %am, 1;\nshl.b32 %am, %am, %nt;\nsub.u32 %am, %am, 1;\nbar.warp.sync %am;\nret;\n"
+                  "QSER:\n";
+        } else {
+            xq += ".reg .b64 %s,%d,%ks,%kd;\n.reg .b32 %n,%v,%w,%t;\n.reg .pred %q;\n"
+                  "ld.param.u64 %s,[ps];\nld.param.u64 %d,[pd];\n"
+                  "ld.param.u32 %t,[pks];\ncvt.s64.s32 %ks,%t;\n"
+                  "ld.param.u32 %t,[pkd];\ncvt.s64.s32 %kd,%t;\n"
+                  "ld.param.u32 %n,[pn];\nld.param.u32 %w,[pw];\n";
+        }
+        xq += "setp.eq.u32 %q,%w,0;\n@%q bra Q0;\nsetp.eq.u32 %q,%w,1;\n@%q bra Q1;\n"
               "Q2:\nld.global.u32 %v,[%s];\nst.global.u32 [%d],%v;\nadd.s64 %s,%s,%ks;\nadd.s64 %d,%d,%kd;\n"
               "sub.u32 %n,%n,1;\nsetp.ne.u32 %q,%n,0;\n@%q bra Q2;\nret;\n"
               "Q1:\nld.global.u16 %v,[%s];\nst.global.u16 [%d],%v;\nadd.s64 %s,%s,%ks;\nadd.s64 %d,%d,%kd;\n"
@@ -3737,7 +3833,8 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
         if (nfill) ptx += ".extern .func xfill (.param .b64 pd, .param .b32 pv, .param .b32 pn);\n";
         if (npal) ptx += ".extern .func xpal (.param .b64 ps, .param .b64 pd, .param .b64 pp, .param .b32 pn, .param .b32 pa);\n";
         if (nscan) ptx += ".extern .func (.param .align 4 .b8 rv[8]) xscan (.param .b64 pp, .param .b32 pkp, "
-                          ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap);\n";
+                          ".param .b32 pkey, .param .b32 pc0, .param .b32 pz, .param .b32 pkc, .param .b32 pcf, .param .b32 pcap, "
+                          ".param .b64 plo, .param .b64 phi);\n";
         if (nscpy) ptx += ".extern .func xscpy (.param .b64 ps, .param .b64 pd, .param .b32 pks, "
                           ".param .b32 pkd, .param .b32 pn, .param .b32 pw);\n";
         if (ntexc) ptx += ".extern .func (.param .align 4 .b8 rv[16]) xtexc (.param .b64 pbt, .param .b64 pbc, "
@@ -4008,12 +4105,16 @@ static void rvx_codegen(std::vector<std::string>& units, std::vector<uint32_t>& 
                 rvx_app(ptx, "cvt.u64.u32 %%a0, %%x%u;\nadd.u64 %%a0, %%a0, %%M;\nadd.s64 %%a0, %%a0, %d;\n",
                              S0.P, S0.off);
                 ptx += "{ .param .align 4 .b8 rv[8]; .param .b64 pp; .param .b32 pkp; .param .b32 pkey;\n"
-                       ".param .b32 pc0; .param .b32 pz; .param .b32 pkc; .param .b32 pcf; .param .b32 pcap;\n";
+                       ".param .b32 pc0; .param .b32 pz; .param .b32 pkc; .param .b32 pcf; .param .b32 pcap;\n"
+                       ".param .b64 plo; .param .b64 phi;\n";
                 rvx_app(ptx, "st.param.b64 [pp], %%a0;\nst.param.b32 [pkp], %d;\nst.param.b32 [pkey], %%x%u;\n"
                              "st.param.b32 [pc0], %%x%u;\nst.param.b32 [pz], %%x%u;\nst.param.b32 [pkc], %d;\n"
                              "st.param.b32 [pcf], %u;\nst.param.b32 [pcap], 1048576;\n",
                              S0.Kp, S0.KEY, S0.C, S0.Z, S0.Kc, S0.cf3);
-                ptx += "call.uni (rv), xscan, (pp, pkp, pkey, pc0, pz, pkc, pcf, pcap);\n"
+                // guest-RAM clamp window for the cooperative unit's speculative loads (w2)
+                rvx_app(ptx, "st.param.b64 [plo], %%M;\nadd.u64 %%a1, %%M, %u;\nst.param.b64 [phi], %%a1;\n",
+                             (unsigned)(g_membytes - 4));
+                ptx += "call.uni (rv), xscan, (pp, pkp, pkey, pc0, pz, pkc, pcf, pcap, plo, phi);\n"
                        "ld.param.u32 %t0, [rv];\nld.param.u32 %t1, [rv+4];\n}\n";
                 ptx += "mul.lo.u32 %t2, %t0, 5;\nsetp.eq.u32 %p0, %t1, 0;\nselp.b32 %t3, 2, 0, %p0;\n"
                        "sub.u32 %t2, %t2, %t3;\nadd.s32 %cnt, %cnt, %t2;\n";

@@ -58,9 +58,12 @@ ncores==1 launches xk with 32 lockstep-redundant threads (SIMT makes the 31
 extra lanes free) and xpal/xcopy split iterations across lanes. +31% all pairs,
 frame-80 byte-identical, all gates green, nc>1 PTX unchanged.
 
-Left on the table (only if a new goal appears): cooperative xscan/xscpy
-(5.6% of pre-w1 cycles ≈ +4%), xtexc/xtexs (~0.2%), and the Tier-3 MULTIMOD
-register-resident program for the scalar 49%.
+w2 landed the follow-up: cooperative xscan/xscpy → **~291 MIPS** (evening
+window, +4.4% over w1, all pairs). Units now 5.99% of kernel cycles — the
+fused-unit lever is EXHAUSTED. f80-capture rule learned: pixel compares need a
+quiet GPU and matched pacing (content is demo-tic-dependent; see w2 row).
+Left on the table (only if a new goal appears): the Tier-3 MULTIMOD
+register-resident program for the scalar `wait` bucket (~50%).
 
 Everything below is the COMPLETED plan, kept for the record.
 
