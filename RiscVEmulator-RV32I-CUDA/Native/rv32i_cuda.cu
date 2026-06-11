@@ -3674,8 +3674,9 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
     int rc = -1;
     if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
         // WATCHDOG: ptxas sits on a knife edge for large brx-heavy units — pathological inputs have
-        // been observed to spin for minutes at multi-GB commits. The 2.5 GB private-bytes cap is the
-        // real knee guard (runaway builds blow it quickly); the wall limit (default 360 s,
+        // been observed to spin for minutes at multi-GB commits. The 2 GB private-bytes cap
+        // (RVX_PTXAS_MEM overrides, in MB) is the real knee guard — runaway builds blow it quickly,
+        // and convergent 30000-word regions stay under it; the wall limit (default 360 s,
         // RVX_PTXAS_TMO overrides the ms) only reaps stuck children. 120 s proved too tight: it
         // killed the CONVERGENT 30000-word Doom regions (~150 s each), pinning the knee marker at
         // 15000 and costing ~6% runtime (r23).
@@ -3684,7 +3685,7 @@ static int rvx_assemble_unit(const std::string& ptx, std::vector<char>& cubin) {
                       s_tmo = (v > 0) ? (DWORD)v : 360000; }
         static SIZE_T s_mem = 0;
         if (!s_mem) { const char* e = getenv("RVX_PTXAS_MEM"); int v = e ? atoi(e) : 0;   // MB
-                      s_mem = ((v > 0) ? (SIZE_T)v : 2560u) * 1024u * 1024u; }
+                      s_mem = ((v > 0) ? (SIZE_T)v : 2048u) * 1024u * 1024u; }            // 2 GB hard cap
         DWORD waited = 0; bool wkilled = false;
         while (WaitForSingleObject(pi.hProcess, 250) == WAIT_TIMEOUT) {
             waited += 250;
